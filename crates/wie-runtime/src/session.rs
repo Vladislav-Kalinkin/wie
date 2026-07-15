@@ -1,0 +1,1340 @@
+//! Persistent `RuntimeSession`: guest setup, yield/resume, and API hook loop.
+
+use crate::hooks::{build_all_runtime_fake_api_entries, find_fake_api_entry, RuntimeFakeApiEntry};
+use crate::memory::{
+    build_default_environment_strings_w, default_winapi_environment, default_winapi_state,
+    write_process_identity_strings, RuntimeMemoryLayout, DEFAULT_LAYOUT,
+};
+use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
+use anyhow::{Context, Result};
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// Saved frame for one in-flight guest window-procedure call.
+#[derive(Debug, Clone)]
+struct PendingGuestCallback {
+    /// `RSP` at the outer host API entry (return address of the caller).
+    dispatch_rsp: u64,
+    /// Original callback request metadata.
+    request: wie_winapi::GuestCallbackRequest,
+    /// Outer host API that requested the callback (`DispatchMessageA`, `SendMessageA`, …).
+    outer_library: String,
+    /// Outer host API export name.
+    outer_name: String,
+    /// Fake VA of the outer host API entry.
+    outer_fake_va: u64,
+    /// When set, outer API is `CreateWindowEx*` and must return this HWND
+    /// (unless the WndProc returns `-1` from `WM_CREATE`).
+    create_window_hwnd: Option<u64>,
+}
+
+/// Host-side timing breakdown for one session (enabled via `WIE_RUNTIME_PROFILE=1`).
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeProfile {
+    /// Wall time spent inside Unicorn `emu_start` (guest instruction execution).
+    pub emu_ns: u128,
+    /// Wall time spent in WinAPI handlers / dispatch / return_from_win64_api.
+    pub handler_ns: u128,
+    /// Wall time spent resolving hook VA → fake API entry.
+    pub resolve_ns: u128,
+    /// Number of times Unicorn stopped on a fake-API hook (host entry points).
+    pub host_stops: u64,
+    /// Noisy API calls (not charged to max_api).
+    pub noisy_calls: u64,
+    /// Charged interesting API calls.
+    pub charged_calls: u64,
+    /// Per-export counts and handler time (library!name → (count, handler_ns)).
+    pub by_export: HashMap<String, (u64, u128)>,
+}
+
+impl RuntimeProfile {
+    /// Human-readable multi-line report for stderr / logs.
+    #[must_use]
+    pub fn report(&self) -> String {
+        let total = self
+            .emu_ns
+            .saturating_add(self.handler_ns)
+            .saturating_add(self.resolve_ns);
+        let pct = |part: u128| -> f64 {
+            if total == 0 {
+                0.0
+            } else {
+                (part as f64) * 100.0 / (total as f64)
+            }
+        };
+        let mut lines = Vec::new();
+        lines.push("=== WIE_RUNTIME_PROFILE ===".to_owned());
+        lines.push(format!(
+            "host_stops={} noisy={} charged={}",
+            self.host_stops, self.noisy_calls, self.charged_calls
+        ));
+        lines.push(format!(
+            "emu_ms={:.2} ({:.1}%)  handler_ms={:.2} ({:.1}%)  resolve_ms={:.2} ({:.1}%)  total_accounted_ms={:.2}",
+            self.emu_ns as f64 / 1e6,
+            pct(self.emu_ns),
+            self.handler_ns as f64 / 1e6,
+            pct(self.handler_ns),
+            self.resolve_ns as f64 / 1e6,
+            pct(self.resolve_ns),
+            total as f64 / 1e6,
+        ));
+        let mut ranked: Vec<_> = self.by_export.iter().collect();
+        ranked.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(b.1 .0.cmp(&a.1 .0)));
+        lines.push("top exports by handler time:".to_owned());
+        for (name, (count, ns)) in ranked.into_iter().take(20) {
+            lines.push(format!(
+                "  {count:>7}  {:>8.2} ms  {name}",
+                *ns as f64 / 1e6
+            ));
+        }
+        lines.push("top exports by count:".to_owned());
+        let mut by_count = self.by_export.iter().collect::<Vec<_>>();
+        by_count.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+        for (name, (count, ns)) in by_count.into_iter().take(15) {
+            lines.push(format!(
+                "  {count:>7}  {:>8.2} ms  {name}",
+                *ns as f64 / 1e6
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+/// Long-lived executable runtime session.
+///
+/// The session owns the Unicorn engine, guest memory, WinAPI state and
+/// dispatcher metadata so execution can yield and later resume.
+pub struct RuntimeSession {
+    engine: Box<dyn wie_cpu::CpuEngine>,
+    environment: wie_winapi::WinApiEnvironment,
+    winapi_state: wie_winapi::WinApiState,
+    fake_api_entries: Vec<RuntimeFakeApiEntry>,
+    /// O(1) lookup: fake target VA → index into `fake_api_entries`.
+    fake_api_by_va: HashMap<u64, usize>,
+    layout: RuntimeMemoryLayout,
+    entry_point_va: u64,
+    initial_rsp: u64,
+    next_api_index: usize,
+    no_hook_slices: usize,
+    pending_callbacks: Vec<PendingGuestCallback>,
+    /// When true, accumulate [`RuntimeProfile`] across `run_until_stop` calls.
+    profile_enabled: bool,
+    profile: RuntimeProfile,
+    /// Last value written to guest TEB.LastErrorValue (skip redundant mem_write).
+    last_published_last_error: Option<u32>,
+}
+
+/// Bundle of fields produced by session initialization (avoids 8-arg constructors).
+struct SessionInit {
+    engine: Box<dyn wie_cpu::CpuEngine>,
+    environment: wie_winapi::WinApiEnvironment,
+    winapi_state: wie_winapi::WinApiState,
+    fake_api_entries: Vec<RuntimeFakeApiEntry>,
+    fake_api_by_va: HashMap<u64, usize>,
+    layout: RuntimeMemoryLayout,
+    entry_point_va: u64,
+    initial_rsp: u64,
+}
+
+impl RuntimeSession {
+    fn from_init(init: SessionInit) -> Self {
+        let profile_enabled = std::env::var_os("WIE_RUNTIME_PROFILE").is_some();
+        Self {
+            engine: init.engine,
+            environment: init.environment,
+            winapi_state: init.winapi_state,
+            fake_api_entries: init.fake_api_entries,
+            fake_api_by_va: init.fake_api_by_va,
+            layout: init.layout,
+            entry_point_va: init.entry_point_va,
+            initial_rsp: init.initial_rsp,
+            next_api_index: 0,
+            no_hook_slices: 0,
+            pending_callbacks: Vec::new(),
+            profile_enabled,
+            profile: RuntimeProfile::default(),
+            last_published_last_error: None,
+        }
+    }
+
+    /// Publish host `last_error` into guest TEB.LastErrorValue so in-guest
+    /// `GetLastError` stubs stay coherent with host-side API failures.
+    fn publish_last_error_to_guest(&mut self) {
+        let err = self.winapi_state.last_error;
+        if self.last_published_last_error == Some(err) {
+            return;
+        }
+        let bytes = err.to_le_bytes();
+        // Best-effort: TEB page is always mapped for this layout.
+        if self
+            .engine
+            .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
+            .is_ok()
+        {
+            self.last_published_last_error = Some(err);
+        }
+    }
+
+    /// Accumulated host-side profile (empty unless `WIE_RUNTIME_PROFILE` is set).
+    #[must_use]
+    pub fn profile(&self) -> &RuntimeProfile {
+        &self.profile
+    }
+
+    /// Whether profiling is enabled for this session.
+    #[must_use]
+    pub fn profile_enabled(&self) -> bool {
+        self.profile_enabled
+    }
+
+    /// Creates and initializes a long-lived Lunar Magic runtime session.
+    pub fn new(
+        path: &std::path::Path,
+        idle_policy: wie_winapi::MessageQueueIdlePolicy,
+    ) -> Result<Self> {
+        Self::new_with_layout(path, idle_policy, DEFAULT_LAYOUT)
+    }
+
+    /// Creates a session with an explicit guest memory layout.
+    pub fn new_with_layout(
+        path: &std::path::Path,
+        idle_policy: wie_winapi::MessageQueueIdlePolicy,
+        layout: RuntimeMemoryLayout,
+    ) -> Result<Self> {
+        let (image, image_summary, patched_imports) =
+            wie_pe::build_loaded_image_with_fake_imports(path)?;
+
+        let (mut fake_api_entries, mut fake_api_by_va) =
+            build_all_runtime_fake_api_entries(&patched_imports)?;
+
+        // WIE CPU backend (Unicorn default; `WIE_CPU=iced` for interpreter).
+        let mut engine = crate::open_default_cpu().context("failed to open WIE CPU backend")?;
+
+        engine
+            .mem_map(
+                image_summary.image_base,
+                image_summary.image_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map PE image memory")?;
+
+        engine
+            .mem_write(image_summary.image_base, &image)
+            .context("failed to write PE image into Unicorn memory")?;
+
+        engine
+            .mem_map(
+                layout.fake_api_base,
+                layout.fake_api_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map fake API memory")?;
+
+        let fake_api_size_u64 =
+            u64::try_from(layout.fake_api_size).context("fake API size does not fit u64")?;
+        let fake_api_end = layout
+            .fake_api_base
+            .checked_add(fake_api_size_u64)
+            .context("fake API end overflow")?
+            .checked_sub(1)
+            .context("fake API end underflow")?;
+
+        // Guest acceleration regions (outside host-stop hook range for helpers).
+        engine
+            .mem_map(
+                layout.guest_io_code_base,
+                layout.guest_io_code_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest I/O code region")?;
+        engine
+            .mem_map(
+                layout.guest_io_table_base,
+                layout.guest_io_table_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest I/O handle table")?;
+        engine
+            .mem_map(
+                layout.guest_file_data_base,
+                layout.guest_file_data_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest file-data arena")?;
+        engine
+            .mem_map(
+                layout.guest_fls_table_base,
+                layout.guest_fls_table_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest FLS table")?;
+        engine
+            .mem_write(
+                layout.guest_fls_table_base,
+                &vec![0_u8; layout.guest_fls_table_size],
+            )
+            .context("failed to zero guest FLS table")?;
+
+        // Plant trivial WinAPI as real x86-64 stubs and build stop-bit mask.
+        // Out-of-line helpers (FlsGetValue) land in the guest I/O code page.
+        let mut stop_bitmap = crate::guest_stubs::plant_guest_stubs(
+            &mut engine,
+            &fake_api_entries,
+            layout.fake_api_base,
+            layout.fake_api_size,
+            layout.guest_fls_table_base,
+            layout.guest_io_code_base + 0x600, // after ReadFile/SetFP/GetFS impls
+            0x400,                             // FlsGetValue + FlsSetValue out-of-line bodies
+        )?;
+
+        let guest_io_config = crate::guest_io::install_guest_io(
+            &mut engine,
+            &mut fake_api_entries,
+            &mut fake_api_by_va,
+            &mut stop_bitmap,
+            &layout,
+        )?;
+
+        engine
+            .mem_map(
+                layout.guest_heap_ctrl_base,
+                layout.guest_heap_ctrl_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest heap control")?;
+        engine
+            .mem_map(
+                layout.guest_heap_code_base,
+                layout.guest_heap_code_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest heap code")?;
+
+        let guest_heap_cfg = crate::guest_heap_accel::install_guest_heap_accel(
+            &mut engine,
+            &mut fake_api_entries,
+            &mut fake_api_by_va,
+            &mut stop_bitmap,
+            &layout,
+        )?;
+
+        engine
+            .mem_map(
+                layout.guest_mbwc_code_base,
+                layout.guest_mbwc_code_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map guest MultiByteToWideChar code")?;
+        let _guest_mbwc = crate::guest_mbwc::install_guest_mbwc(
+            &mut engine,
+            &mut fake_api_entries,
+            &mut fake_api_by_va,
+            &mut stop_bitmap,
+            &layout,
+        )?;
+
+        engine
+            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
+            .context("failed to install persistent Unicorn runtime hooks")?;
+
+        engine
+            .mem_map(layout.stack_base, layout.stack_size, wie_cpu::perm::ALL)
+            .context("failed to map entry stack memory")?;
+
+        let stack_size_u64 =
+            u64::try_from(layout.stack_size).context("stack size does not fit u64")?;
+
+        let stack_top = layout
+            .stack_base
+            .checked_add(stack_size_u64)
+            .context("entry stack top overflow")?;
+
+        let initial_rsp = stack_top
+            .checked_sub(0x1008)
+            .context("entry initial RSP underflow")?;
+
+        engine
+            .write_rsp(initial_rsp)
+            .context("failed to initialize entry RSP")?;
+
+        engine
+            .mem_map(layout.teb_low_base, layout.teb_low_size, wie_cpu::perm::ALL)
+            .context("failed to map fake low TEB page")?;
+
+        let stack_limit = layout.stack_base;
+
+        engine
+            .mem_write(0x08, &stack_top.to_le_bytes())
+            .context("failed to write fake TEB StackBase")?;
+
+        engine
+            .mem_write(0x10, &stack_limit.to_le_bytes())
+            .context("failed to write fake TEB StackLimit")?;
+
+        // TEB.LastErrorValue (x64 offset 0x68) — guest GetLastError/SetLastError stubs.
+        engine
+            .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &0_u32.to_le_bytes())
+            .context("failed to zero TEB LastErrorValue")?;
+
+        engine
+            .mem_map(
+                layout.env_data_base,
+                layout.env_data_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map entry environment data memory")?;
+
+        // Guest page for UCRT FILE* cookies / CRT pointer slots (ucrt module).
+        engine
+            .mem_map(0x0000_0000_6800_0000, 0x1000, wie_cpu::perm::ALL)
+            .context("failed to map guest UCRT data page")?;
+
+        let command_line_a_ptr = layout
+            .env_data_base
+            .checked_add(0x100)
+            .context("entry command line A pointer overflow")?;
+
+        let command_line_w_ptr = layout
+            .env_data_base
+            .checked_add(0x200)
+            .context("entry command line W pointer overflow")?;
+
+        let environment_strings_w_ptr = layout
+            .env_data_base
+            .checked_add(0x400)
+            .context("entry environment strings W pointer overflow")?;
+
+        let module_file_name_a_ptr = layout
+            .env_data_base
+            .checked_add(0x700)
+            .context("entry module file name A pointer overflow")?;
+
+        let module_file_name_w_ptr = layout
+            .env_data_base
+            .checked_add(0x800)
+            .context("entry module file name W pointer overflow")?;
+
+        let process = wie_pe::process_identity_from_host_path(path);
+        write_process_identity_strings(
+            &mut engine,
+            command_line_a_ptr,
+            command_line_w_ptr,
+            module_file_name_a_ptr,
+            module_file_name_w_ptr,
+            &process,
+        )?;
+
+        let environment_strings_w = build_default_environment_strings_w()?;
+
+        engine
+            .mem_write(environment_strings_w_ptr, &environment_strings_w)
+            .context("failed to write entry UTF-16 environment strings")?;
+
+        engine
+            .mem_map(
+                layout.process_heap_base,
+                layout.process_heap_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map fake process heap memory")?;
+
+        engine
+            .mem_map(
+                layout.process_heap_shadow_base(),
+                layout.process_heap_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map fake process heap shadow memory")?;
+
+        engine
+            .mem_map(
+                layout.resource_data_base,
+                layout.resource_data_size,
+                wie_cpu::perm::ALL,
+            )
+            .context("failed to map fake resource memory")?;
+
+        let environment = default_winapi_environment(
+            &layout,
+            image_summary.image_base,
+            command_line_a_ptr,
+            command_line_w_ptr,
+            environment_strings_w_ptr,
+            module_file_name_a_ptr,
+            module_file_name_w_ptr,
+        );
+
+        let executable_file_bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read executable bytes: {}", path.display(),))?;
+
+        let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
+
+        winapi_state.message_queue_idle_policy = idle_policy;
+        winapi_state.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
+            table_va: guest_io_config.table_va,
+            file_data_base: guest_io_config.file_data_base,
+            file_data_size: guest_io_config.file_data_size,
+        });
+        winapi_state.guest_file_data_next = layout.guest_file_data_base;
+        winapi_state.guest_fls_table_va = layout.guest_fls_table_base;
+        winapi_state
+            .heap
+            .attach_guest_control(guest_heap_cfg.ctrl_va);
+
+        Ok(Self::from_init(SessionInit {
+            engine,
+            environment,
+            winapi_state,
+            fake_api_entries,
+            fake_api_by_va,
+            layout,
+            entry_point_va: image_summary.entry_point_va,
+            initial_rsp,
+        }))
+    }
+
+    /// Returns the PE entry-point address associated with this session.
+    #[must_use]
+    pub fn entry_point_va(&self) -> u64 {
+        self.entry_point_va
+    }
+
+    /// Sets the bottle root for guest `C:\…` → host `{root}/drive_c/…` mapping.
+    ///
+    /// Overrides any `WIE_ROOT` applied at session construction.
+    pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.winapi_state.bottle_root = root;
+    }
+
+    /// Returns the original stack pointer used to start the guest.
+    #[must_use]
+    pub fn initial_rsp(&self) -> u64 {
+        self.initial_rsp
+    }
+
+    /// Returns the guest memory layout used by this session.
+    #[must_use]
+    pub fn layout(&self) -> RuntimeMemoryLayout {
+        self.layout
+    }
+
+    /// Changes the behavior of `GetMessageA` when the queue is empty.
+    pub fn set_message_queue_idle_policy(&mut self, policy: wie_winapi::MessageQueueIdlePolicy) {
+        self.winapi_state.message_queue_idle_policy = policy;
+    }
+
+    /// Adds one message to the persistent guest message queue.
+    pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
+        self.winapi_state.message_queue.push(message);
+    }
+
+    /// Runs the guest until it yields, terminates, reaches an unsupported API,
+    /// or processes `max_api` additional API calls.
+    pub fn run_until_stop(&mut self, max_api: usize) -> Result<RuntimeRunSummary> {
+        let fake_api_size_u64 =
+            u64::try_from(self.layout.fake_api_size).context("fake API size does not fit u64")?;
+
+        let fake_api_end = self
+            .layout
+            .fake_api_base
+            .checked_add(fake_api_size_u64)
+            .context("fake API end overflow")?
+            .checked_sub(1)
+            .context("fake API end underflow")?;
+
+        let instruction_budget = self.layout.instruction_budget;
+        let no_hook_limit = self.layout.no_hook_slice_limit;
+
+        let mut events: Vec<crate::trace::EntryTraceEvent> = Vec::new();
+        let mut termination = EntryTraceTermination::ApiLimit;
+
+        // High-frequency FS / sync APIs are not charged against `max_api` so ROM loads can
+        // finish; a separate absolute cap still bounds pure spin loops.
+        let max_noisy_api = max_api
+            .saturating_mul(50)
+            .max(max_api.saturating_add(50_000));
+        let mut charged_api = 0_usize;
+        let mut noisy_api = 0_usize;
+
+        while charged_api < max_api {
+            if noisy_api >= max_noisy_api {
+                termination = EntryTraceTermination::ApiLimit;
+                break;
+            }
+
+            let index = self.next_api_index;
+
+            self.next_api_index = self
+                .next_api_index
+                .checked_add(1)
+                .context("runtime API index overflow")?;
+
+            let current_rip = self
+                .engine
+                .read_rip()
+                .context("failed to read RIP before runtime step")?;
+
+            let begin = if current_rip == 0 {
+                self.entry_point_va
+            } else {
+                current_rip
+            };
+
+            let emu_t0 = self.profile_enabled.then(Instant::now);
+            let hook_result = self.engine.run_until_stop(
+                begin,
+                0,
+                0,
+                instruction_budget,
+                self.layout.fake_api_base,
+                fake_api_end,
+            );
+            if let Some(t0) = emu_t0 {
+                self.profile.emu_ns = self.profile.emu_ns.saturating_add(t0.elapsed().as_nanos());
+            }
+
+            let (hook, invalid_memory) = match hook_result {
+                Ok(result) => (result.code, result.invalid_memory),
+                Err(error) => {
+                    let rip = self
+                        .engine
+                        .read_rip()
+                        .context("failed to read RIP after runtime emulation error")?;
+
+                    let rsp = self
+                        .engine
+                        .read_rsp()
+                        .context("failed to read RSP after runtime emulation error")?;
+
+                    // Diagnostic: indirect-call slot used by recent crash sites.
+                    let mut slot = [0_u8; 8];
+                    let slot_va = rsp.wrapping_add(0x160);
+                    let slot_val = self
+                        .engine
+                        .mem_read(slot_va, &mut slot)
+                        .ok()
+                        .map(|()| u64::from_le_bytes(slot));
+                    let last_api = match events.last() {
+                        Some(e) => format!("{}!{}", e.library, e.name),
+                        None => "-".into(),
+                    };
+                    termination = EntryTraceTermination::RuntimeStop(format!(
+                        "emulation error (api_index={index}, last_api={last_api}): {error}; \
+                         rip={rip:#018x}; rsp={rsp:#018x}; [rsp+0x160]={slot_val:?}"
+                    ));
+
+                    break;
+                }
+            };
+
+            if invalid_memory.hit {
+                let rip = self
+                    .engine
+                    .read_rip()
+                    .context("failed to read RIP after invalid memory access")?;
+
+                let rsp = self
+                    .engine
+                    .read_rsp()
+                    .context("failed to read RSP after invalid memory access")?;
+
+                let rax = self
+                    .engine
+                    .read_rax()
+                    .context("failed to read RAX after invalid memory access")?;
+
+                let rcx = self
+                    .engine
+                    .read_rcx()
+                    .context("failed to read RCX after invalid memory access")?;
+
+                let rdx = self
+                    .engine
+                    .read_rdx()
+                    .context("failed to read RDX after invalid memory access")?;
+
+                let r8 = self
+                    .engine
+                    .read_r8()
+                    .context("failed to read R8 after invalid memory access")?;
+
+                let r9 = self
+                    .engine
+                    .read_r9()
+                    .context("failed to read R9 after invalid memory access")?;
+
+                termination = EntryTraceTermination::RuntimeStop(format!(
+                    "invalid memory access before fake API hook: \
+                     type={} address={:#018x} size={} value={} \
+                     rip={rip:#018x}; rsp={rsp:#018x}; rax={rax:#018x}; \
+                     rcx={rcx:#018x}; rdx={rdx:#018x}; \
+                     r8={r8:#018x}; r9={r9:#018x}",
+                    invalid_memory.access_type,
+                    invalid_memory.address,
+                    invalid_memory.size,
+                    invalid_memory.value,
+                ));
+
+                break;
+            }
+
+            if !hook.hit {
+                let rip = self
+                    .engine
+                    .read_rip()
+                    .context("failed to read RIP after no-hook stop")?;
+
+                let rsp = self
+                    .engine
+                    .read_rsp()
+                    .context("failed to read RSP after no-hook stop")?;
+
+                let rax = self
+                    .engine
+                    .read_rax()
+                    .context("failed to read RAX after no-hook stop")?;
+
+                let rcx = self
+                    .engine
+                    .read_rcx()
+                    .context("failed to read RCX after no-hook stop")?;
+
+                let rdx = self
+                    .engine
+                    .read_rdx()
+                    .context("failed to read RDX after no-hook stop")?;
+
+                self.no_hook_slices = self
+                    .no_hook_slices
+                    .checked_add(1)
+                    .context("no-hook slice count overflow")?;
+
+                if self.no_hook_slices == 1
+                    || self.no_hook_slices.is_multiple_of(5)
+                    || self.no_hook_slices == no_hook_limit
+                {
+                    tracing::debug!(
+                        slice = self.no_hook_slices,
+                        limit = no_hook_limit,
+                        begin,
+                        rip,
+                        rsp,
+                        rax,
+                        rcx,
+                        rdx,
+                        "runtime no-hook slice"
+                    );
+                }
+
+                if self.no_hook_slices < no_hook_limit {
+                    continue;
+                }
+
+                termination = EntryTraceTermination::RuntimeStop(format!(
+                    "emulation stopped without hitting fake API hook after {} slices: \
+                     begin={begin:#018x}; rip={rip:#018x}; rsp={rsp:#018x}; \
+                     rax={rax:#018x}; rcx={rcx:#018x}; rdx={rdx:#018x}; \
+                     budget={instruction_budget}",
+                    self.no_hook_slices,
+                ));
+
+                break;
+            }
+
+            self.no_hook_slices = 0;
+
+            if hook.address == self.layout.callback_return_trampoline_va {
+                match self.complete_guest_callback() {
+                    Ok(completion) => {
+                        charged_api = charged_api.saturating_add(1);
+                        events.push(EntryTraceEvent {
+                            index,
+                            library: completion.outer_library,
+                            name: completion.outer_name,
+                            fake_target_va: completion.outer_fake_va,
+                            handled: true,
+                            return_value: Some(completion.return_value),
+                            return_address: Some(completion.return_address),
+                        });
+                        self.publish_last_error_to_guest();
+                        continue;
+                    }
+                    Err(error) => {
+                        termination = EntryTraceTermination::RuntimeStop(format!(
+                            "failed to complete guest callback: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            let resolve_t0 = self.profile_enabled.then(Instant::now);
+            let Some(resolved) =
+                find_fake_api_entry(&self.fake_api_entries, &self.fake_api_by_va, hook.address)
+            else {
+                termination = EntryTraceTermination::RuntimeStop(format!(
+                    "unresolved fake API at {:#018x}",
+                    hook.address,
+                ));
+                break;
+            };
+            if let Some(t0) = resolve_t0 {
+                self.profile.resolve_ns = self
+                    .profile
+                    .resolve_ns
+                    .saturating_add(t0.elapsed().as_nanos());
+            }
+
+            if self.profile_enabled {
+                self.profile.host_stops = self.profile.host_stops.saturating_add(1);
+            }
+
+            let export_key = if self.profile_enabled {
+                Some(format!("{}!{}", resolved.library, resolved.name))
+            } else {
+                None
+            };
+
+            // Guest SetLastError may have updated TEB since the last host stop.
+            // Inline field borrows so this coexists with `resolved` (&self.fake_api_entries).
+            {
+                let mut teb_err = [0_u8; 4];
+                if self
+                    .engine
+                    .mem_read(crate::guest_stubs::TEB_LAST_ERROR_VA, &mut teb_err)
+                    .is_ok()
+                {
+                    self.winapi_state.last_error = u32::from_le_bytes(teb_err);
+                }
+            }
+
+            let mut record_handler = |ns: u128, noisy: bool| {
+                if !self.profile_enabled {
+                    return;
+                }
+                self.profile.handler_ns = self.profile.handler_ns.saturating_add(ns);
+                if noisy {
+                    self.profile.noisy_calls = self.profile.noisy_calls.saturating_add(1);
+                } else {
+                    self.profile.charged_calls = self.profile.charged_calls.saturating_add(1);
+                }
+                if let Some(key) = export_key.as_ref() {
+                    let entry = self.profile.by_export.entry(key.clone()).or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(1);
+                    entry.1 = entry.1.saturating_add(ns);
+                }
+            };
+
+            if resolved.traits.exit_process() {
+                let handler_t0 = self.profile_enabled.then(Instant::now);
+                let exit_code_raw = self
+                    .engine
+                    .read_rcx()
+                    .context("failed to read RCX for ExitProcess")?;
+
+                let exit_code = u32::try_from(exit_code_raw & u64::from(u32::MAX))
+                    .context("ExitProcess code does not fit u32")?;
+
+                events.push(EntryTraceEvent {
+                    index,
+                    library: resolved.library.clone(),
+                    name: resolved.name.clone(),
+                    fake_target_va: hook.address,
+                    handled: true,
+                    return_value: None,
+                    return_address: None,
+                });
+
+                if let Some(t0) = handler_t0 {
+                    record_handler(t0.elapsed().as_nanos(), false);
+                }
+
+                termination = EntryTraceTermination::ExitProcess { code: exit_code };
+
+                break;
+            }
+
+            if resolved.traits.fast_void_sync() {
+                let handler_t0 = self.profile_enabled.then(Instant::now);
+                self.engine
+                    .return_from_win64_api(0)
+                    .context("failed to return from fast synchronization API")?;
+                if let Some(t0) = handler_t0 {
+                    record_handler(t0.elapsed().as_nanos(), true);
+                }
+
+                noisy_api = noisy_api.saturating_add(1);
+                self.publish_last_error_to_guest();
+                continue;
+            }
+
+            // Ultra-hot host path: HeapAlloc is the dominant stop after guest stubs.
+            // Call the lean handler without string dispatch.
+            if matches!(
+                resolved.winapi_id,
+                Some(wie_winapi::WinApiId::Kernel32Heapalloc)
+            ) {
+                let handler_t0 = self.profile_enabled.then(Instant::now);
+                wie_winapi::kernel32::handle_heap_alloc(&mut self.engine, &mut self.winapi_state)?;
+                if let Some(t0) = handler_t0 {
+                    record_handler(t0.elapsed().as_nanos(), true);
+                }
+                noisy_api = noisy_api.saturating_add(1);
+                self.publish_last_error_to_guest();
+                continue;
+            }
+
+            if matches!(
+                resolved.winapi_id,
+                Some(wie_winapi::WinApiId::Kernel32Heapfree)
+            ) {
+                let handler_t0 = self.profile_enabled.then(Instant::now);
+                wie_winapi::kernel32::handle_heap_free(&mut self.engine, &mut self.winapi_state)?;
+                if let Some(t0) = handler_t0 {
+                    record_handler(t0.elapsed().as_nanos(), true);
+                }
+                noisy_api = noisy_api.saturating_add(1);
+                self.publish_last_error_to_guest();
+                continue;
+            }
+
+            // MultiByteToWideChar host fallback / non-SBCS path (guest handles ACP/1252/437).
+            if matches!(
+                resolved.winapi_id,
+                Some(wie_winapi::WinApiId::Kernel32Multibytetowidechar)
+            ) {
+                let handler_t0 = self.profile_enabled.then(Instant::now);
+                wie_winapi::kernel32::handle_multi_byte_to_wide_char(&mut self.engine)?;
+                if let Some(t0) = handler_t0 {
+                    record_handler(t0.elapsed().as_nanos(), true);
+                }
+                noisy_api = noisy_api.saturating_add(1);
+                self.publish_last_error_to_guest();
+                continue;
+            }
+
+            let handler_t0 = self.profile_enabled.then(Instant::now);
+            let dispatch_result = if let Some(id) = resolved.winapi_id {
+                wie_winapi::dispatch_winapi_id(
+                    &mut self.engine,
+                    self.environment,
+                    &mut self.winapi_state,
+                    id,
+                )
+            } else {
+                wie_winapi::dispatch_winapi(
+                    &mut self.engine,
+                    self.environment,
+                    &mut self.winapi_state,
+                    &resolved.library,
+                    &resolved.name,
+                )
+            };
+            let handler_ns = handler_t0.map(|t0| t0.elapsed().as_nanos()).unwrap_or(0);
+
+            match dispatch_result {
+                Ok(handler_result) => {
+                    if resolved.traits.noisy() {
+                        record_handler(handler_ns, true);
+                        noisy_api = noisy_api.saturating_add(1);
+                    } else {
+                        record_handler(handler_ns, false);
+                        charged_api = charged_api.saturating_add(1);
+                        events.push(EntryTraceEvent {
+                            index,
+                            library: resolved.library.clone(),
+                            name: resolved.name.clone(),
+                            fake_target_va: hook.address,
+                            handled: true,
+                            return_value: Some(handler_result.return_value),
+                            return_address: Some(handler_result.return_address),
+                        });
+                    }
+                    let j_lib = resolved.library.clone();
+                    let j_name = resolved.name.clone();
+                    let j_ret = handler_result.return_value;
+                    let j_retaddr = handler_result.return_address;
+                    self.publish_last_error_to_guest();
+                    // WIE_API_JOURNAL=path — one line per host return for dual-backend diff.
+                    journal_api_return(index, &j_lib, &j_name, &mut self.engine, j_ret, j_retaddr);
+                }
+
+                Err(error) => {
+                    record_handler(handler_ns, false);
+                    let control_signal = error.downcast_ref::<wie_winapi::WinApiControlSignal>();
+
+                    match control_signal {
+                        Some(wie_winapi::WinApiControlSignal::WaitingForMessage) => {
+                            self.next_api_index = self
+                                .next_api_index
+                                .checked_sub(1)
+                                .context("runtime API index underflow after message yield")?;
+
+                            termination = EntryTraceTermination::WaitingForMessage;
+
+                            break;
+                        }
+
+                        Some(wie_winapi::WinApiControlSignal::GuestCallbackRequested {
+                            request,
+                        }) => {
+                            let outer_library = resolved.library.clone();
+                            let outer_name = resolved.name.clone();
+                            let request = *request;
+
+                            tracing::debug!(
+                                callback = request.callback_address,
+                                hwnd = request.window_handle,
+                                message = request.message,
+                                wparam = request.word_parameter,
+                                lparam = request.long_parameter,
+                                unicode = request.unicode,
+                                "beginning guest window callback"
+                            );
+
+                            // Charge the outer message API once; the completion event
+                            // is charged separately when the trampoline returns.
+                            charged_api = charged_api.saturating_add(1);
+                            events.push(EntryTraceEvent {
+                                index,
+                                library: outer_library.clone(),
+                                name: outer_name.clone(),
+                                fake_target_va: hook.address,
+                                handled: true,
+                                return_value: None,
+                                return_address: None,
+                            });
+
+                            if let Err(error) = self.begin_guest_callback(
+                                request,
+                                &outer_library,
+                                &outer_name,
+                                hook.address,
+                            ) {
+                                termination = EntryTraceTermination::RuntimeStop(format!(
+                                    "failed to begin guest callback: {error}"
+                                ));
+                                break;
+                            }
+
+                            // Continue the run loop so the WndProc executes and
+                            // may itself call more WinAPI functions.
+                            continue;
+                        }
+
+                        None => {
+                            let api = format!("{}!{}: {error}", resolved.library, resolved.name,);
+
+                            events.push(EntryTraceEvent {
+                                index,
+                                library: resolved.library.clone(),
+                                name: resolved.name.clone(),
+                                fake_target_va: hook.address,
+                                handled: false,
+                                return_value: None,
+                                return_address: None,
+                            });
+
+                            termination = EntryTraceTermination::UnsupportedApi(api);
+
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_rip = self
+            .engine
+            .read_rip()
+            .context("failed to read final runtime RIP")?;
+
+        let final_rsp = self
+            .engine
+            .read_rsp()
+            .context("failed to read final runtime RSP")?;
+
+        Ok(RuntimeRunSummary {
+            events,
+            termination,
+            final_rip,
+            final_rsp,
+        })
+    }
+
+    /// Queues one deterministic USER32 message for the guest.
+    pub fn post_window_message(
+        &mut self,
+        window_handle: u64,
+        message: u32,
+        word_parameter: u64,
+        long_parameter: u64,
+    ) -> Result<()> {
+        let time = self.winapi_state.next_message_time;
+
+        self.winapi_state.next_message_time = self
+            .winapi_state
+            .next_message_time
+            .checked_add(1)
+            .context("runtime message timestamp overflow")?;
+
+        self.winapi_state
+            .message_queue
+            .push(wie_winapi::QueuedWindowMessage {
+                window_handle,
+                message,
+                word_parameter,
+                long_parameter,
+                time,
+                point_x: 0,
+                point_y: 0,
+            });
+
+        Ok(())
+    }
+
+    /// Returns the first window backed by a guest WndProc.
+    #[must_use]
+    pub fn first_guest_window_handle(&self) -> Option<u64> {
+        self.winapi_state
+            .windows
+            .iter()
+            .find(|window| window.window_proc != 0)
+            .map(|window| window.handle)
+    }
+
+    /// Snapshot of runtime-owned windows (handle, class, title, has WndProc).
+    #[must_use]
+    pub fn guest_windows_snapshot(&self) -> Vec<(u64, String, String, bool)> {
+        self.winapi_state
+            .windows
+            .iter()
+            .map(|window| {
+                (
+                    window.handle,
+                    window.class_name.clone(),
+                    window.title.clone(),
+                    window.window_proc != 0,
+                )
+            })
+            .collect()
+    }
+
+    /// Prefers the main Lunar Magic frame window when choosing a WM_COMMAND target.
+    #[must_use]
+    pub fn preferred_command_window_handle(&self) -> Option<u64> {
+        let windows = &self.winapi_state.windows;
+
+        windows
+            .iter()
+            .find(|window| {
+                window.window_proc != 0
+                    && (window.title.to_ascii_lowercase().contains("lunar")
+                        || window.class_name.to_ascii_lowercase().contains("lunar"))
+            })
+            .or_else(|| {
+                windows
+                    .iter()
+                    .find(|window| window.window_proc != 0 && window.visible && window.width >= 200)
+            })
+            .or_else(|| windows.iter().find(|window| window.window_proc != 0))
+            .map(|window| window.handle)
+    }
+
+    /// Number of guest callbacks currently nested on the bridge stack.
+    #[must_use]
+    pub fn pending_callback_depth(&self) -> usize {
+        self.pending_callbacks.len()
+    }
+
+    /// Configures the next common file dialog outcome (`GetOpenFileName` / `GetSaveFileName`).
+    pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::FileDialogPolicy) {
+        self.winapi_state.file_dialog_policy = policy;
+    }
+
+    /// Returns the last path accepted by a simulated file dialog.
+    #[must_use]
+    pub fn last_file_dialog_path(&self) -> Option<&str> {
+        self.winapi_state.last_file_dialog_path.as_deref()
+    }
+
+    /// Mounts a host file so the guest can open it via `CreateFile*` under `guest_path`.
+    pub fn mount_host_file(
+        &mut self,
+        guest_path: &str,
+        host_path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        wie_winapi::kernel32::mount_host_file(&mut self.winapi_state, guest_path, host_path)
+    }
+
+    /// Opens a guest path with the same rules as `CreateFile*` (for smoke tests).
+    pub fn open_guest_path(&mut self, guest_path: &str) -> Result<u64> {
+        wie_winapi::kernel32::open_guest_path(&mut self.winapi_state, guest_path)
+    }
+
+    /// Returns the size of an open guest file handle.
+    pub fn guest_file_size(&self, handle: u64) -> Result<u64> {
+        let file = self
+            .winapi_state
+            .open_files
+            .iter()
+            .find(|file| file.handle == handle)
+            .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
+
+        u64::try_from(file.bytes.len()).context("guest file size does not fit u64")
+    }
+
+    /// Reads a slice from an open guest file without advancing the cursor.
+    pub fn peek_guest_file(&self, handle: u64, offset: usize, len: usize) -> Result<Vec<u8>> {
+        let file = self
+            .winapi_state
+            .open_files
+            .iter()
+            .find(|file| file.handle == handle)
+            .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
+
+        let end = offset
+            .checked_add(len)
+            .context("guest file peek range overflow")?;
+
+        file.bytes
+            .get(offset..end)
+            .map(<[u8]>::to_vec)
+            .with_context(|| {
+                format!(
+                    "guest file peek out of range handle={handle:#018x} offset={offset} len={len}"
+                )
+            })
+    }
+
+    /// Snapshot of currently open guest files (path + handle + size).
+    #[must_use]
+    pub fn open_guest_files_snapshot(&self) -> Vec<(u64, String, u64)> {
+        self.winapi_state
+            .open_files
+            .iter()
+            .filter_map(|file| {
+                let size = u64::try_from(file.bytes.len()).ok()?;
+                Some((file.handle, file.path.clone(), size))
+            })
+            .collect()
+    }
+
+    /// Sets up Win64 calling convention and transfers control to a guest WndProc.
+    ///
+    /// Stack layout below the original `DispatchMessageA` frame:
+    /// ```text
+    /// [dispatch_rsp]      return address of DispatchMessageA caller
+    /// [dispatch_rsp-8]    alignment padding
+    /// [dispatch_rsp-0x28] 32-byte shadow space
+    /// [dispatch_rsp-0x30] trampoline return address  ← new RSP / WndProc entry
+    /// ```
+    fn begin_guest_callback(
+        &mut self,
+        request: wie_winapi::GuestCallbackRequest,
+        outer_library: &str,
+        outer_name: &str,
+        outer_fake_va: u64,
+    ) -> Result<()> {
+        let trampoline = self.layout.callback_return_trampoline_va;
+        let dispatch_rsp = crate::guest_callback::install_guest_callback_frame(
+            self.engine.as_mut(),
+            &request,
+            trampoline,
+        )?;
+        let create_window_hwnd =
+            crate::guest_callback::create_window_hwnd_for_outer(outer_name, request.window_handle);
+
+        self.pending_callbacks.push(PendingGuestCallback {
+            dispatch_rsp,
+            request,
+            outer_library: outer_library.to_owned(),
+            outer_name: outer_name.to_owned(),
+            outer_fake_va,
+            create_window_hwnd,
+        });
+
+        Ok(())
+    }
+
+    /// Completes the most recent guest WndProc and returns from the outer host API.
+    fn complete_guest_callback(&mut self) -> Result<GuestCallbackCompletion> {
+        let pending = self
+            .pending_callbacks
+            .pop()
+            .context("callback trampoline hit without a pending guest callback")?;
+
+        let (return_value, return_address) = crate::guest_callback::finish_guest_callback(
+            self.engine.as_mut(),
+            pending.dispatch_rsp,
+            pending.create_window_hwnd,
+        )?;
+
+        tracing::debug!(
+            outer = %format!("{}!{}", pending.outer_library, pending.outer_name),
+            callback = pending.request.callback_address,
+            hwnd = pending.request.window_handle,
+            message = pending.request.message,
+            return_value,
+            resume = return_address,
+            "completed guest window callback"
+        );
+
+        Ok(GuestCallbackCompletion {
+            outer_library: pending.outer_library,
+            outer_name: pending.outer_name,
+            outer_fake_va: pending.outer_fake_va,
+            return_value,
+            return_address,
+        })
+    }
+}
+
+/// Result of finishing one bridged guest WndProc call.
+struct GuestCallbackCompletion {
+    outer_library: String,
+    outer_name: String,
+    outer_fake_va: u64,
+    return_value: u64,
+    return_address: u64,
+}
+
+/// Append one journal line when `WIE_API_JOURNAL` is set (backend A/B diffs).
+fn journal_api_return(
+    index: usize,
+    library: &str,
+    name: &str,
+    engine: &mut dyn wie_cpu::CpuEngine,
+    return_value: u64,
+    return_address: u64,
+) {
+    let Ok(path) = std::env::var("WIE_API_JOURNAL") else {
+        return;
+    };
+    let rip = engine.read_rip().unwrap_or(0);
+    let rsp = engine.read_rsp().unwrap_or(0);
+    let rax = engine.read_rax().unwrap_or(return_value);
+    let rcx = engine.read_rcx().unwrap_or(0);
+    let rdx = engine.read_rdx().unwrap_or(0);
+    let r8 = engine.read_r8().unwrap_or(0);
+    let r9 = engine.read_r9().unwrap_or(0);
+    // Sample stack slots that the crash site uses as call tables.
+    let mut slot160 = [0_u8; 8];
+    let s160 = engine
+        .mem_read(rsp.wrapping_add(0x160), &mut slot160)
+        .ok()
+        .map_or(0_u64, |()| u64::from_le_bytes(slot160));
+    let line = format!(
+        "{index}|{library}|{name}|ret={return_value:#x}|retaddr={return_address:#x}|\
+         rip={rip:#x}|rsp={rsp:#x}|rax={rax:#x}|rcx={rcx:#x}|rdx={rdx:#x}|r8={r8:#x}|r9={r9:#x}|\
+         [rsp+160]={s160:#x}\n"
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+}

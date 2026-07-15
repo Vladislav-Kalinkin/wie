@@ -1,0 +1,22 @@
+[package]
+name = "wie-cpu"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WIE CPU engine trait and backends (Cranelift JIT default; iced interpreter)"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libc = "0.2"
+iced-x86 = "1.21"
+# Phase 2: host-native block JIT (Apple Silicon = ARM64)
+cranelift = "0.133"
+cranelift-codegen = "0.133"
+cranelift-jit = "0.133"
+cranelift-native = "0.133"
+cranelift-module = "0.133"
+
+[lints]
+workspace = true

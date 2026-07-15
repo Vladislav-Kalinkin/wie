@@ -1,0 +1,88 @@
+[workspace]
+members = [
+    "crates/wie-pe",
+    "crates/wie-runtime",
+    "crates/wie-winapi",
+    "crates/wie-cli",
+    "crates/wie-cpu",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.97"
+license = "AGPL-3.0-only"
+authors = ["Vlad"]
+repository = ""
+homepage = ""
+description = "WIE — Windows PE64 userspace emulator (Cranelift JIT + iced)"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+goblin = "0.9"
+
+clap = { version = "4.5", features = ["derive"] }
+
+[workspace.lints.rust]
+# `deny` (not `forbid`) so wie-cpu can allow unsafe for Cranelift JIT entry points.
+unsafe_code = "deny"
+missing_docs = "allow"
+unused_extern_crates = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+let_underscore_drop = "deny"
+elided_lifetimes_in_paths = "warn"
+explicit_outlives_requirements = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2021_prelude_collisions = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+indexing_slicing = "deny"
+integer_division = "warn"
+arithmetic_side_effects = "warn"
+
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+cast_sign_loss = "deny"
+
+dbg_macro = "deny"
+print_stdout = "allow"
+print_stderr = "allow"
+
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+large_enum_variant = "warn"
+large_stack_arrays = "warn"
+needless_pass_by_value = "warn"
+
+[profile.release]
+lto = true                # Link-Time Optimization: глобальная оптимизация между всеми крейтами
+codegen-units = 1         # Сборка в один поток для максимальной LTO-оптимизации кода
+panic = "abort"           # Вырезает тяжелую инфраструктуру раскрутки стека (stack unwinding)
+strip = true              # Полностью вырезает все отладочные символы и таблицы из бинарника

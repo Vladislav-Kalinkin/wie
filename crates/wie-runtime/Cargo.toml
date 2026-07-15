@@ -1,0 +1,15 @@
+[package]
+name = "wie-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+wie-pe = { path = "../wie-pe" }
+wie-cpu = { path = "../wie-cpu" }
+wie-winapi = { path = "../wie-winapi" }
