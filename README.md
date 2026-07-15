@@ -35,7 +35,36 @@ cargo build -p wie-cli --release
 ## Quick start
 
 ```bash
-make -C micro-exes                    # needs x86_64-w64-mingw32-gcc
 ./target/release/wie-cli run-micro micro-exes/out/heap_alloc.exe
 ./target/release/wie-cli run-micro micro-exes/out/crt_hello.exe --max-api 8000
+```
+
+## Installation & Prerequisites
+
+To build the emulator and compile the test micro-executables on Apple Silicon Mac, you need to install the Rust toolchain and an x86_64 cross-compiler.
+
+### 1. Install System Dependencies
+
+Use [Homebrew](https://brew.sh) to install the required cross-compiler:
+
+```bash
+brew install mingw-w64
+```
+
+### 2. Clone and Build WIE
+
+Clone the repository and build the CLI tool in release mode:
+
+```bash
+git clone https://github.com/Vladislav-Kalinkin/wie
+cd wie
+cargo build -p wie-cli --release
+```
+
+### 3. Compile Test Binaries
+
+Build the local x86_64 PE samples using the installed MinGW compiler:
+
+```bash
+make -C micro-exes
 ```
