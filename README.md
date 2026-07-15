@@ -3,8 +3,6 @@
 **WIE** (_Wie Is Emulator_) — experimental **PE64 userspace emulator** in Rust.
 
 **Product:** generic PE64 userspace. Prove WinAPI with **micro-PE64s** + Microsoft docs.
-Lunar Magic open-rom is optional integration stress, not the design driver.
-See [`docs/PIVOT.md`](docs/PIVOT.md).
 
 **Universal PE64** — no per-EXE cheats. x86-64 only (no 32-bit).
 
