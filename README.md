@@ -9,7 +9,18 @@
 
 At the moment, the project has more than a hundred different plugs made only to build the emulator engine and are not the final solution
 
-### Core Components
+## Example
+
+```
+time ./target/release/wie-cli run micro-exes/out/crt_hello.exe
+hello from crt
+entry=0x0000000140001440 initial_rsp=0x000000002000eff8 termination=ExitProcess { code: 0 } final_rip=0x00007000000001f0 final_rsp=0x000000002000ef28
+api[0] handled fake=0x0000700000000050 ret=0x0000000000000000 resume=0x000000014000118d KERNEL32.dll!SetUnhandledExceptionFilter
+api[1] handled fake=0x00007000000001f0 ret=- resume=- api-ms-win-crt-runtime-l1-1-0.dll!exit
+./target/release/wie-cli run micro-exes/out/crt_hello.exe  0.02s user 0.03s system 81% cpu 0.059 total
+```
+
+## Core Components
 
 - **`wie-cpu`** – the CPU core. Provides two backends:
   - **`JitCpu`** (default) – compiles x86‑64 basic blocks into ARM64 machine code via **Cranelift**. Compiled blocks are cached and can be chained directly without returning to the dispatcher.
@@ -21,7 +32,7 @@ At the moment, the project has more than a hundred different plugs made only to 
 
 - **`wie-pe`** – PE64 parsing, section loading, import table processing, and IAT patching with fake addresses.
 
-### Execution Flow
+## Execution Flow
 
 1. **PE Loading**  
    `wie-pe` reads the file, builds the in‑memory image at virtual addresses, and parses the import table. Every imported function gets a **fake address** in a reserved region (e.g., `0x7000_0000_0000_xxxx`). These addresses are written into the IAT.
@@ -44,19 +55,19 @@ At the moment, the project has more than a hundred different plugs made only to 
 7. **Host System Interaction**  
    File system emulation (via “bottles” – root directories mapped to `C:\`) and windowing (fake HWNDs, message queuing) are implemented on the host. For example, `CreateFile` opens a file under `WIE_ROOT/drive_c`, while window messages are queued and dispatched through guest WndProc callbacks.
 
-### JIT Compilation Details
+## JIT Compilation Details
 
 - **Granularity**: only basic blocks (up to 32 instructions) ending in a branch, call, or return are compiled.
 - **Hotness**: a block is compiled after 100 visits (or immediately for UCRT calls). Compiled blocks are cached in a `HashMap`.
 - **SSE2 Support**: common XMM operations (mov, xor, add/sub/mul/div scalar/packed) are compiled; everything else goes to the interpreter.
 - **Fast UCRT Imports**: calls to `malloc`, `free`, `memcpy`, `strlen`, `fwrite`, `fflush`, and `__acrt_iob_func` are compiled as direct host‑function calls, bypassing stops.
 
-### Memory Management
+## Memory Management
 
 - Guest memory is a `HashMap<page_key, Page>` backed by a 4‑level radix table for fast page lookups from JIT code.
 - Heaps are emulated using segregated free‑lists (24 size classes) plus a bump allocator. The guest and host heap structures are synchronised via a shared control block in guest memory, allowing the `HeapAlloc/HeapFree` accelerators to run without host stops.
 
-### Profiling and Debugging
+## Profiling and Debugging
 
 - Set `WIE_RUNTIME_PROFILE=1` to collect timing statistics (emulation, handlers, resolution) and call counts per API.
 - `WIE_API_JOURNAL=path` writes a log of every API call with register state, useful for comparing backends.
@@ -116,7 +127,7 @@ make -C micro-exes
 RUST_LOG=info ./scripts/run-micro-suite.sh
 ```
 
-### History
+## History
 
 At the early stage of building the engine, the project began as an experiment to create an alternative way to launch FuSoYa's Lunar Magic.
 
