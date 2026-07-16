@@ -50,18 +50,29 @@ const WM_SYSDEADCHAR: u32 = 0x0107;
 /// Handles `USER32.dll!GetAsyncKeyState`.
 pub fn handle_get_async_key_state(
     engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _virtual_key = engine
+    let virtual_key_raw = engine
         .read_rcx()
         .context("failed to read RCX for GetAsyncKeyState")?;
 
+    let virtual_key = usize::try_from(virtual_key_raw & 0xff)
+        .unwrap_or(0);
+
+    // Bit 15: key is currently down.  Bit 0: key was pressed since last call.
+    let key_state = state.keyboard_state.get(virtual_key).copied().unwrap_or(0);
+    let mut result = u64::from(key_state & 0x80);
+    if result != 0 {
+        result |= 1; // most-significant bit set → key down
+    }
+
     let return_address = engine
-        .return_from_win64_api(0)
+        .return_from_win64_api(result)
         .context("failed to return from GetAsyncKeyState")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 0,
+        return_value: result,
     })
 }
 

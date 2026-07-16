@@ -2188,7 +2188,7 @@ pub fn handle_find_next_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _find_handle = engine
+    let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindNextFileW")?;
 
@@ -2196,7 +2196,12 @@ pub fn handle_find_next_file_w(
         .read_rdx()
         .context("failed to read RDX for FindNextFileW")?;
 
-    state.last_error = ERROR_NO_MORE_FILES;
+    let valid = state.find_handles.iter().any(|h| h.handle == find_handle);
+    state.last_error = if valid {
+        ERROR_NO_MORE_FILES
+    } else {
+        ERROR_INVALID_HANDLE
+    };
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -2213,7 +2218,7 @@ pub fn handle_find_next_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _find_handle = engine
+    let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindNextFileA")?;
 
@@ -2221,7 +2226,12 @@ pub fn handle_find_next_file_a(
         .read_rdx()
         .context("failed to read RDX for FindNextFileA")?;
 
-    state.last_error = ERROR_NO_MORE_FILES;
+    let valid = state.find_handles.iter().any(|h| h.handle == find_handle);
+    state.last_error = if valid {
+        ERROR_NO_MORE_FILES
+    } else {
+        ERROR_INVALID_HANDLE
+    };
 
     let return_address = engine
         .return_from_win64_api(0)

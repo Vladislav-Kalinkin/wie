@@ -1370,7 +1370,7 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Findnextfilew => kernel32::handle_find_next_file_w(engine, state),
         WinApiId::Kernel32Findnextfilea => kernel32::handle_find_next_file_a(engine, state),
         WinApiId::Kernel32Findclose => kernel32::handle_find_close(engine, state),
-        WinApiId::User32Getasynckeystate => user32::handle_get_async_key_state(engine),
+        WinApiId::User32Getasynckeystate => user32::handle_get_async_key_state(engine, state),
         WinApiId::User32Peekmessagea => user32::handle_peek_message_a(engine, state),
         WinApiId::Kernel32Loadlibraryexa => {
             kernel32::handle_load_library_ex_a(engine, environment, state)
