@@ -4,7 +4,7 @@ use crate::iced_cpu::IcedCpu;
 use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
 
 /// Max instructions per compiled block (keeps compile time bounded).
-pub(super) const MAX_BLOCK_INSNS: usize = 32;
+pub(super) const MAX_BLOCK_INSNS: usize = 64;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
 pub(super) const MIN_BLOCK_INSNS: usize = 8;
 
@@ -56,14 +56,13 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
     let mut bytes_len = 0_u32;
     let mut term: Option<BlockTerm> = None;
 
-    for _ in 0..MAX_BLOCK_INSNS {
-        // Host-stop addresses must not be entered by JIT.
-        if let Some(h) = cpu.hooks_ref()
-            && h.should_host_stop(rip)
-        {
-            break;
-        }
+    if let Some(h) = cpu.hooks_ref()
+        && h.should_host_stop(start)
+    {
+        return BlockKind::NotPure;
+    }
 
+    for _ in 0..MAX_BLOCK_INSNS {
         let mut buf = [0_u8; 15];
         if cpu.mem_read_into(rip, &mut buf).is_err() {
             break;
@@ -105,8 +104,7 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
     // Lone / short blocks ending in bulk string, near-call (UCRT), or near-ret
     // (shadow-stack chaining) are worth compiling — beat iced + host-stop.
     let min = if insns.last().is_some_and(|d| {
-        is_string_op(&d.instr)
-            || matches!(d.instr.mnemonic(), Mnemonic::Call | Mnemonic::Ret)
+        is_string_op(&d.instr) || matches!(d.instr.mnemonic(), Mnemonic::Call | Mnemonic::Ret)
     }) {
         1
     } else {

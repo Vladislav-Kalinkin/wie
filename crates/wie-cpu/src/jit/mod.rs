@@ -500,13 +500,19 @@ impl JitEngine {
 
         let mut flag_builder = settings::builder();
         flag_builder
-            .set("use_colocated_libcalls", "false")
+            .set("opt_level", "speed_and_size")
+            .map_err(|e| e.to_string())?;
+        flag_builder
+            .set("enable_verifier", "false")
             .map_err(|e| e.to_string())?;
         flag_builder
             .set("is_pic", "false")
             .map_err(|e| e.to_string())?;
         flag_builder
-            .set("enable_verifier", "false")
+            .set("use_colocated_libcalls", "false")
+            .map_err(|e| e.to_string())?;
+        flag_builder
+            .set("enable_probestack", "false")
             .map_err(|e| e.to_string())?;
         // Prefer speed of generated code; opt_level=speed is default for cranelift-native.
         let isa_builder =
