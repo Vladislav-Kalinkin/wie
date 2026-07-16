@@ -2698,11 +2698,7 @@ fn finish_create_file(
             handle = return_value,
             "{api_name}"
         );
-        if let Some(file) = find_open_file(state, return_value) {
-            let bytes = file.bytes.clone();
-            let _ =
-                crate::guest_io_host::register_open_file(engine, state, return_value, &bytes).ok();
-        }
+        let _ = crate::guest_io_host::register_open_file(engine, state, return_value).ok();
     }
 
     return_value

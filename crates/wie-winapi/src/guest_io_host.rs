@@ -15,18 +15,31 @@ pub const GUEST_IO_SLOT_SIZE: usize = 40;
 pub const GUEST_IO_FLAG_VALID: u64 = 1;
 
 /// Publishes an open file into the guest handle table and file-data arena.
+///
+/// Looks up the file content inside `state` to avoid the caller having to clone
+/// the (potentially large) byte Vec across a borrow boundary.
 pub fn register_open_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     handle: u64,
-    bytes: &[u8],
 ) -> Result<()> {
     let Some(cfg) = state.guest_io.clone() else {
         return Ok(());
     };
 
-    let size = u64::try_from(bytes.len()).context("file size does not fit u64")?;
-    let aligned_size = size.wrapping_add(15) & !15_u64;
+    // Immutable reborrow of state to read size and bytes — engine is a separate
+    // mutable borrow so there is no aliasing conflict.
+    let size = match state.open_files.iter().find(|f| f.handle == handle) {
+        Some(f) => f.bytes.len(),
+        None => return Ok(()),
+    };
+
+    if size == 0 {
+        return Ok(());
+    }
+
+    let size_u64 = u64::try_from(size).context("file size does not fit u64")?;
+    let aligned_size = size_u64.wrapping_add(15) & !15_u64;
     let data_va = state.guest_file_data_next;
     let file_end = cfg
         .file_data_base
@@ -40,9 +53,11 @@ pub fn register_open_file(
         return Ok(());
     }
 
-    if !bytes.is_empty() {
+    // Write bytes into guest arena.  Immutable reborrow of state for the file
+    // data; mutable borrow of engine — different allocations, no conflict.
+    if let Some(file) = state.open_files.iter().find(|f| f.handle == handle) {
         engine
-            .mem_write(data_va, bytes)
+            .mem_write(data_va, &file.bytes)
             .context("failed to mirror file bytes into guest I/O arena")?;
     }
 
@@ -69,7 +84,7 @@ pub fn register_open_file(
     };
     write_u64(engine, slot_va, handle)?;
     write_u64(engine, slot_va.wrapping_add(8), data_va)?;
-    write_u64(engine, slot_va.wrapping_add(16), size)?;
+    write_u64(engine, slot_va.wrapping_add(16), size_u64)?;
     write_u64(engine, slot_va.wrapping_add(24), 0)?;
     write_u64(engine, slot_va.wrapping_add(32), GUEST_IO_FLAG_VALID)?;
 
