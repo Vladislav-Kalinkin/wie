@@ -1,6 +1,8 @@
-# WIE
+# WIE (_Wie Is Emulator_) - experimental userspace emulator prototype in Rust 1.97
 
-**WIE** (_Wie Is Emulator_) - experimental **PE64 userspace emulator prototype** in Rust 1.97.
+#### WARNING
+
+Work In Progress (WIP): This is an early-stage experimental prototype.
 
 **Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
 
@@ -71,7 +73,7 @@ The project had many workarounds for its launch and originally used Unicorn Engi
 
 In one of the tests before removing Lunar Specific elements, it was possible to accelerate the launch by almost 2 seconds compared to Unicorn Engine.
 
-The condition of the engine is raw at the moment - It can execute probe exes that are applied to the project, but CPU consumption is very high (up to more than 90 percent) and the engine lacks proper optimization passes of ultra-small executable files there was no positive effect of optimization.
+The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%). At this early stage of running ultra-small executable files, initial optimization attempts have not yet yielded positive results, and the engine lacks proper optimization passes.
 
 ## AI-Usage
 
