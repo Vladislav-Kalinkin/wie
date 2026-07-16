@@ -4,7 +4,6 @@ use super::util::write_entry_trace_summary;
 use anyhow::{Result, bail};
 use std::io;
 use std::path::Path;
-
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
 pub(crate) fn run_micro(
     path: &Path,

@@ -32,7 +32,9 @@ struct PendingGuestCallback {
 /// Host-side timing breakdown for one session (enabled via `WIE_RUNTIME_PROFILE=1`).
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeProfile {
-    /// Wall time spent inside Unicorn `emu_start` (guest instruction execution).
+    /// Wall time spent in session init (PE loading, patch, pre-compilation).
+    pub init_ns: u128,
+    /// Wall time spent inside `run_until_stop` (guest instruction execution).
     pub emu_ns: u128,
     /// Wall time spent in WinAPI handlers / dispatch / return_from_win64_api.
     pub handler_ns: u128,
@@ -70,7 +72,7 @@ impl RuntimeProfile {
             self.host_stops, self.noisy_calls, self.charged_calls
         ));
         lines.push(format!(
-            "emu_ms={:.2} ({:.1}%)  handler_ms={:.2} ({:.1}%)  resolve_ms={:.2} ({:.1}%)  total_accounted_ms={:.2}",
+            "emu_ms={:.2} ({:.1}%)  handler_ms={:.2} ({:.1}%)  resolve_ms={:.2} ({:.1}%)  total_accounted_ms={:.2}  init_ms={:.2}",
             self.emu_ns as f64 / 1e6,
             pct(self.emu_ns),
             self.handler_ns as f64 / 1e6,
@@ -78,6 +80,7 @@ impl RuntimeProfile {
             self.resolve_ns as f64 / 1e6,
             pct(self.resolve_ns),
             total as f64 / 1e6,
+            self.init_ns as f64 / 1e6,
         ));
         let mut ranked: Vec<_> = self.by_export.iter().collect();
         ranked.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)));
@@ -202,6 +205,7 @@ impl RuntimeSession {
         idle_policy: wie_winapi::MessageQueueIdlePolicy,
         layout: RuntimeMemoryLayout,
     ) -> Result<Self> {
+        let t_init = Instant::now();
         let (image, image_summary, patched_imports) =
             wie_pe::build_loaded_image_with_fake_imports(path)?;
 
@@ -520,7 +524,7 @@ impl RuntimeSession {
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
 
-        Ok(Self::from_init(SessionInit {
+        let mut session = Self::from_init(SessionInit {
             engine,
             environment,
             winapi_state,
@@ -529,7 +533,11 @@ impl RuntimeSession {
             layout,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
-        }))
+        });
+        if session.profile_enabled {
+            session.profile.init_ns = t_init.elapsed().as_nanos();
+        }
+        Ok(session)
     }
 
     /// Returns the PE entry-point address associated with this session.
