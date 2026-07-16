@@ -9,6 +9,58 @@
 
 At the moment, the project has more than a hundred different plugs made only to build the emulator engine and are not the final solution
 
+### Core Components
+
+- **`wie-cpu`** – the CPU core. Provides two backends:
+  - **`JitCpu`** (default) – compiles x86‑64 basic blocks into ARM64 machine code via **Cranelift**. Compiled blocks are cached and can be chained directly without returning to the dispatcher.
+  - **`IcedCpu`** – an interpreter based on **iced‑x86**, used as fallback for complex instructions or when the JIT is disabled.
+
+- **`wie-winapi`** – emulation of Windows system calls. Contains dozens of handlers for KERNEL32, USER32, GDI32, ADVAPI32, COMCTL32, and other DLLs. API dispatch uses a dense integer‑based table (no string comparisons on the hot path).
+
+- **`wie-runtime`** – manages the execution session: loads the PE, sets up guest memory, installs hooks on fake API addresses, drives the run loop, and maintains the overall state (registers, heap, windows, message queue, etc.).
+
+- **`wie-pe`** – PE64 parsing, section loading, import table processing, and IAT patching with fake addresses.
+
+### Execution Flow
+
+1. **PE Loading**  
+   `wie-pe` reads the file, builds the in‑memory image at virtual addresses, and parses the import table. Every imported function gets a **fake address** in a reserved region (e.g., `0x7000_0000_0000_xxxx`). These addresses are written into the IAT.
+
+2. **Hook Installation**  
+   The entire fake‑address range is covered by a **stop bitmap** (bit = 1 means “stop and hand over to the host handler”). For frequently called functions (e.g., `GetLastError`, `EnterCriticalSection`), **guest stubs** (small pieces of machine code) are placed directly in that range, so calls execute entirely in‑guest without stopping.
+
+3. **Execution Start**  
+   Control is transferred to the PE’s entry point. `JitCpu` starts decoding basic blocks from the current `RIP`. If a block is “pure” (only GPR ops, simple memory accesses, ALU, branches), it is compiled to ARM64 and executed. If the block is complex (SSE, system instructions) or cold, it is interpreted by `IcedCpu`.
+
+4. **System Call Interception**  
+   When execution reaches a fake address (i.e., a call to an imported function), the stop‑bit triggers. `JitCpu` or `IcedCpu` returns control to `RuntimeSession`. The session identifies which API was called and invokes the corresponding handler from `wie-winapi`. The handler reads arguments from guest registers/stack, performs emulation (often modifying state), and then calls `return_from_win64_api`, which restores `RIP` and `RSP` as if the call returned normally.
+
+5. **In‑Guest Accelerators**  
+   For the hottest APIs (e.g., `malloc`, `memcpy`, `ReadFile`, `HeapAlloc`), actual machine‑code stubs are placed in guest memory and their addresses are written into the IAT instead of the fake ones, with the corresponding stop‑bits cleared. This way, calls to these functions never leave the guest context, drastically reducing overhead. Implemented in modules `guest_stubs`, `guest_io`, `guest_heap`, and `guest_mbwc`.
+
+6. **Block Chaining and Shadow Stack**  
+   Compiled blocks can call each other directly, bypassing the dispatcher. For `call` instructions, a shadow return stack is maintained to improve prediction and speed up `ret` handling.
+
+7. **Host System Interaction**  
+   File system emulation (via “bottles” – root directories mapped to `C:\`) and windowing (fake HWNDs, message queuing) are implemented on the host. For example, `CreateFile` opens a file under `WIE_ROOT/drive_c`, while window messages are queued and dispatched through guest WndProc callbacks.
+
+### JIT Compilation Details
+
+- **Granularity**: only basic blocks (up to 32 instructions) ending in a branch, call, or return are compiled.
+- **Hotness**: a block is compiled after 100 visits (or immediately for UCRT calls). Compiled blocks are cached in a `HashMap`.
+- **SSE2 Support**: common XMM operations (mov, xor, add/sub/mul/div scalar/packed) are compiled; everything else goes to the interpreter.
+- **Fast UCRT Imports**: calls to `malloc`, `free`, `memcpy`, `strlen`, `fwrite`, `fflush`, and `__acrt_iob_func` are compiled as direct host‑function calls, bypassing stops.
+
+### Memory Management
+
+- Guest memory is a `HashMap<page_key, Page>` backed by a 4‑level radix table for fast page lookups from JIT code.
+- Heaps are emulated using segregated free‑lists (24 size classes) plus a bump allocator. The guest and host heap structures are synchronised via a shared control block in guest memory, allowing the `HeapAlloc/HeapFree` accelerators to run without host stops.
+
+### Profiling and Debugging
+
+- Set `WIE_RUNTIME_PROFILE=1` to collect timing statistics (emulation, handlers, resolution) and call counts per API.
+- `WIE_API_JOURNAL=path` writes a log of every API call with register state, useful for comparing backends.
+
 ## CLI
 
 ```bash
@@ -64,7 +116,7 @@ make -C micro-exes
 RUST_LOG=info ./scripts/run-micro-suite.sh
 ```
 
-### Architecture Validation Note
+### History
 
 At the early stage of building the engine, the project began as an experiment to create an alternative way to launch FuSoYa's Lunar Magic.
 
