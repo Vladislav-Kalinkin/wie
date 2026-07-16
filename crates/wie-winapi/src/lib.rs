@@ -633,3 +633,322 @@ pub use dispatch_table::{
     WINAPI_ID_COUNT, WinApiId, WinApiTraits, dispatch_winapi, dispatch_winapi_id,
     is_winapi_implemented, resolve_winapi_id,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wie_cpu::{CpuEngine, IcedCpu};
+
+    const STACK_VA: u64 = 0x100_0000;
+    const STACK_SIZE: u64 = 0x10000;
+    const STACK_TOP: u64 = STACK_VA + STACK_SIZE - 0x100;
+
+    /// Minimal engine for handler unit tests: maps 16 MiB with a valid return address on the stack.
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x100000, 7).expect("map test memory");
+        cpu.mem_map(STACK_VA, STACK_SIZE as usize, 7)
+            .expect("map test stack");
+        // Write a dummy return address — every handler calls return_from_win64_api which reads it.
+        cpu.mem_write(STACK_TOP, &0_u64.to_le_bytes())
+            .expect("write return address");
+        cpu.write_rsp(STACK_TOP).ok();
+        cpu
+    }
+
+    fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64, rsp: u64) {
+        cpu.write_rcx(rcx).ok();
+        cpu.write_rdx(rdx).ok();
+        cpu.write_r8(r8).ok();
+        cpu.write_r9(r9).ok();
+        cpu.write_rsp(if rsp == 0 { STACK_TOP } else { rsp }).ok();
+    }
+
+    fn default_winapi_state() -> WinApiState {
+        // Simplified default with a bump heap covering [0x2000, 0x10000).
+        let mut heap = GuestHeap::new(0x2000, 0x10000);
+        heap.attach_guest_control(0x2000);
+        WinApiState {
+            heap,
+            ..winapi_state_default()
+        }
+    }
+
+    fn winapi_state_default() -> WinApiState {
+        // This must stay in sync with the fields of WinApiState.
+        // Only the heap is customised; everything else is default.
+        WinApiState {
+            heap: GuestHeap::new(0x2000, 0x10000),
+            next_fls_index: 0,
+            fls_slots: Vec::new(),
+            last_error: 0,
+            next_registry_key_handle: 0,
+            registry_keys: Vec::new(),
+            next_find_handle: 0,
+            find_handles: Vec::new(),
+            executable_file_size: 0,
+            executable_file_bytes: Vec::new(),
+            main_module_file_name: String::new(),
+            main_module_path: String::new(),
+            tls_slots: Vec::new(),
+            bottle_root: None,
+            executable_file_cursor: 0,
+            host_file_mounts: Vec::new(),
+            virtual_files: Vec::new(),
+            open_files: HashMap::new(),
+            next_file_handle: 0,
+            next_resource_handle: 0,
+            resources: Vec::new(),
+            current_directory_wide: Vec::new(),
+            window_long_ptr_values: Vec::new(),
+            image_list_counts: Vec::new(),
+            image_list_background_colors: Vec::new(),
+            window_visible: false,
+            window_enabled: false,
+            active_window_handle: 0,
+            foreground_window_handle: 0,
+            focus_window_handle: 0,
+            capture_window_handle: 0,
+            cursor_handle: 0,
+            window_title: String::new(),
+            window_x: 0,
+            window_y: 0,
+            window_width: 0,
+            window_height: 0,
+            window_invalidated: false,
+            tick_count: 0,
+            keyboard_state: [0; 256],
+            next_timer_id: 0,
+            timers: Vec::new(),
+            next_global_atom: 0,
+            global_atoms: Vec::new(),
+            next_windows_hook_handle: 0,
+            windows_hooks: Vec::new(),
+            d3d9_current_vertex_shader: 0,
+            d3d9_current_fvf: 0,
+            d3d9_render_states: Vec::new(),
+            d3d9_texture_stage_states: Vec::new(),
+            d3d9_sampler_states: Vec::new(),
+            menu_item_states: Vec::new(),
+            menu_item_check_states: Vec::new(),
+            message_queue: Vec::new(),
+            next_message_time: 0,
+            d3d9_device_object_address: 0,
+            d3d9_device_ref_count: 0,
+            d3d9_object_address: 0,
+            d3d9_ref_count: 0,
+            message_queue_idle_policy: MessageQueueIdlePolicy::ExitOnIdle,
+            next_window_class_atom: 0,
+            window_classes: Vec::new(),
+            next_window_handle: 0,
+            windows: Vec::new(),
+            get_proc_address_cache: HashMap::new(),
+            file_dialog_policy: FileDialogPolicy::Cancel,
+            last_file_dialog_path: None,
+            comm_dlg_extended_error: 0,
+            next_menu_handle: 0,
+            guest_io: None,
+            guest_file_data_next: 0,
+            guest_fls_table_va: 0,
+        }
+    }
+
+    macro_rules! assert_return_value {
+        ($result:expr, $expected:expr) => {
+            let r = $result.expect("handler should succeed");
+            assert_eq!(r.return_value, $expected, "return value mismatch");
+        };
+    }
+
+    // --- Kernel32 ---
+
+    #[test]
+    fn test_free_library_valid_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0x6100_0001, 0, 0, 0, 0);
+        assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 1);
+        assert_eq!(state.last_error, 0);
+    }
+
+    #[test]
+    fn test_free_library_null_handle() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        write_regs(&mut engine, 0, 0, 0, 0, 0);
+        assert_return_value!(kernel32::handle_free_library(&mut engine, &mut state), 0);
+        assert_eq!(state.last_error, 6); // ERROR_INVALID_HANDLE
+    }
+
+    #[test]
+    fn test_get_last_error() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.last_error = 123;
+        let r = kernel32::handle_get_last_error(&mut engine, &mut state).expect("GetLastError");
+        assert_eq!(r.return_value, 123);
+    }
+
+    #[test]
+    fn test_set_last_error() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.last_error = 0;
+        write_regs(&mut engine, 456, 0, 0, 0, 0);
+        let _ = kernel32::handle_set_last_error(&mut engine, &mut state).expect("SetLastError");
+        assert_eq!(state.last_error, 456);
+    }
+
+    // --- User32 ---
+
+    #[test]
+    fn test_get_async_key_state_default() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // VK_RETURN = 0x0D, keyboard_state starts all zero.
+        write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
+        assert_return_value!(user32::handle_get_async_key_state(&mut engine, &mut state), 0);
+    }
+
+    #[test]
+    fn test_get_async_key_state_down() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.keyboard_state[0x0D] = 0x80; // VK_RETURN high bit set
+        write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
+        assert_return_value!(user32::handle_get_async_key_state(&mut engine, &mut state), 0x81);
+    }
+
+    #[test]
+    fn test_peek_message_a_empty_queue() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // Write a valid MSG struct address (doesn't matter since queue is empty).
+        write_regs(&mut engine, 0x1000, 0, 0, 0, 0x2000);
+        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 0);
+    }
+
+    #[test]
+    fn test_peek_message_a_with_message() {
+        use crate::QueuedWindowMessage;
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let msg_va = 0x4000;
+        // Map memory for the MSG struct.
+        engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
+        // Push a WM_PAINT message for any window.
+        state.message_queue.push(QueuedWindowMessage {
+            window_handle: 0x100,
+            message: 15, // WM_PAINT
+            word_parameter: 0,
+            long_parameter: 0,
+            time: 1,
+            point_x: 0,
+            point_y: 0,
+        });
+        // PeekMessageA(msg_ptr=msg_va, hwnd=0, min=0, max=0, wRemoveMsg=1)
+        // wRemoveMsg is on the stack at RSP+0x28.
+        write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
+        // Write wRemoveMsg=1 (PM_REMOVE) at RSP+0x28.
+        engine.mem_write(0x3028, &1_u32.to_le_bytes()).ok();
+        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
+        // WM_PAINT should have been removed from the queue.
+        assert_eq!(state.message_queue.len(), 0);
+    }
+
+    #[test]
+    fn test_peek_message_a_noremove() {
+        use crate::QueuedWindowMessage;
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let msg_va = 0x4000;
+        engine.mem_map(msg_va, 0x1000, 7).expect("map msg struct");
+        state.message_queue.push(QueuedWindowMessage {
+            window_handle: 0x100,
+            message: 15,
+            word_parameter: 0,
+            long_parameter: 0,
+            time: 1,
+            point_x: 0,
+            point_y: 0,
+        });
+        write_regs(&mut engine, msg_va, 0, 0, 0, 0x3000);
+        // wRemoveMsg=0 (PM_NOREMOVE) at RSP+0x28.
+        engine.mem_write(0x3028, &0_u32.to_le_bytes()).ok();
+        assert_return_value!(user32::handle_peek_message_a(&mut engine, &mut state), 1);
+        // Message should still be in the queue.
+        assert_eq!(state.message_queue.len(), 1);
+    }
+
+    // --- Comctl32 ---
+
+    #[test]
+    fn test_init_common_controls() {
+        let mut engine = test_engine();
+        assert_return_value!(comctl32::handle_init_common_controls(&mut engine), 1);
+    }
+
+    // --- Comdlg32 ---
+
+    #[test]
+    fn test_choose_color_a_writes_color() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let cc_ptr = 0x5000;
+        engine.mem_map(cc_ptr, 0x1000, 7).expect("map CHOOSECOLOR");
+        write_regs(&mut engine, cc_ptr, 0, 0, 0, 0);
+        assert_return_value!(comdlg32::handle_choose_color_a(&mut engine, &mut state), 1);
+        // rgbResult is at offset 0x10 in CHOOSECOLOR — should be RGB black (0).
+        let mut rgb = [0_u8; 4];
+        engine.mem_read(cc_ptr + 0x10, &mut rgb).ok();
+        assert_eq!(u32::from_le_bytes(rgb), 0x00_00_00);
+    }
+
+    // --- Gdi32 ---
+
+    #[test]
+    fn test_text_out_a_returns_cch() {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0x100, 10, 20, 0x2000, 0x3000);
+        // cchString at RSP+0x28 = 5.
+        engine.mem_write(0x3028, &5_u32.to_le_bytes()).ok();
+        assert_return_value!(gdi32::handle_text_out_a(&mut engine), 5);
+    }
+
+    #[test]
+    fn test_bit_blt_success() {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0x100, 0, 0, 100, 0);
+        assert_return_value!(gdi32::handle_bit_blt(&mut engine), 1);
+    }
+
+    #[test]
+    fn test_stretch_blt_success() {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0x100, 0, 0, 100, 0);
+        assert_return_value!(gdi32::handle_stretch_blt(&mut engine), 1);
+    }
+
+    #[test]
+    fn test_pat_blt_success() {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0x100, 0, 0, 100, 0);
+        assert_return_value!(gdi32::handle_pat_blt(&mut engine), 1);
+    }
+
+    // --- Advapi32 ---
+
+    #[test]
+    fn test_set_security_descriptor_dacl_null_fails() {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0, 0, 0, 0, 0);
+        assert_return_value!(advapi32::handle_set_security_descriptor_dacl(&mut engine), 0);
+    }
+
+    #[test]
+    fn test_set_security_descriptor_dacl_valid_succeeds() {
+        let mut engine = test_engine();
+        write_regs(&mut engine, 0x1000, 1, 0x2000, 1, 0);
+        assert_return_value!(advapi32::handle_set_security_descriptor_dacl(&mut engine), 1);
+    }
+}
