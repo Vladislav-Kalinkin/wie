@@ -1,6 +1,6 @@
 # WIE
 
-**WIE** (_Wie Is Emulator_) - experimental **PE64 userspace emulator prototype** in Rust.
+**WIE** (_Wie Is Emulator_) - experimental **PE64 userspace emulator prototype** in Rust 1.97.
 
 **Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
 
@@ -84,3 +84,9 @@ And also this section is not a boasting or a proclamation of artificial intellig
 ## Contributing
 
 If you find problems, vulnerabilities or optimization solutions that I have not noticed, I will be glad if you let me know.
+
+## License
+
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+
+WIE is open-source software. If you modify this emulator and run it as part of a network service, you **must** make your modified source code available to the users of that service. For more details, see the `LICENSE` file in the repository root.
