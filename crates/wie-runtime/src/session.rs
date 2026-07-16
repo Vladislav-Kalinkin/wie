@@ -357,7 +357,13 @@ impl RuntimeSession {
 
         engine
             .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
-            .context("failed to install persistent Unicorn runtime hooks")?;
+            .context("failed to install persistent runtime hooks")?;
+
+        // Pre-compile all known fake-API stubs so they are Ready in the JIT
+        // cache when first hit, avoiding the cold-start compilation tax.
+        for entry in &fake_api_entries {
+            engine.precompile_at(entry.fake_target_va);
+        }
 
         engine
             .mem_map(layout.stack_base, layout.stack_size, wie_cpu::perm::ALL)
