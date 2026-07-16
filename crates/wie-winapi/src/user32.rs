@@ -137,30 +137,69 @@ fn write_fake_monitor_info(
 }
 
 /// Handles `USER32.dll!PeekMessageA`.
-pub fn handle_peek_message_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _message_ptr = engine
+pub fn handle_peek_message_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let message_address = engine
         .read_rcx()
         .context("failed to read RCX for PeekMessageA")?;
 
-    let _window_handle = engine
+    let window_filter = engine
         .read_rdx()
         .context("failed to read RDX for PeekMessageA")?;
 
-    let _message_filter_min = engine
+    let minimum_message_raw = engine
         .read_r8()
         .context("failed to read R8 for PeekMessageA")?;
 
-    let _message_filter_max = engine
+    let maximum_message_raw = engine
         .read_r9()
         .context("failed to read R9 for PeekMessageA")?;
 
+    let w_remove_msg = engine.read_rsp().ok()
+        .and_then(|rsp| read_guest_u32(engine, rsp.wrapping_add(0x28)).ok())
+        .unwrap_or(0);
+
+    let minimum_message = u32::try_from(minimum_message_raw & u64::from(u32::MAX))
+        .context("PeekMessageA minimum message does not fit u32")?;
+
+    let maximum_message = u32::try_from(maximum_message_raw & u64::from(u32::MAX))
+        .context("PeekMessageA maximum message does not fit u32")?;
+
+    let matches_filter = |queued: &QueuedWindowMessage| -> bool {
+        let window_matches = window_filter == 0 || queued.window_handle == window_filter;
+        let message_matches = if minimum_message == 0 && maximum_message == 0 {
+            true
+        } else {
+            queued.message >= minimum_message && queued.message <= maximum_message
+        };
+        window_matches && message_matches
+    };
+
+    let matching_index = state.message_queue.iter().position(matches_filter);
+
+    let return_value = if let Some(index) = matching_index {
+        let queued = if w_remove_msg != 0 {
+            // PM_REMOVE: remove from queue.
+            state.message_queue.remove(index)
+        } else {
+            // PM_NOREMOVE: leave in queue.
+            state.message_queue[index].clone()
+        };
+        write_message_structure(engine, message_address, &queued)?;
+        1
+    } else {
+        0
+    };
+
     let return_address = engine
-        .return_from_win64_api(0)
+        .return_from_win64_api(return_value)
         .context("failed to return from PeekMessageA")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 0,
+        return_value,
     })
 }
 
