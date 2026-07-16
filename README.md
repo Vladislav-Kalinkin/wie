@@ -1,5 +1,11 @@
 # WIE (_Wie Is Emulator_) - experimental userspace emulator prototype in Rust 1.97
 
+[![Project status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)](https://github.com/Vladislav-Kalinkin/wie)
+[![License](https://img.shields.io/github/license/Vladislav-Kalinkin/wie?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.97+-blue?style=flat-square)](https://www.rust-lang.org/)
+[![GitHub Actions](https://img.shields.io/badge/CI-not%20configured-lightgrey?style=flat-square)](<>)
+[![GitHub stars](https://img.shields.io/github/stars/Vladislav-Kalinkin/wie?style=social)](https://github.com/Vladislav-Kalinkin/wie)
+
 > [!WARNING]
 > **Work In Progress (WIP):** This is an early-stage experimental prototype.
 
