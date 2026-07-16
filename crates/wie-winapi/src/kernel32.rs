@@ -3841,8 +3841,9 @@ pub fn handle_write_file(
 }
 
 /// Copies the open handle's buffer into `virtual_files` for the same path.
+/// Takes the bytes from the open file (which is about to be closed) to avoid a Vec clone.
 fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) {
-    let Some(bytes) = find_open_file(state, handle).map(|file| file.bytes.clone()) else {
+    let Some(bytes) = find_open_file_mut(state, handle).map(|file| std::mem::take(&mut file.bytes)) else {
         return;
     };
 
