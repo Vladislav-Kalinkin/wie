@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 
 use crate::guest_memory::{
     checked_field_address, read_i32 as read_guest_i32, read_u16 as read_guest_u16,
-    write_i32 as write_guest_i32, write_u16 as write_guest_u16, write_u32 as write_guest_u32,
-    write_u64 as write_guest_u64,
+    read_u32 as read_guest_u32, write_i32 as write_guest_i32, write_u16 as write_guest_u16,
+    write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
 use crate::{WinApiHandlerResult, WinApiState};
 
@@ -752,29 +752,52 @@ pub fn handle_set_bk_mode(
     })
 }
 
-/// Handles `GDI32.dll!TextOutA` (success stub).
+/// Handles `GDI32.dll!TextOutA` (reads params; no actual rendering).
 pub fn handle_text_out_a(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for TextOutA")?;
+    let _x = engine
+        .read_rdx()
+        .context("failed to read RDX for TextOutA")?;
+    let _y = engine
+        .read_r8()
+        .context("failed to read R8 for TextOutA")?;
+    let _lp_string = engine
+        .read_r9()
+        .context("failed to read R9 for TextOutA")?;
+
+    // cchString is the 5th parameter on the stack.
+    let cch_string = engine.read_rsp().ok()
+        .and_then(|rsp| read_guest_u32(engine, rsp.wrapping_add(0x28)).ok())
+        .unwrap_or(0);
 
     let return_address = engine
-        .return_from_win64_api(1)
+        .return_from_win64_api(u64::from(cch_string))
         .context("failed to return from TextOutA")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value: u64::from(cch_string),
     })
 }
 
-/// Handles `GDI32.dll!BitBlt` (success stub; no real blit).
+/// Handles `GDI32.dll!BitBlt` (reads params; no actual blit).
 pub fn handle_bit_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _hdc = engine
+    let _hdc_dst = engine
         .read_rcx()
         .context("failed to read RCX for BitBlt")?;
+    let _x = engine
+        .read_rdx()
+        .context("failed to read RDX for BitBlt")?;
+    let _y = engine
+        .read_r8()
+        .context("failed to read R8 for BitBlt")?;
+    let _cx = engine
+        .read_r9()
+        .context("failed to read R9 for BitBlt")?;
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -786,13 +809,22 @@ pub fn handle_bit_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandl
     })
 }
 
-/// Handles `GDI32.dll!StretchBlt` (success stub).
+/// Handles `GDI32.dll!StretchBlt` (reads params; no actual stretch).
 pub fn handle_stretch_blt(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
-    let _hdc = engine
+    let _hdc_dst = engine
         .read_rcx()
         .context("failed to read RCX for StretchBlt")?;
+    let _x = engine
+        .read_rdx()
+        .context("failed to read RDX for StretchBlt")?;
+    let _y = engine
+        .read_r8()
+        .context("failed to read R8 for StretchBlt")?;
+    let _cx = engine
+        .read_r9()
+        .context("failed to read R9 for StretchBlt")?;
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -804,11 +836,20 @@ pub fn handle_stretch_blt(
     })
 }
 
-/// Handles `GDI32.dll!PatBlt` (success stub).
+/// Handles `GDI32.dll!PatBlt` (reads params; no actual pattern).
 pub fn handle_pat_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for PatBlt")?;
+    let _x = engine
+        .read_rdx()
+        .context("failed to read RDX for PatBlt")?;
+    let _y = engine
+        .read_r8()
+        .context("failed to read R8 for PatBlt")?;
+    let _cx = engine
+        .read_r9()
+        .context("failed to read R9 for PatBlt")?;
 
     let return_address = engine
         .return_from_win64_api(1)
