@@ -69,7 +69,11 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    if let Err(error) = tracing_subscriber::fmt().with_env_filter("info").try_init() {
+    let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_owned());
+    if let Err(error) = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .try_init()
+    {
         bail!("failed to initialize tracing subscriber: {error}");
     }
 
