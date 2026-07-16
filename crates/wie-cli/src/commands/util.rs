@@ -35,8 +35,8 @@ pub(crate) fn format_entry_trace_event(event: &wie_runtime::EntryTraceEvent) -> 
         event.fake_target_va,
         format_optional_hex(event.return_value),
         format_optional_hex(event.return_address),
-        event.library,
-        event.name,
+        event.library.as_ref(),
+        event.name.as_ref(),
     )
 }
 

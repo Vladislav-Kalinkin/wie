@@ -1,5 +1,7 @@
 //! Entry-point tracing summaries and persistent smoke-test entry points.
 
+use std::sync::Arc;
+
 use crate::session::{RuntimeProfile, RuntimeSession};
 use anyhow::Result;
 
@@ -10,10 +12,10 @@ pub struct EntryTraceEvent {
     pub index: usize,
 
     /// Imported library name.
-    pub library: String,
+    pub library: Arc<str>,
 
     /// Imported function name.
-    pub name: String,
+    pub name: Arc<str>,
 
     /// Fake API address hit by Unicorn.
     pub fake_target_va: u64,

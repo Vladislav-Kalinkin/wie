@@ -140,8 +140,8 @@ fn register_fallback(
     let index = entries.len();
     entries.push(RuntimeFakeApiEntry {
         fake_target_va: va,
-        library: library.to_owned(),
-        name: name.to_owned(),
+        library: library.into(),
+        name: name.into(),
         iat_slot_va: 0,
         winapi_id,
         traits,

@@ -8,6 +8,7 @@ use crate::memory::{
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Saved frame for one in-flight guest window-procedure call.
@@ -18,9 +19,9 @@ struct PendingGuestCallback {
     /// Original callback request metadata.
     request: wie_winapi::GuestCallbackRequest,
     /// Outer host API that requested the callback (`DispatchMessageA`, `SendMessageA`, …).
-    outer_library: String,
+    outer_library: Arc<str>,
     /// Outer host API export name.
-    outer_name: String,
+    outer_name: Arc<str>,
     /// Fake VA of the outer host API entry.
     outer_fake_va: u64,
     /// When set, outer API is `CreateWindowEx*` and must return this HWND
@@ -647,7 +648,7 @@ impl RuntimeSession {
                         .ok()
                         .map(|()| u64::from_le_bytes(slot));
                     let last_api = match events.last() {
-                        Some(e) => format!("{}!{}", e.library, e.name),
+                        Some(e) => format!("{}!{}", e.library.as_ref(), e.name.as_ref()),
                         None => "-".into(),
                     };
                     termination = EntryTraceTermination::RuntimeStop(format!(
@@ -822,7 +823,7 @@ impl RuntimeSession {
             }
 
             let export_key = if self.profile_enabled {
-                Some(format!("{}!{}", resolved.library, resolved.name))
+                Some(format!("{}!{}", resolved.library.as_ref(), resolved.name.as_ref()))
             } else {
                 None
             };
@@ -988,7 +989,7 @@ impl RuntimeSession {
                     let j_retaddr = handler_result.return_address;
                     self.publish_last_error_to_guest();
                     // WIE_API_JOURNAL=path — one line per host return for dual-backend diff.
-                    journal_api_return(index, &j_lib, &j_name, &mut self.engine, j_ret, j_retaddr);
+                    journal_api_return(index, j_lib.as_ref(), j_name.as_ref(), &mut self.engine, j_ret, j_retaddr);
                 }
 
                 Err(error) => {
@@ -1055,7 +1056,7 @@ impl RuntimeSession {
                         }
 
                         None => {
-                            let api = format!("{}!{}: {error}", resolved.library, resolved.name,);
+                            let api = format!("{}!{}: {error}", resolved.library.as_ref(), resolved.name.as_ref(),);
 
                             events.push(EntryTraceEvent {
                                 index,
@@ -1259,8 +1260,8 @@ impl RuntimeSession {
         self.pending_callbacks.push(PendingGuestCallback {
             dispatch_rsp,
             request,
-            outer_library: outer_library.to_owned(),
-            outer_name: outer_name.to_owned(),
+            outer_library: outer_library.into(),
+            outer_name: outer_name.into(),
             outer_fake_va,
             create_window_hwnd,
         });
@@ -1282,7 +1283,7 @@ impl RuntimeSession {
         )?;
 
         tracing::debug!(
-            outer = %format!("{}!{}", pending.outer_library, pending.outer_name),
+            outer = %format!("{}!{}", pending.outer_library.as_ref(), pending.outer_name.as_ref()),
             callback = pending.request.callback_address,
             hwnd = pending.request.window_handle,
             message = pending.request.message,
@@ -1303,8 +1304,8 @@ impl RuntimeSession {
 
 /// Result of finishing one bridged guest WndProc call.
 struct GuestCallbackCompletion {
-    outer_library: String,
-    outer_name: String,
+    outer_library: Arc<str>,
+    outer_name: Arc<str>,
     outer_fake_va: u64,
     return_value: u64,
     return_address: u64,
