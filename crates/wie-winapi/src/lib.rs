@@ -1,5 +1,7 @@
 //! WinAPI dispatcher model for WIE (generic PE64 userspace).
 
+use std::sync::Arc;
+
 pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;
@@ -341,7 +343,7 @@ pub struct VirtualGuestFile {
 #[derive(Debug, Clone)]
 pub struct GetProcAddressCacheEntry {
     /// Normalized (lowercase) export name.
-    pub name: String,
+    pub name: Arc<str>,
 
     /// Module handle that first requested this export.
     pub module_handle: u64,

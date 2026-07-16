@@ -2007,7 +2007,7 @@ pub fn handle_get_proc_address(
         state.get_proc_address_cache.insert(
             name_key,
             crate::GetProcAddressCacheEntry {
-                name: proc_name.clone(),
+                name: proc_name.clone().into(),
                 module_handle,
                 address,
                 hit_count: 1,
