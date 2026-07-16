@@ -62,12 +62,12 @@ pub fn handle_init_common_controls(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
     let return_address = engine
-        .return_from_win64_api(0)
+        .return_from_win64_api(1)
         .context("failed to return from InitCommonControls")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 0,
+        return_value: 1,
     })
 }
 

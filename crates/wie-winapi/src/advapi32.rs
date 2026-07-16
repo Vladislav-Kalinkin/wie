@@ -188,17 +188,28 @@ pub fn handle_initialize_security_descriptor(
 pub fn handle_set_security_descriptor_dacl(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
-    let _security_descriptor_ptr = engine
+    let security_descriptor_ptr = engine
         .read_rcx()
         .context("failed to read RCX for SetSecurityDescriptorDacl")?;
+    let _dacl_present = engine
+        .read_rdx()
+        .context("failed to read RDX for SetSecurityDescriptorDacl")?;
+    let _dacl_ptr = engine
+        .read_r8()
+        .context("failed to read R8 for SetSecurityDescriptorDacl")?;
+    let _dacl_defaulted = engine
+        .read_r9()
+        .context("failed to read R9 for SetSecurityDescriptorDacl")?;
+
+    let return_value = u64::from(security_descriptor_ptr != 0);
 
     let return_address = engine
-        .return_from_win64_api(1)
+        .return_from_win64_api(return_value)
         .context("failed to return from SetSecurityDescriptorDacl")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value,
     })
 }
 

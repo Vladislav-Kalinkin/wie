@@ -1357,7 +1357,7 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Loadlibraryw => {
             kernel32::handle_load_library_w(engine, environment, state)
         }
-        WinApiId::Kernel32Freelibrary => kernel32::handle_free_library(engine),
+        WinApiId::Kernel32Freelibrary => kernel32::handle_free_library(engine, state),
         WinApiId::Kernel32Getprocaddress => kernel32::handle_get_proc_address(engine, state),
         WinApiId::Kernel32Getfileattributesa => {
             kernel32::handle_get_file_attributes_a(engine, state)

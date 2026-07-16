@@ -1954,18 +1954,29 @@ pub fn handle_load_library_w(
 }
 
 /// Handles `KERNEL32.dll!FreeLibrary`.
-pub fn handle_free_library(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _module_handle = engine
+pub fn handle_free_library(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let module_handle = engine
         .read_rcx()
         .context("failed to read RCX for FreeLibrary")?;
 
+    // Return TRUE if handle is non-zero (valid-looking module handle).
+    let return_value = u64::from(module_handle != 0);
+    state.last_error = if module_handle == 0 {
+        ERROR_INVALID_HANDLE
+    } else {
+        0
+    };
+
     let return_address = engine
-        .return_from_win64_api(1)
+        .return_from_win64_api(return_value)
         .context("failed to return from FreeLibrary")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value,
     })
 }
 
@@ -4136,7 +4147,11 @@ fn handle_tls_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _index = engine.read_rcx()?;
+    let index_raw = engine.read_rcx()?;
+    let index = usize::try_from(index_raw).unwrap_or(usize::MAX);
+    if index < state.tls_slots.len() {
+        state.tls_slots[index] = 0;
+    }
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {
