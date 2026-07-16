@@ -67,6 +67,10 @@ pub(super) struct JitCtx {
     pub chain_va: *mut u64,
     /// Parallel host fn pointers (`0` = empty), same lifetime as `chain_va`.
     pub chain_fn: *mut u64,
+    /// Sticky single-page TLB for inline IR mem (last hit/fill); `TLB_EMPTY` if cold.
+    pub tlb_hot_page: u64,
+    /// Host base pointer for [`Self::tlb_hot_page`] (page-aligned guest data).
+    pub tlb_hot_ptr: *mut u8,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
@@ -77,6 +81,8 @@ const OFF_FAULT: i32 = std::mem::offset_of!(JitCtx, fault) as i32;
 const OFF_SHADOW_SP: i32 = std::mem::offset_of!(JitCtx, shadow_sp) as i32;
 const OFF_XMM: i32 = std::mem::offset_of!(JitCtx, xmm) as i32;
 const OFF_SHADOW_RET: i32 = OFF_SHADOW_SP + 8;
+const OFF_TLB_HOT_PAGE: i32 = std::mem::offset_of!(JitCtx, tlb_hot_page) as i32;
+const OFF_TLB_HOT_PTR: i32 = std::mem::offset_of!(JitCtx, tlb_hot_ptr) as i32;
 
 // Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
 const _: () = {
@@ -86,6 +92,8 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, xmm) as i32 == OFF_XMM);
     assert!(std::mem::offset_of!(JitCtx, shadow_sp) as i32 == OFF_SHADOW_SP);
     assert!(std::mem::offset_of!(JitCtx, shadow_ret) as i32 == OFF_SHADOW_RET);
+    assert!(std::mem::offset_of!(JitCtx, tlb_hot_page) as i32 == OFF_TLB_HOT_PAGE);
+    assert!(std::mem::offset_of!(JitCtx, tlb_hot_ptr) as i32 == OFF_TLB_HOT_PTR);
     assert!(SHADOW_DEPTH.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());
 };
@@ -143,6 +151,12 @@ fn set_fault(ctx: &mut JitCtx, insn_ip: u64, addr: u64, size: u64, access: u64) 
     ctx.fault_access = access;
 }
 
+/// Promote a mapped page into the sticky hot TLB (inline IR path) and multi-way cache.
+fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8) {
+    ctx.tlb_hot_page = page_key;
+    ctx.tlb_hot_ptr = page_base;
+}
+
 /// Resolve host page pointer via multi-way TLB (single-page accesses only).
 unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize) -> Option<*mut u8> {
     let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
@@ -151,8 +165,14 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize) -> Option<*mut 
         return None; // cross-page → slow path
     }
     let page_key = addr >> 12; // PAGE_SIZE = 0x1000
+    // Sticky hit first (matches inline IR fast path).
+    if ctx.tlb_hot_page == page_key && !ctx.tlb_hot_ptr.is_null() {
+        // SAFETY: hot ptr is a mapped page base; access stays in-page.
+        return Some(unsafe { ctx.tlb_hot_ptr.add(page_off) });
+    }
     for i in 0..TLB_WAYS {
         if ctx.tlb_page[i] == page_key && !ctx.tlb_ptr[i].is_null() {
+            tlb_set_hot(ctx, page_key, ctx.tlb_ptr[i]);
             // SAFETY: page mapped; access stays within the page.
             return Some(unsafe { ctx.tlb_ptr[i].add(page_off) });
         }
@@ -167,6 +187,7 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize) -> Option<*mut 
     ctx.tlb_page[slot] = page_key;
     ctx.tlb_ptr[slot] = ptr;
     ctx.tlb_rr = ctx.tlb_rr.wrapping_add(1);
+    tlb_set_hot(ctx, page_key, ptr);
     // SAFETY: page mapped; access stays within the page.
     Some(unsafe { ptr.add(page_off) })
 }
@@ -455,17 +476,6 @@ pub(super) fn compile_block(
         let ctx_ptr = bcx.block_params(entry)[0];
         let flags = MemFlagsData::trusted();
 
-        // Loop header: body + self-loop back-edges land here (reload GPRs from JitCtx).
-        let loop_header = if self_loop {
-            let h = bcx.create_block();
-            bcx.ins().jump(h, &[]);
-            bcx.switch_to_block(h);
-            // Leave unsealed until after self-loop back-edges are emitted.
-            h
-        } else {
-            entry
-        };
-
         // Exit: gpr[16] + rflags as block params → store and return.
         // XMM is write-through to JitCtx (correct on mid-block mem faults).
         let exit = bcx.create_block();
@@ -537,9 +547,8 @@ pub(super) fn compile_block(
             chain_refs.insert(end_rip, eng.module.declare_func_in_func(fid, bcx.func));
         }
 
-        let mut gpr_vals = [bcx.ins().iconst(types::I64, 0); 16];
-        let mut gpr_loaded = [false; 16];
-        // For self-loops and fast calls, ensure Win64 arg/result regs are available.
+        // Live GPRs: only load what the block uses. Self-loops keep a full set in
+        // block params so back-edges pass SSA values (no JitCtx store/reload).
         let mut live_eff = live;
         if has_fast_call {
             live_eff[0] = true; // RAX result
@@ -549,17 +558,70 @@ pub(super) fn compile_block(
             live_eff[9] = true; // R9
         }
         if self_loop {
-            // Reload a broad set on re-entry (safe for loops).
             live_eff.fill(true);
         }
-        for i in 0..16 {
-            if live_eff[i] {
-                let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
-                let p = bcx.ins().iadd_imm(ctx_ptr, off);
-                gpr_vals[i] = bcx.ins().load(types::I64, flags, p, 0);
-                gpr_loaded[i] = true;
+
+        let mut gpr_vals = [bcx.ins().iconst(types::I64, 0); 16];
+        let mut gpr_loaded = [false; 16];
+        // Dirty = written this block; only dirty+loaded regs are flushed to JitCtx
+        // on chain/exit (reg-mapping: avoid storing read-only live-ins).
+        let mut gpr_dirty = [false; 16];
+        let rflags_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RFLAGS));
+        // Carry flags across self-loop iterations via a block param when needed.
+        let pass_flags = needs_flags || self_loop;
+
+        // Loop header: SSA params for GPRs (+ optional rflags). Entry loads once
+        // and jumps here; self-loop back-edges re-enter with updated Values.
+        let loop_header = if self_loop {
+            let h = bcx.create_block();
+            for &is_live in live_eff.iter().take(16) {
+                if is_live {
+                    bcx.append_block_param(h, types::I64);
+                }
             }
-        }
+            if pass_flags {
+                bcx.append_block_param(h, types::I64);
+            }
+            // Entry: load from JitCtx → jump header with params (one-time cost).
+            let mut entry_args: Vec<BlockArg> = Vec::with_capacity(17);
+            for i in 0..16 {
+                if live_eff[i] {
+                    let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+                    let p = bcx.ins().iadd_imm(ctx_ptr, off);
+                    let v = bcx.ins().load(types::I64, flags, p, 0);
+                    gpr_vals[i] = v;
+                    gpr_loaded[i] = true;
+                    entry_args.push(BlockArg::Value(v));
+                }
+            }
+            if pass_flags {
+                let v = bcx.ins().load(types::I64, flags, rflags_ptr, 0);
+                entry_args.push(BlockArg::Value(v));
+            }
+            bcx.ins().jump(h, &entry_args);
+            bcx.switch_to_block(h);
+            // Rebind SSA from header params (dominates body + back-edges).
+            let params = bcx.block_params(h);
+            let mut pi = 0_usize;
+            for i in 0..16 {
+                if live_eff[i] {
+                    gpr_vals[i] = params[pi];
+                    gpr_loaded[i] = true;
+                    pi = pi.saturating_add(1);
+                }
+            }
+            h
+        } else {
+            for i in 0..16 {
+                if live_eff[i] {
+                    let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+                    let p = bcx.ins().iadd_imm(ctx_ptr, off);
+                    gpr_vals[i] = bcx.ins().load(types::I64, flags, p, 0);
+                    gpr_loaded[i] = true;
+                }
+            }
+            entry
+        };
 
         // XMM SSA: [lo0, hi0, lo1, hi1, …]; write-through on stores.
         let mut xmm_vals = [bcx.ins().iconst(types::I64, 0); 32];
@@ -570,8 +632,10 @@ pub(super) fn compile_block(
             }
         }
 
-        let rflags_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RFLAGS));
-        let mut rflags_val = if needs_flags || self_loop {
+        let mut rflags_val = if self_loop && pass_flags {
+            let params = bcx.block_params(loop_header);
+            params[params.len() - 1]
+        } else if needs_flags {
             bcx.ins().load(types::I64, flags, rflags_ptr, 0)
         } else {
             bcx.ins().iconst(types::I64, 0)
@@ -627,6 +691,7 @@ pub(super) fn compile_block(
                     &mut bcx,
                     &d.instr,
                     &mut gpr_vals,
+                    &mut gpr_dirty,
                     &mut rflags_val,
                     &mut pending,
                     &mut mem_env,
@@ -635,8 +700,12 @@ pub(super) fn compile_block(
             }
         }
 
-        // Materialize flags before terminator that reads them, or before writeback.
-        if matches!(term, Some(BlockTerm::Jcc { .. })) || needs_flags {
+        // Lazy flags: materialize only when a consumer needs them or before
+        // architectural writeback (pending must not be dropped on block exit).
+        if matches!(term, Some(BlockTerm::Jcc { .. }))
+            || needs_flags
+            || !matches!(pending, PendingFlags::None)
+        {
             flush_pending(&mut bcx, &mut rflags_val, &mut pending);
         }
 
@@ -681,7 +750,14 @@ pub(super) fn compile_block(
                     gpr_vals[0] = bcx.ins().load(types::I64, flags, p, 0);
                     gpr_loaded[0] = true;
                 }
-                lower_fast_ucrt(&mut bcx, kind, &mut gpr_vals, rflags_val, &mut mem_env)?;
+                lower_fast_ucrt(
+                    &mut bcx,
+                    kind,
+                    &mut gpr_vals,
+                    &mut gpr_dirty,
+                    rflags_val,
+                    &mut mem_env,
+                )?;
                 let exit_rip = iconst_u64(&mut bcx, return_ip);
                 emit_chain_or_exit(
                     &mut bcx,
@@ -689,6 +765,7 @@ pub(super) fn compile_block(
                     flags,
                     &gpr_vals,
                     &gpr_loaded,
+                    Some(&gpr_dirty),
                     rflags_val,
                     rflags_ptr,
                     true,
@@ -704,10 +781,13 @@ pub(super) fn compile_block(
                     t,
                     start_rip,
                     loop_header,
+                    &live_eff,
+                    pass_flags,
                     ctx_ptr,
                     flags,
                     &mut gpr_vals,
                     &gpr_loaded,
+                    &gpr_dirty,
                     rflags_val,
                     rflags_ptr,
                     needs_flags,
@@ -725,6 +805,7 @@ pub(super) fn compile_block(
                     &mut bcx,
                     t,
                     &mut gpr_vals,
+                    &mut gpr_dirty,
                     rflags_val,
                     &mut mem_env,
                     term_ip,
@@ -754,6 +835,7 @@ pub(super) fn compile_block(
                             flags,
                             &gpr_vals,
                             &gpr_loaded,
+                            Some(&gpr_dirty),
                             rflags_val,
                             rflags_ptr,
                             needs_flags,
@@ -769,6 +851,7 @@ pub(super) fn compile_block(
                             flags,
                             &gpr_vals,
                             &gpr_loaded,
+                            Some(&gpr_dirty),
                             rflags_val,
                             rflags_ptr,
                             needs_flags,
@@ -787,6 +870,7 @@ pub(super) fn compile_block(
                             flags,
                             &gpr_vals,
                             &gpr_loaded,
+                            Some(&gpr_dirty),
                             rflags_val,
                             rflags_ptr,
                             needs_flags,
@@ -807,6 +891,7 @@ pub(super) fn compile_block(
                 flags,
                 &gpr_vals,
                 &gpr_loaded,
+                Some(&gpr_dirty),
                 rflags_val,
                 rflags_ptr,
                 needs_flags,
@@ -824,6 +909,7 @@ pub(super) fn compile_block(
                 flags,
                 &gpr_vals,
                 &gpr_loaded,
+                Some(&gpr_dirty),
                 rflags_val,
                 rflags_ptr,
                 needs_flags,
@@ -844,6 +930,7 @@ pub(super) fn compile_block(
             (g, exit_params[16])
         };
         for i in 0..16 {
+            // Fault/exit path: store loaded regs (may include partial helper progress).
             if gpr_loaded[i] {
                 let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
                 let p = bcx.ins().iadd_imm(ctx_ptr, off);
@@ -889,18 +976,27 @@ fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
     }
 }
 
+/// Write SSA GPRs back into `JitCtx`.
+///
+/// When `gpr_dirty` is `Some`, only dirty+loaded regs are stored (reg-mapping opt).
+/// When `None`, every loaded reg is stored (safe default for host helpers / unknown).
 fn writeback_gprs(
     bcx: &mut FunctionBuilder<'_>,
     ctx_ptr: Value,
     flags: MemFlagsData,
     gpr: &[Value; 16],
     gpr_loaded: &[bool; 16],
+    gpr_dirty: Option<&[bool; 16]>,
     rflags: Value,
     rflags_ptr: Value,
     store_flags: bool,
 ) {
     for i in 0..16 {
-        if gpr_loaded[i] {
+        let do_store = match gpr_dirty {
+            Some(d) => d[i] && gpr_loaded[i],
+            None => gpr_loaded[i],
+        };
+        if do_store {
             let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
             let p = bcx.ins().iadd_imm(ctx_ptr, off);
             bcx.ins().store(flags, gpr[i], p, 0);
@@ -909,6 +1005,25 @@ fn writeback_gprs(
     if store_flags {
         bcx.ins().store(flags, rflags, rflags_ptr, 0);
     }
+}
+
+/// Build block-param args for a self-loop header: live GPRs + optional rflags.
+fn loop_header_args(
+    gpr: &[Value; 16],
+    live: &[bool; 16],
+    rflags: Value,
+    pass_flags: bool,
+) -> Vec<BlockArg> {
+    let mut args = Vec::with_capacity(17);
+    for i in 0..16 {
+        if live[i] {
+            args.push(BlockArg::Value(gpr[i]));
+        }
+    }
+    if pass_flags {
+        args.push(BlockArg::Value(rflags));
+    }
+    args
 }
 
 /// Push guest `return_ip` onto the software shadow return stack.
@@ -977,6 +1092,7 @@ fn emit_chain_or_exit(
     flags: MemFlagsData,
     gpr: &[Value; 16],
     gpr_loaded: &[bool; 16],
+    gpr_dirty: Option<&[bool; 16]>,
     rflags: Value,
     rflags_ptr: Value,
     store_flags: bool,
@@ -988,12 +1104,14 @@ fn emit_chain_or_exit(
 ) {
     let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
     bcx.ins().store(flags, exit_rip, rip_ptr, 0);
+    // Chain to another block: successor reloads from JitCtx, so flush dirty SSA.
     writeback_gprs(
         bcx,
         ctx_ptr,
         flags,
         gpr,
         gpr_loaded,
+        gpr_dirty,
         rflags,
         rflags_ptr,
         store_flags,
@@ -1019,7 +1137,8 @@ fn emit_chain_or_exit(
     jump_exit(bcx, exit, gpr, rflags);
 }
 
-/// Self-loop terminator: writeback + jump to loop header (or chain non-loop edge).
+/// Self-loop terminator: re-enter header via SSA block params (no JitCtx traffic),
+/// or chain the non-loop edge with dirty writeback.
 ///
 /// `loop_header` must **not** be the function entry block — Cranelift rejects
 /// edges into entry (`remove_constant_phis` / `edge.block != entry_block`).
@@ -1028,10 +1147,13 @@ fn lower_self_loop_term(
     term: BlockTerm,
     start_rip: u64,
     loop_header: Block,
+    live: &[bool; 16],
+    pass_flags: bool,
     ctx_ptr: Value,
     flags: MemFlagsData,
     gpr: &mut [Value; 16],
     gpr_loaded: &[bool; 16],
+    gpr_dirty: &[bool; 16],
     rflags: Value,
     rflags_ptr: Value,
     _needs_flags: bool,
@@ -1042,11 +1164,9 @@ fn lower_self_loop_term(
 ) -> Result<bool, String> {
     match term {
         BlockTerm::Jmp { target } if target == start_rip => {
-            writeback_gprs(
-                bcx, ctx_ptr, flags, gpr, gpr_loaded, rflags, rflags_ptr, true,
-            );
-            // Re-enter header (reload GPRs from JitCtx); no block params.
-            bcx.ins().jump(loop_header, &[]);
+            // Stay in native SSA — pass live regs as header params (no store/reload).
+            let args = loop_header_args(gpr, live, rflags, pass_flags);
+            bcx.ins().jump(loop_header, &args);
             Ok(true)
         }
         BlockTerm::Jcc {
@@ -1063,10 +1183,8 @@ fn lower_self_loop_term(
                 bcx.switch_to_block(blk);
                 bcx.seal_block(blk);
                 if va == start_rip {
-                    writeback_gprs(
-                        bcx, ctx_ptr, flags, gpr, gpr_loaded, rflags, rflags_ptr, true,
-                    );
-                    bcx.ins().jump(loop_header, &[]);
+                    let args = loop_header_args(gpr, live, rflags, pass_flags);
+                    bcx.ins().jump(loop_header, &args);
                 } else {
                     let rv = iconst_u64(bcx, va);
                     emit_chain_or_exit(
@@ -1075,6 +1193,7 @@ fn lower_self_loop_term(
                         flags,
                         gpr,
                         gpr_loaded,
+                        Some(gpr_dirty),
                         rflags,
                         rflags_ptr,
                         true,
@@ -1103,6 +1222,7 @@ fn lower_jcc_chain(
     flags: MemFlagsData,
     gpr: &[Value; 16],
     gpr_loaded: &[bool; 16],
+    gpr_dirty: Option<&[bool; 16]>,
     rflags: Value,
     rflags_ptr: Value,
     needs_flags: bool,
@@ -1124,6 +1244,7 @@ fn lower_jcc_chain(
             flags,
             gpr,
             gpr_loaded,
+            gpr_dirty,
             rflags,
             rflags_ptr,
             needs_flags,
@@ -1142,6 +1263,7 @@ fn lower_fast_ucrt(
     bcx: &mut FunctionBuilder<'_>,
     kind: FastApiKind,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -1167,14 +1289,16 @@ fn lower_fast_ucrt(
             let step2 = bcx.ins().select(is2, f2, zero);
             let step1 = bcx.ins().select(is1, f1, step2);
             gpr[0] = bcx.ins().select(is0, f0, step1);
+            mark_dirty(dirty, 0);
             Ok(())
         }
         // P3: inline `strlen` as a byte-scan loop in IR.
-        FastApiKind::Strlen => lower_inline_strlen(bcx, gpr, rflags, mem),
+        FastApiKind::Strlen => lower_inline_strlen(bcx, gpr, dirty, rflags, mem),
         FastApiKind::Malloc => {
             let fref = mem.ucrt_refs[kind as usize].ok_or("malloc import")?;
             let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx]);
             gpr[0] = bcx.inst_results(call)[0];
+            mark_dirty(dirty, 0);
             check_fault_after_ucrt(bcx, mem, gpr, rflags);
             Ok(())
         }
@@ -1182,6 +1306,7 @@ fn lower_fast_ucrt(
             let fref = mem.ucrt_refs[kind as usize].ok_or("free import")?;
             bcx.ins().call(fref, &[mem.ctx_ptr, rcx]);
             gpr[0] = iconst_u64(bcx, 0);
+            mark_dirty(dirty, 0);
             check_fault_after_ucrt(bcx, mem, gpr, rflags);
             Ok(())
         }
@@ -1189,6 +1314,7 @@ fn lower_fast_ucrt(
             let fref = mem.ucrt_refs[kind as usize].ok_or("memcpy import")?;
             let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx, rdx, r8]);
             gpr[0] = bcx.inst_results(call)[0];
+            mark_dirty(dirty, 0);
             check_fault_after_ucrt(bcx, mem, gpr, rflags);
             Ok(())
         }
@@ -1196,6 +1322,7 @@ fn lower_fast_ucrt(
             let fref = mem.ucrt_refs[kind as usize].ok_or("fwrite import")?;
             let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx, rdx, r8, r9]);
             gpr[0] = bcx.inst_results(call)[0];
+            mark_dirty(dirty, 0);
             check_fault_after_ucrt(bcx, mem, gpr, rflags);
             Ok(())
         }
@@ -1203,6 +1330,7 @@ fn lower_fast_ucrt(
             let fref = mem.ucrt_refs[kind as usize].ok_or("fflush import")?;
             let call = bcx.ins().call(fref, &[rcx]);
             gpr[0] = bcx.inst_results(call)[0];
+            mark_dirty(dirty, 0);
             Ok(())
         }
     }
@@ -1212,6 +1340,7 @@ fn lower_fast_ucrt(
 fn lower_inline_strlen(
     bcx: &mut FunctionBuilder<'_>,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -1252,6 +1381,7 @@ fn lower_inline_strlen(
     bcx.switch_to_block(done);
     bcx.seal_block(done);
     gpr[0] = bcx.block_params(done)[0];
+    mark_dirty(dirty, 0);
     Ok(())
 }
 
@@ -1508,6 +1638,7 @@ fn lower_sse_movq(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
@@ -1541,7 +1672,7 @@ fn lower_sse_movq(
             let addr = effective_addr(bcx, instr, gpr)?;
             return call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip);
         }
-        return write_gpr(bcx, gpr, r0, lo);
+        return write_gpr(bcx, gpr, dirty, r0, lo);
     }
     // mem, xmm
     if instr.op0_kind() == OpKind::Memory && r1.is_xmm() {
@@ -1556,6 +1687,7 @@ fn lower_sse_movd(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
@@ -1589,7 +1721,7 @@ fn lower_sse_movd(
             let addr = effective_addr(bcx, instr, gpr)?;
             return call_store(bcx, mem, gpr, rflags, addr, 4, v, ip);
         }
-        return write_gpr(bcx, gpr, r0, v);
+        return write_gpr(bcx, gpr, dirty, r0, v);
     }
     Err("movd form".into())
 }
@@ -2088,6 +2220,7 @@ fn lower_insn(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
@@ -2096,20 +2229,22 @@ fn lower_insn(
     match instr.mnemonic() {
         Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => Ok(()),
         // Non-flag ops: leave pending (may be overwritten later).
-        Mnemonic::Mov => lower_mov(bcx, instr, gpr, *rflags, mem),
-        Mnemonic::Movzx => lower_movx(bcx, instr, gpr, *rflags, mem, false),
-        Mnemonic::Movsx | Mnemonic::Movsxd => lower_movx(bcx, instr, gpr, *rflags, mem, true),
-        Mnemonic::Lea => lower_lea(bcx, instr, gpr),
-        Mnemonic::Push => lower_push(bcx, instr, gpr, *rflags, mem),
-        Mnemonic::Pop => lower_pop(bcx, instr, gpr, *rflags, mem),
-        Mnemonic::Xchg => lower_xchg(bcx, instr, gpr, *rflags, mem),
-        Mnemonic::Not => lower_not(bcx, instr, gpr, *rflags, mem),
+        Mnemonic::Mov => lower_mov(bcx, instr, gpr, dirty, *rflags, mem),
+        Mnemonic::Movzx => lower_movx(bcx, instr, gpr, dirty, *rflags, mem, false),
+        Mnemonic::Movsx | Mnemonic::Movsxd => {
+            lower_movx(bcx, instr, gpr, dirty, *rflags, mem, true)
+        }
+        Mnemonic::Lea => lower_lea(bcx, instr, gpr, dirty),
+        Mnemonic::Push => lower_push(bcx, instr, gpr, dirty, *rflags, mem),
+        Mnemonic::Pop => lower_pop(bcx, instr, gpr, dirty, *rflags, mem),
+        Mnemonic::Xchg => lower_xchg(bcx, instr, gpr, dirty, *rflags, mem),
+        Mnemonic::Not => lower_not(bcx, instr, gpr, dirty, *rflags, mem),
         // Lazy-capable ALU (overwrite pending without materializing).
-        Mnemonic::Add => lower_arith_lazy(bcx, instr, gpr, rflags, pending, mem, Arith::Add),
-        Mnemonic::Sub => lower_arith_lazy(bcx, instr, gpr, rflags, pending, mem, Arith::Sub),
-        Mnemonic::Xor => lower_arith_lazy(bcx, instr, gpr, rflags, pending, mem, Arith::Xor),
-        Mnemonic::And => lower_arith_lazy(bcx, instr, gpr, rflags, pending, mem, Arith::And),
-        Mnemonic::Or => lower_arith_lazy(bcx, instr, gpr, rflags, pending, mem, Arith::Or),
+        Mnemonic::Add => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Add),
+        Mnemonic::Sub => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Sub),
+        Mnemonic::Xor => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Xor),
+        Mnemonic::And => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::And),
+        Mnemonic::Or => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Or),
         Mnemonic::Cmp => lower_cmp_test_lazy(bcx, instr, gpr, rflags, pending, mem, true),
         Mnemonic::Test => lower_cmp_test_lazy(bcx, instr, gpr, rflags, pending, mem, false),
         // Need live CF / complex flags → flush then eager.
@@ -2119,6 +2254,7 @@ fn lower_insn(
                 bcx,
                 instr,
                 gpr,
+                dirty,
                 rflags,
                 mem,
                 if instr.mnemonic() == Mnemonic::Adc {
@@ -2129,24 +2265,32 @@ fn lower_insn(
             )
         }
         // Inc/dec: lazy with CF preserved on flush (Intel: INC/DEC do not touch CF).
-        Mnemonic::Inc => lower_inc_dec_lazy(bcx, instr, gpr, rflags, pending, mem, true),
-        Mnemonic::Dec => lower_inc_dec_lazy(bcx, instr, gpr, rflags, pending, mem, false),
+        Mnemonic::Inc => lower_inc_dec_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, true),
+        Mnemonic::Dec => lower_inc_dec_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, false),
         Mnemonic::Neg => {
             // Neg is 0-sub; can lazy as Sub{0,a,res}.
-            lower_neg_lazy(bcx, instr, gpr, rflags, pending, mem)
+            lower_neg_lazy(bcx, instr, gpr, dirty, rflags, pending, mem)
         }
         Mnemonic::Imul => {
             flush_pending(bcx, rflags, pending);
-            lower_imul(bcx, instr, gpr, rflags, mem)
+            lower_imul(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Shift/rotate: compute result now; defer flag packing (unless count_mod==0).
         Mnemonic::Shl | Mnemonic::Sal => {
-            lower_shift_lazy(bcx, instr, gpr, rflags, pending, mem, ShiftKind::Shl)
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Shl)
         }
-        Mnemonic::Shr => lower_shift_lazy(bcx, instr, gpr, rflags, pending, mem, ShiftKind::Shr),
-        Mnemonic::Sar => lower_shift_lazy(bcx, instr, gpr, rflags, pending, mem, ShiftKind::Sar),
-        Mnemonic::Rol => lower_shift_lazy(bcx, instr, gpr, rflags, pending, mem, ShiftKind::Rol),
-        Mnemonic::Ror => lower_shift_lazy(bcx, instr, gpr, rflags, pending, mem, ShiftKind::Ror),
+        Mnemonic::Shr => {
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Shr)
+        }
+        Mnemonic::Sar => {
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Sar)
+        }
+        Mnemonic::Rol => {
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Rol)
+        }
+        Mnemonic::Ror => {
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Ror)
+        }
         m @ (Mnemonic::Cmove
         | Mnemonic::Cmovne
         | Mnemonic::Cmova
@@ -2164,7 +2308,7 @@ fn lower_insn(
         | Mnemonic::Cmovp
         | Mnemonic::Cmovnp) => {
             flush_pending(bcx, rflags, pending);
-            lower_cmov(bcx, instr, gpr, *rflags, mem, m)
+            lower_cmov(bcx, instr, gpr, dirty, *rflags, mem, m)
         }
         m @ (Mnemonic::Sete
         | Mnemonic::Setne
@@ -2183,7 +2327,7 @@ fn lower_insn(
         | Mnemonic::Setp
         | Mnemonic::Setnp) => {
             flush_pending(bcx, rflags, pending);
-            lower_setcc(bcx, instr, gpr, *rflags, mem, m)
+            lower_setcc(bcx, instr, gpr, dirty, *rflags, mem, m)
         }
         Mnemonic::Movaps
         | Mnemonic::Movups
@@ -2193,8 +2337,8 @@ fn lower_insn(
         | Mnemonic::Movupd => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 16, false),
         Mnemonic::Movss => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 4, true),
         Mnemonic::Movsd => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 8, true),
-        Mnemonic::Movq => lower_sse_movq(bcx, instr, gpr, *rflags, mem, xmm),
-        Mnemonic::Movd => lower_sse_movd(bcx, instr, gpr, *rflags, mem, xmm),
+        Mnemonic::Movq => lower_sse_movq(bcx, instr, gpr, dirty, *rflags, mem, xmm),
+        Mnemonic::Movd => lower_sse_movd(bcx, instr, gpr, dirty, *rflags, mem, xmm),
         Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
             lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Xor)
         }
@@ -2315,6 +2459,7 @@ fn lower_term(
     bcx: &mut FunctionBuilder<'_>,
     term: BlockTerm,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     term_ip: u64,
@@ -2326,6 +2471,7 @@ fn lower_term(
             taken,
             not_taken,
         } => {
+            // Flags already flushed before terminator when pending/jcc.
             let cond = flag_cond(bcx, rflags, mnemonic)?;
             let t = iconst_u64(bcx, taken);
             let n = iconst_u64(bcx, not_taken);
@@ -2338,12 +2484,14 @@ fn lower_term(
             let new_rsp = bcx.ins().iadd_imm(rsp, -8);
             call_store(bcx, mem, gpr, rflags, new_rsp, 8, ret, term_ip)?;
             gpr[4] = new_rsp;
+            mark_dirty(dirty, 4);
             Ok(iconst_u64(bcx, target))
         }
         BlockTerm::Ret => {
             let rsp = gpr[4];
             let ret = call_load(bcx, mem, gpr, rflags, rsp, 8, term_ip)?;
             gpr[4] = bcx.ins().iadd_imm(rsp, 8);
+            mark_dirty(dirty, 4);
             Ok(ret)
         }
     }
@@ -2409,6 +2557,7 @@ fn lower_cmov(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     m: Mnemonic,
@@ -2420,8 +2569,10 @@ fn lower_cmov(
     let old = gpr[idx];
     // Simulate taken write into a temp slot.
     let mut gpr_t = *gpr;
-    write_gpr(bcx, &mut gpr_t, reg, src)?;
+    let mut dirty_t = [false; 16];
+    write_gpr(bcx, &mut gpr_t, &mut dirty_t, reg, src)?;
     gpr[idx] = bcx.ins().select(cond, gpr_t[idx], old);
+    mark_dirty(dirty, idx);
     Ok(())
 }
 
@@ -2429,6 +2580,7 @@ fn lower_setcc(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     m: Mnemonic,
@@ -2438,7 +2590,7 @@ fn lower_setcc(
     let zero = iconst_u64(bcx, 0);
     let val = bcx.ins().select(cond, one, zero);
     match instr.op0_kind() {
-        OpKind::Register => write_gpr(bcx, gpr, instr.op_register(0), val),
+        OpKind::Register => write_gpr(bcx, gpr, dirty, instr.op_register(0), val),
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr)?;
             call_store(bcx, mem, gpr, rflags, addr, 1, val, instr.ip())
@@ -2452,6 +2604,7 @@ fn lower_shift_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
@@ -2497,7 +2650,7 @@ fn lower_shift_lazy(
     };
     let result = mask_width(bcx, result_raw, bits);
     let final_res = bcx.ins().select(is_zero, dst, result);
-    write_op_mem(bcx, instr, 0, gpr, *rflags, mem, final_res, bits)?;
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, final_res, bits)?;
 
     // Defer flag packing; materialize_shift_flags keeps old rflags when count_mod==0.
     *pending = PendingFlags::Shift {
@@ -2591,6 +2744,7 @@ fn read_gpr(gpr: &[Value; 16], reg: Register) -> Result<Value, String> {
 fn write_gpr(
     bcx: &mut FunctionBuilder<'_>,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     reg: Register,
     val: Value,
 ) -> Result<(), String> {
@@ -2623,7 +2777,13 @@ fn write_gpr(
         bcx.ins().bor(cleared, low)
     };
     gpr[i] = new_v;
+    dirty[i] = true;
     Ok(())
+}
+
+#[inline]
+fn mark_dirty(dirty: &mut [bool; 16], idx: usize) {
+    dirty[idx] = true;
 }
 
 fn read_imm(bcx: &mut FunctionBuilder<'_>, instr: &Instruction, op: u32) -> Value {
@@ -2731,6 +2891,81 @@ fn read_op_mem(
     }
 }
 
+/// Probe sticky hot TLB: same page_key and access entirely within the page.
+///
+/// Returns `(ok_i1, host_ptr)` where `host_ptr` is only valid when `ok` is true.
+fn sticky_tlb_probe(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    addr: Value,
+    size: u32,
+) -> (Value, Value) {
+    let page_mask = iconst_u64(bcx, PAGE_SIZE - 1);
+    let page_off = bcx.ins().band(addr, page_mask);
+    let sh = iconst_u64(bcx, 12);
+    let page_key = bcx.ins().ushr(addr, sh);
+    let size_v = iconst_u64(bcx, u64::from(size));
+    let end = bcx.ins().iadd(page_off, size_v);
+    // end <= PAGE_SIZE  ⇒  no cross-page
+    let page_sz = iconst_u64(bcx, PAGE_SIZE);
+    let in_page = bcx.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, page_sz);
+
+    let hot_key_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PAGE));
+    let hot_ptr_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PTR));
+    let hot_key = bcx.ins().load(types::I64, mem.flags, hot_key_p, 0);
+    let hot_base = bcx.ins().load(types::I64, mem.flags, hot_ptr_p, 0);
+    let key_ok = bcx.ins().icmp(IntCC::Equal, hot_key, page_key);
+    let base_nz = bcx.ins().icmp_imm(IntCC::NotEqual, hot_base, 0);
+    let ok1 = bcx.ins().band(key_ok, base_nz);
+    // band of icmp results: convert to i64 first if needed — Cranelift icmp → i8/b1.
+    // Use select/bitwise carefully: both are b1 (boolean) in Cranelift.
+    let ok = bcx.ins().band(ok1, in_page);
+    let host = bcx.ins().iadd(hot_base, page_off);
+    (ok, host)
+}
+
+/// Zero-extend a loaded integer of `size` bytes to i64.
+fn load_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32) -> Value {
+    // Sticky TLB guarantees a mapped host page; trust the pointer.
+    let flags = MemFlagsData::trusted();
+    match size {
+        1 => {
+            let v = bcx.ins().load(types::I8, flags, host, 0);
+            bcx.ins().uextend(types::I64, v)
+        }
+        2 => {
+            let v = bcx.ins().load(types::I16, flags, host, 0);
+            bcx.ins().uextend(types::I64, v)
+        }
+        4 => {
+            let v = bcx.ins().load(types::I32, flags, host, 0);
+            bcx.ins().uextend(types::I64, v)
+        }
+        _ => bcx.ins().load(types::I64, flags, host, 0),
+    }
+}
+
+fn store_guest_bytes(bcx: &mut FunctionBuilder<'_>, host: Value, size: u32, value: Value) {
+    let flags = MemFlagsData::trusted();
+    match size {
+        1 => {
+            let v = bcx.ins().ireduce(types::I8, value);
+            bcx.ins().store(flags, v, host, 0);
+        }
+        2 => {
+            let v = bcx.ins().ireduce(types::I16, value);
+            bcx.ins().store(flags, v, host, 0);
+        }
+        4 => {
+            let v = bcx.ins().ireduce(types::I32, value);
+            bcx.ins().store(flags, v, host, 0);
+        }
+        _ => {
+            bcx.ins().store(flags, value, host, 0);
+        }
+    }
+}
+
 fn call_load(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
@@ -2740,13 +2975,29 @@ fn call_load(
     size: u32,
     insn_ip: u64,
 ) -> Result<Value, String> {
-    // Host: 4-way TLB + dense page-table walk on miss.
-    // Full IR page-walk was measured ~2× slower on open-rom (branchy IR / icache).
+    // Inline sticky-TLB fast path for single-page hits; helper on miss / cross-page.
+    // (Full multi-way IR walk was measured slower; sticky covers hot loops.)
     let load_ref = mem.load_ref.ok_or("load helper missing")?;
+    let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size);
+
+    let fast = bcx.create_block();
+    let slow = bcx.create_block();
+    let merge = bcx.create_block();
+    bcx.append_block_param(merge, types::I64);
+
+    bcx.ins().brif(ok, fast, &[], slow, &[]);
+
+    bcx.switch_to_block(fast);
+    bcx.seal_block(fast);
+    let fast_val = load_guest_bytes(bcx, host, size);
+    bcx.ins().jump(merge, &[BlockArg::Value(fast_val)]);
+
+    bcx.switch_to_block(slow);
+    bcx.seal_block(slow);
     let size_v = bcx.ins().iconst(types::I64, i64::from(size));
     let ip_v = iconst_u64(bcx, insn_ip);
     let call = bcx.ins().call(load_ref, &[mem.ctx_ptr, addr, size_v, ip_v]);
-    let val = bcx.inst_results(call)[0];
+    let slow_val = bcx.inst_results(call)[0];
     let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
     let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
     let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
@@ -2755,7 +3006,11 @@ fn call_load(
     bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
     bcx.switch_to_block(cont);
     bcx.seal_block(cont);
-    Ok(val)
+    bcx.ins().jump(merge, &[BlockArg::Value(slow_val)]);
+
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
+    Ok(bcx.block_params(merge)[0])
 }
 
 fn call_store(
@@ -2769,6 +3024,20 @@ fn call_store(
     insn_ip: u64,
 ) -> Result<(), String> {
     let store_ref = mem.store_ref.ok_or("store helper missing")?;
+    let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size);
+
+    let fast = bcx.create_block();
+    let slow = bcx.create_block();
+    let merge = bcx.create_block();
+    bcx.ins().brif(ok, fast, &[], slow, &[]);
+
+    bcx.switch_to_block(fast);
+    bcx.seal_block(fast);
+    store_guest_bytes(bcx, host, size, value);
+    bcx.ins().jump(merge, &[]);
+
+    bcx.switch_to_block(slow);
+    bcx.seal_block(slow);
     let size_v = bcx.ins().iconst(types::I64, i64::from(size));
     let ip_v = iconst_u64(bcx, insn_ip);
     bcx.ins()
@@ -2781,6 +3050,10 @@ fn call_store(
     bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
     bcx.switch_to_block(cont);
     bcx.seal_block(cont);
+    bcx.ins().jump(merge, &[]);
+
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
     Ok(())
 }
 
@@ -2788,6 +3061,7 @@ fn lower_mov(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -2799,7 +3073,7 @@ fn lower_mov(
             let addr = effective_addr(bcx, instr, gpr)?;
             let width = mem_width_bytes(instr)?;
             let val = call_load(bcx, mem, gpr, rflags, addr, width, ip)?;
-            write_gpr(bcx, gpr, instr.op_register(0), val)
+            write_gpr(bcx, gpr, dirty, instr.op_register(0), val)
         }
         (OpKind::Memory, OpKind::Register) => {
             let addr = effective_addr(bcx, instr, gpr)?;
@@ -2815,7 +3089,7 @@ fn lower_mov(
         }
         (OpKind::Register, _) => {
             let src = read_op(bcx, instr, 1, gpr)?;
-            write_gpr(bcx, gpr, instr.op_register(0), src)
+            write_gpr(bcx, gpr, dirty, instr.op_register(0), src)
         }
         _ => Err("mov form".into()),
     }
@@ -2825,6 +3099,7 @@ fn lower_movx(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     signed: bool,
@@ -2842,7 +3117,7 @@ fn lower_movx(
         read_gpr(gpr, instr.op_register(1))?
     };
     let val = extend_value(bcx, src, src_bits, signed);
-    write_gpr(bcx, gpr, instr.op_register(0), val)
+    write_gpr(bcx, gpr, dirty, instr.op_register(0), val)
 }
 
 fn extend_value(bcx: &mut FunctionBuilder<'_>, src: Value, src_bits: u32, signed: bool) -> Value {
@@ -2885,9 +3160,10 @@ fn lower_lea(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
 ) -> Result<(), String> {
     let addr = effective_addr(bcx, instr, gpr)?;
-    write_gpr(bcx, gpr, instr.op_register(0), addr)
+    write_gpr(bcx, gpr, dirty, instr.op_register(0), addr)
 }
 
 /// 64-bit push (Intel: value of RSP before decrement is what `push rsp` stores).
@@ -2895,6 +3171,7 @@ fn lower_push(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -2912,6 +3189,7 @@ fn lower_push(
     let new_rsp = bcx.ins().iadd_imm(rsp, -i64::from(size));
     call_store(bcx, mem, gpr, rflags, new_rsp, size, val, instr.ip())?;
     gpr[4] = new_rsp;
+    mark_dirty(dirty, 4);
     Ok(())
 }
 
@@ -2919,6 +3197,7 @@ fn lower_pop(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -2927,10 +3206,11 @@ fn lower_pop(
     let val = call_load(bcx, mem, gpr, rflags, rsp, size, instr.ip())?;
     let new_rsp = bcx.ins().iadd_imm(rsp, i64::from(size));
     gpr[4] = new_rsp;
+    mark_dirty(dirty, 4);
     match instr.op0_kind() {
         OpKind::Register => {
             // pop rsp: write the popped value (already advanced rsp).
-            write_gpr(bcx, gpr, instr.op_register(0), val)
+            write_gpr(bcx, gpr, dirty, instr.op_register(0), val)
         }
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr)?;
@@ -2946,6 +3226,7 @@ fn lower_arith_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
@@ -2965,7 +3246,7 @@ fn lower_arith_lazy(
         Arith::Adc | Arith::Sbb => return Err("lazy path only for non-carry ALU".into()),
     };
     let res_m = mask_width(bcx, res, bits);
-    write_op_mem(bcx, instr, 0, gpr, *rflags, mem, res_m, bits)?;
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res_m, bits)?;
     *pending = match op {
         Arith::Add => PendingFlags::Add {
             a,
@@ -3016,6 +3297,7 @@ fn lower_arith(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
     op: Arith,
@@ -3042,7 +3324,7 @@ fn lower_arith(
         Arith::Or => bcx.ins().bor(a, b),
     };
     let res_m = mask_width(bcx, res, bits);
-    write_op_mem(bcx, instr, 0, gpr, *rflags, mem, res_m, bits)?;
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res_m, bits)?;
     *rflags = match op {
         Arith::Xor | Arith::And | Arith::Or => flags_logic(bcx, *rflags, res_m, bits),
         Arith::Add => flags_add(bcx, *rflags, a, b, res_m, bits),
@@ -3099,6 +3381,7 @@ fn lower_imul(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -3133,7 +3416,7 @@ fn lower_imul(
         let ov = bcx.ins().icmp(IntCC::NotEqual, product, expected);
         (lo, ov)
     };
-    write_op_mem(bcx, instr, 0, gpr, *rflags, mem, lo, bits)?;
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, lo, bits)?;
     let cf_on = select_flag(bcx, overflow, rflags::CF);
     let of_on = select_flag(bcx, overflow, rflags::OF);
     let f = replace_flag(bcx, *rflags, rflags::CF, cf_on);
@@ -3145,6 +3428,7 @@ fn lower_xchg(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -3156,8 +3440,8 @@ fn lower_xchg(
             let r1 = instr.op_register(1);
             let v0 = read_gpr(gpr, r0)?;
             let v1 = read_gpr(gpr, r1)?;
-            write_gpr(bcx, gpr, r0, v1)?;
-            write_gpr(bcx, gpr, r1, v0)
+            write_gpr(bcx, gpr, dirty, r0, v1)?;
+            write_gpr(bcx, gpr, dirty, r1, v0)
         }
         (OpKind::Register, OpKind::Memory) | (OpKind::Memory, OpKind::Register) => {
             let reg = if k0 == OpKind::Register {
@@ -3176,7 +3460,7 @@ fn lower_xchg(
             let addr = effective_addr(bcx, instr, gpr)?;
             let mem_v = call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?;
             let reg_v = read_gpr(gpr, reg)?;
-            write_gpr(bcx, gpr, reg, mem_v)?;
+            write_gpr(bcx, gpr, dirty, reg, mem_v)?;
             call_store(bcx, mem, gpr, rflags, addr, width, reg_v, instr.ip())
         }
         _ => Err("xchg form".into()),
@@ -3188,13 +3472,14 @@ fn write_op_mem(
     instr: &Instruction,
     op: u32,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
     val: Value,
     bits: u32,
 ) -> Result<(), String> {
     match instr.op_kind(op) {
-        OpKind::Register => write_gpr(bcx, gpr, instr.op_register(op), val),
+        OpKind::Register => write_gpr(bcx, gpr, dirty, instr.op_register(op), val),
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr)?;
             let width = match bits {
@@ -3214,6 +3499,7 @@ fn lower_inc_dec_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
@@ -3229,7 +3515,7 @@ fn lower_inc_dec_lazy(
         bcx.ins().isub(a, one)
     };
     let res = mask_width(bcx, res_raw, bits);
-    write_op_mem(bcx, instr, 0, gpr, *rflags, mem, res, bits)?;
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res, bits)?;
     *pending = if inc {
         PendingFlags::Inc { a, res, bits }
     } else {
@@ -3242,6 +3528,7 @@ fn lower_not(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), String> {
@@ -3250,13 +3537,14 @@ fn lower_not(
     let a = mask_width(bcx, a_raw, bits);
     let not_a = bcx.ins().bnot(a);
     let res = mask_width(bcx, not_a, bits);
-    write_op_mem(bcx, instr, 0, gpr, rflags, mem, res, bits)
+    write_op_mem(bcx, instr, 0, gpr, dirty, rflags, mem, res, bits)
 }
 
 fn lower_neg_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
@@ -3267,7 +3555,7 @@ fn lower_neg_lazy(
     let zero = bcx.ins().iconst(types::I64, 0);
     let sub = bcx.ins().isub(zero, a);
     let res = mask_width(bcx, sub, bits);
-    write_op_mem(bcx, instr, 0, gpr, *rflags, mem, res, bits)?;
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res, bits)?;
     // NEG is 0 - a (SUB flags).
     *pending = PendingFlags::Sub {
         a: zero,

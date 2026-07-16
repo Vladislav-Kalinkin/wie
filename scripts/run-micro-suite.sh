@@ -29,6 +29,7 @@ run_one "$ROOT/micro-exes/out/process_ids.exe"
 run_one "$ROOT/micro-exes/out/heap_alloc.exe"
 run_one "$ROOT/micro-exes/out/heap_core.exe"
 run_one "$ROOT/micro-exes/out/modules.exe"
+run_one "$ROOT/micro-exes/out/long_loop.exe"
 
 # N5 — ordinary CRT-linked hello (drives UCRT + more kernel32)
 run_one "$ROOT/micro-exes/out/crt_hello.exe" --max-api 8000

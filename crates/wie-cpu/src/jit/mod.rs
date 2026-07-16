@@ -60,6 +60,9 @@ pub struct JitCpu {
     tlb_page: [u64; TLB_WAYS],
     tlb_ptr: [*mut u8; TLB_WAYS],
     tlb_rr: u64,
+    /// Sticky last-hit page for inline IR mem path.
+    tlb_hot_page: u64,
+    tlb_hot_ptr: *mut u8,
     /// Fake-API VA → fast UCRT kind (compile-time lookup).
     fast_api: HashMap<u64, FastApiKind>,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
@@ -167,6 +170,8 @@ impl JitCpu {
             tlb_page: [TLB_EMPTY; TLB_WAYS],
             tlb_ptr: [std::ptr::null_mut(); TLB_WAYS],
             tlb_rr: 0,
+            tlb_hot_page: TLB_EMPTY,
+            tlb_hot_ptr: std::ptr::null_mut(),
             fast_api: HashMap::new(),
             chain_va: Box::new([0; CHAIN_SLOTS]),
             chain_fn: Box::new([0; CHAIN_SLOTS]),
@@ -387,15 +392,19 @@ impl JitCpu {
             shadow_ret: self.shadow_ret,
             chain_va: self.chain_va.as_mut_ptr(),
             chain_fn: self.chain_fn.as_mut_ptr(),
+            tlb_hot_page: self.tlb_hot_page,
+            tlb_hot_ptr: self.tlb_hot_ptr,
         };
         // SAFETY: `func` was finalized by Cranelift for this process; `ctx` is valid.
         unsafe {
             func(std::ptr::from_mut(&mut ctx));
         }
-        // Persist multi-way TLB + shadow stack across chained blocks.
+        // Persist multi-way TLB + sticky hot page + shadow stack across chained blocks.
         self.tlb_page = ctx.tlb_page;
         self.tlb_ptr = ctx.tlb_ptr;
         self.tlb_rr = ctx.tlb_rr;
+        self.tlb_hot_page = ctx.tlb_hot_page;
+        self.tlb_hot_ptr = ctx.tlb_hot_ptr;
         self.shadow_sp = ctx.shadow_sp;
         self.shadow_ret = ctx.shadow_ret;
         for i in 0..16 {
@@ -428,6 +437,8 @@ impl JitCpu {
         self.tlb_page = [TLB_EMPTY; TLB_WAYS];
         self.tlb_ptr = [std::ptr::null_mut(); TLB_WAYS];
         self.tlb_rr = 0;
+        self.tlb_hot_page = TLB_EMPTY;
+        self.tlb_hot_ptr = std::ptr::null_mut();
     }
 
     fn invalidate_chain_and_shadow(&mut self) {
