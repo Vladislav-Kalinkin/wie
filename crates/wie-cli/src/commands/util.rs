@@ -56,6 +56,9 @@ pub(crate) fn write_entry_trace_summary(
     if !write_line(output, &header)? {
         return Ok(());
     }
+    if let Some(profile) = &summary.profile {
+        println!("{}", profile.report());
+    }
     for event in &summary.events {
         if !write_line(output, &format_entry_trace_event(event))? {
             return Ok(());

@@ -30,6 +30,8 @@ pub(crate) enum GuestStubKind {
     FlsGetValue { table_va: u64, max_slots: u32 },
     /// `FlsSetValue`: RCX=index, RDX=value; returns TRUE. OOR → FALSE.
     FlsSetValue { table_va: u64, max_slots: u32 },
+    /// `__acrt_iob_func(ix)` → FILE* cookie (stdin/stdout/stderr).
+    AcrtIobFunc,
 }
 
 impl GuestStubKind {
@@ -103,6 +105,16 @@ impl GuestStubKind {
                 buf[jae_imm] = rel as i8 as u8;
                 buf
             }
+            Self::AcrtIobFunc => {
+                // Fits 16-byte IAT stride (no bounds check; CRT only passes 0/1/2):
+                // mov eax, 0x68000000 ; shl ecx, 8 ; add eax, ecx ; ret
+                // (32-bit ops zero-extend into RAX)
+                let mut buf = vec![0xb8, 0x00, 0x00, 0x00, 0x68]; // mov eax, 0x68000000
+                buf.extend_from_slice(&[0xc1, 0xe1, 0x08]); // shl ecx, 8
+                buf.extend_from_slice(&[0x01, 0xc8]); // add eax, ecx
+                buf.push(0xc3); // ret
+                buf
+            }
         }
     }
 
@@ -132,6 +144,55 @@ pub(crate) fn classify_guest_stub(
     name: &str,
     fls_table_va: u64,
 ) -> Option<GuestStubKind> {
+    // UCRT pure helpers: cover indirect `call reg` paths that miss the JIT near-call
+    // fast path (still no host-stop). Matches FILE* cookies / CRT slots in `wie_winapi::ucrt`.
+    if wie_winapi::ucrt::is_ucrt_library(library) {
+        const CRT: u64 = 0x0000_0000_6800_0000;
+        let n = name;
+        if n.eq_ignore_ascii_case("__acrt_iob_func") {
+            return Some(GuestStubKind::AcrtIobFunc);
+        }
+        // No-op / fixed-success CRT init (host handlers only returned 0).
+        if n.eq_ignore_ascii_case("fflush")
+            || n.eq_ignore_ascii_case("setvbuf")
+            || n.eq_ignore_ascii_case("_crt_atexit")
+            || n.eq_ignore_ascii_case("_set_invalid_parameter_handler")
+            || n.eq_ignore_ascii_case("_set_app_type")
+            || n.eq_ignore_ascii_case("_set_new_mode")
+            || n.eq_ignore_ascii_case("_initterm")
+            || n.eq_ignore_ascii_case("_initterm_e")
+            || n.eq_ignore_ascii_case("_configure_narrow_argv")
+            || n.eq_ignore_ascii_case("_initialize_narrow_environment")
+            || n.eq_ignore_ascii_case("__setusermatherr")
+            || n.eq_ignore_ascii_case("_configthreadlocale")
+            || n.eq_ignore_ascii_case("_cexit")
+            || n.eq_ignore_ascii_case("signal")
+        {
+            return Some(GuestStubKind::ReturnZero);
+        }
+        // __p__* → pointer to pre-mapped CRT guest slots (session maps 0x68000000 page).
+        if n.eq_ignore_ascii_case("__p__environ") {
+            return Some(GuestStubKind::ReturnImm64(CRT + 0x300));
+        }
+        if n.eq_ignore_ascii_case("__p___argv") {
+            return Some(GuestStubKind::ReturnImm64(CRT + 0x308));
+        }
+        if n.eq_ignore_ascii_case("__p___argc") {
+            return Some(GuestStubKind::ReturnImm64(CRT + 0x310));
+        }
+        if n.eq_ignore_ascii_case("__p__commode") {
+            return Some(GuestStubKind::ReturnImm64(CRT + 0x318));
+        }
+        if n.eq_ignore_ascii_case("__p__fmode") {
+            return Some(GuestStubKind::ReturnImm64(CRT + 0x320));
+        }
+        if n.eq_ignore_ascii_case("__p__acmdln") {
+            return Some(GuestStubKind::ReturnImm64(CRT + 0x328));
+        }
+        // malloc/free/memcpy/strlen/fwrite stay on JIT import / host path.
+        return None;
+    }
+
     if !library.eq_ignore_ascii_case("KERNEL32.dll")
         && !library.eq_ignore_ascii_case("ntdll.dll")
     {

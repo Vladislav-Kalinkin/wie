@@ -15,7 +15,7 @@ mod mem;
 mod regs;
 
 pub use iced_cpu::IcedCpu;
-pub use jit::{JitCpu, JitStats};
+pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
 pub use regs::RegFile;
 
 /// Memory protection flags for [`CpuEngine::mem_map`] (r/w/x combined).
@@ -103,6 +103,9 @@ pub trait CpuEngine {
         stop_bitmap: Vec<u8>,
     ) -> Result<(), CpuError>;
 
+    /// Configure JIT direct-UCRT / heap fast path (no-op for non-JIT backends).
+    fn configure_jit_fast_path(&mut self, _cfg: JitFastPathConfig) {}
+
     /// Run until a stop-bitmap hit, invalid memory, or instruction budget.
     ///
     /// # Errors
@@ -174,6 +177,9 @@ impl CpuEngine for Box<dyn CpuEngine> {
         stop_bitmap: Vec<u8>,
     ) -> Result<(), CpuError> {
         (**self).install_runtime_hooks(hook_begin, hook_end, stop_bitmap)
+    }
+    fn configure_jit_fast_path(&mut self, cfg: JitFastPathConfig) {
+        (**self).configure_jit_fast_path(cfg);
     }
     fn run_until_stop(
         &mut self,
@@ -247,10 +253,6 @@ impl CpuEngine for Box<dyn CpuEngine> {
 pub fn active_backend_name() -> &'static str {
     match std::env::var("WIE_CPU") {
         Ok(v) if v.eq_ignore_ascii_case("iced") => "iced",
-        Ok(v) if v.eq_ignore_ascii_case("unicorn") => {
-            tracing::warn!("WIE_CPU=unicorn is no longer supported; using jit");
-            "jit"
-        }
         Ok(v) if v.eq_ignore_ascii_case("jit") => "jit",
         _ => "jit",
     }

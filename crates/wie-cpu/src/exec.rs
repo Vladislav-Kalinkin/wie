@@ -13,9 +13,9 @@
     clippy::integer_division
 )]
 
-use crate::mem::GuestMemory;
-use crate::regs::{self, rflags, RegFile};
 use crate::CpuError;
+use crate::mem::GuestMemory;
+use crate::regs::{self, RegFile, rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
 
 /// Access type codes matching Unicorn-ish invalid-memory reporting (0=read,1=write,2=fetch).
@@ -54,10 +54,7 @@ pub(crate) fn step(
     {
         // Decode first for accurate size when possible.
         let size = peek_insn_len(mem, rip).unwrap_or(1);
-        return Ok(StepResult::HostStop {
-            address: rip,
-            size,
-        });
+        return Ok(StepResult::HostStop { address: rip, size });
     }
 
     let Ok(bytes) = mem.fetch(rip, 15) else {
@@ -104,7 +101,8 @@ fn peek_insn_len(mem: &GuestMemory, rip: u64) -> Option<u32> {
     u32::try_from(instr.len()).ok()
 }
 
-enum StepExecError {
+#[derive(Debug)]
+pub(crate) enum StepExecError {
     InvalidMemory(InvalidMem),
     Cpu(CpuError),
 }
@@ -366,12 +364,42 @@ fn execute_one(
 
         // Scalar / packed SSE moves (enough for CRT / memcpy helpers).
         Mnemonic::Movss => exec_sse_mov(mem, regs, instr, 4, true),
-        Mnemonic::Movaps | Mnemonic::Movups | Mnemonic::Movdqa | Mnemonic::Movdqu => {
-            exec_sse_mov(mem, regs, instr, 16, false)
-        }
+        Mnemonic::Movaps
+        | Mnemonic::Movups
+        | Mnemonic::Movdqa
+        | Mnemonic::Movdqu
+        | Mnemonic::Movapd
+        | Mnemonic::Movupd => exec_sse_mov(mem, regs, instr, 16, false),
         Mnemonic::Movq => exec_sse_movq(mem, regs, instr),
-        Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => exec_sse_xor(mem, regs, instr),
+        Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
+            exec_sse_bitwise(mem, regs, instr, SseBitOp::Xor)
+        }
+        Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => {
+            exec_sse_bitwise(mem, regs, instr, SseBitOp::And)
+        }
+        Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => {
+            exec_sse_bitwise(mem, regs, instr, SseBitOp::Or)
+        }
+        Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
+            exec_sse_bitwise(mem, regs, instr, SseBitOp::Andn)
+        }
         Mnemonic::Movd => exec_sse_movd(mem, regs, instr),
+        Mnemonic::Addss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Add, false),
+        Mnemonic::Subss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Sub, false),
+        Mnemonic::Mulss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Mul, false),
+        Mnemonic::Divss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Div, false),
+        Mnemonic::Addsd => exec_sse_scalar_fp(mem, regs, instr, FpOp::Add, true),
+        Mnemonic::Subsd => exec_sse_scalar_fp(mem, regs, instr, FpOp::Sub, true),
+        Mnemonic::Mulsd => exec_sse_scalar_fp(mem, regs, instr, FpOp::Mul, true),
+        Mnemonic::Divsd => exec_sse_scalar_fp(mem, regs, instr, FpOp::Div, true),
+        Mnemonic::Addps => exec_sse_packed_fp(mem, regs, instr, FpOp::Add, false),
+        Mnemonic::Subps => exec_sse_packed_fp(mem, regs, instr, FpOp::Sub, false),
+        Mnemonic::Mulps => exec_sse_packed_fp(mem, regs, instr, FpOp::Mul, false),
+        Mnemonic::Divps => exec_sse_packed_fp(mem, regs, instr, FpOp::Div, false),
+        Mnemonic::Addpd => exec_sse_packed_fp(mem, regs, instr, FpOp::Add, true),
+        Mnemonic::Subpd => exec_sse_packed_fp(mem, regs, instr, FpOp::Sub, true),
+        Mnemonic::Mulpd => exec_sse_packed_fp(mem, regs, instr, FpOp::Mul, true),
+        Mnemonic::Divpd => exec_sse_packed_fp(mem, regs, instr, FpOp::Div, true),
 
         // Minimal stubs: enough for CRT init that queries the host.
         Mnemonic::Cpuid => {
@@ -739,11 +767,12 @@ fn set_imul_flags(regs: &mut RegFile, product: i128, size: usize) {
     // CF/OF set if high half is not sign-extension of low half.
     let bits = size.saturating_mul(8);
     let lo_bits = bits.min(64);
-    let lo = product as u64 & if lo_bits >= 64 {
-        u64::MAX
-    } else {
-        (1_u64 << lo_bits).wrapping_sub(1)
-    };
+    let lo = product as u64
+        & if lo_bits >= 64 {
+            u64::MAX
+        } else {
+            (1_u64 << lo_bits).wrapping_sub(1)
+        };
     let sign_ext = if (lo >> (lo_bits.saturating_sub(1))) & 1 == 1 {
         // negative: high should be all ones for width
         match size {
@@ -803,9 +832,9 @@ fn exec_div(
             if signed {
                 let num = dividend as i16;
                 let den = sign_extend(divisor, 1) as i16;
-                let q = num.checked_div(den).ok_or_else(|| {
-                    StepExecError::Cpu(CpuError::Message("idiv overflow".into()))
-                })?;
+                let q = num
+                    .checked_div(den)
+                    .ok_or_else(|| StepExecError::Cpu(CpuError::Message("idiv overflow".into())))?;
                 let r = num.wrapping_rem(den);
                 let ax = u64::from(u16::from(r as u8) << 8 | u16::from(q as u8));
                 regs.write_reg(Register::AX, ax)?;
@@ -813,9 +842,7 @@ fn exec_div(
                 let q = dividend / divisor;
                 let r = dividend % divisor;
                 if q > 0xff {
-                    return Err(StepExecError::Cpu(CpuError::Message(
-                        "div overflow".into(),
-                    )));
+                    return Err(StepExecError::Cpu(CpuError::Message("div overflow".into())));
                 }
                 regs.write_reg(Register::AX, (r & 0xff) << 8 | (q & 0xff))?;
             }
@@ -827,9 +854,9 @@ fn exec_div(
                 // DX:AX as i32
                 let num = (i32::from(hi as i16) << 16) | i32::from(lo as u16);
                 let den = sign_extend(divisor, 2) as i32;
-                let q = num.checked_div(den).ok_or_else(|| {
-                    StepExecError::Cpu(CpuError::Message("idiv overflow".into()))
-                })?;
+                let q = num
+                    .checked_div(den)
+                    .ok_or_else(|| StepExecError::Cpu(CpuError::Message("idiv overflow".into())))?;
                 let r = num.wrapping_rem(den);
                 if !(-32768..=32767).contains(&q) {
                     return Err(StepExecError::Cpu(CpuError::Message(
@@ -843,9 +870,7 @@ fn exec_div(
                 let q = dividend / divisor;
                 let r = dividend % divisor;
                 if q > 0xffff {
-                    return Err(StepExecError::Cpu(CpuError::Message(
-                        "div overflow".into(),
-                    )));
+                    return Err(StepExecError::Cpu(CpuError::Message("div overflow".into())));
                 }
                 regs.write_reg(Register::AX, q & 0xffff)?;
                 regs.write_reg(Register::DX, r & 0xffff)?;
@@ -857,9 +882,9 @@ fn exec_div(
             if signed {
                 let num = (i64::from(hi as i32) << 32) | i64::from(lo as u32);
                 let den = sign_extend(divisor, 4);
-                let q = num.checked_div(den).ok_or_else(|| {
-                    StepExecError::Cpu(CpuError::Message("idiv overflow".into()))
-                })?;
+                let q = num
+                    .checked_div(den)
+                    .ok_or_else(|| StepExecError::Cpu(CpuError::Message("idiv overflow".into())))?;
                 let r = num.wrapping_rem(den);
                 if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&q) {
                     return Err(StepExecError::Cpu(CpuError::Message(
@@ -873,9 +898,7 @@ fn exec_div(
                 let q = dividend / u128::from(divisor);
                 let r = dividend % u128::from(divisor);
                 if q > u128::from(u32::MAX) {
-                    return Err(StepExecError::Cpu(CpuError::Message(
-                        "div overflow".into(),
-                    )));
+                    return Err(StepExecError::Cpu(CpuError::Message("div overflow".into())));
                 }
                 regs.write_reg(Register::EAX, q as u64 & 0xffff_ffff)?;
                 regs.write_reg(Register::EDX, r as u64 & 0xffff_ffff)?;
@@ -887,9 +910,9 @@ fn exec_div(
             if signed {
                 let num = (i128::from(hi as i64) << 64) | i128::from(lo);
                 let den = i128::from(sign_extend(divisor, 8));
-                let q = num.checked_div(den).ok_or_else(|| {
-                    StepExecError::Cpu(CpuError::Message("idiv overflow".into()))
-                })?;
+                let q = num
+                    .checked_div(den)
+                    .ok_or_else(|| StepExecError::Cpu(CpuError::Message("idiv overflow".into())))?;
                 let r = num.wrapping_rem(den);
                 if q < i128::from(i64::MIN) || q > i128::from(i64::MAX) {
                     return Err(StepExecError::Cpu(CpuError::Message(
@@ -903,9 +926,7 @@ fn exec_div(
                 let q = dividend / u128::from(divisor);
                 let r = dividend % u128::from(divisor);
                 if q > u128::from(u64::MAX) {
-                    return Err(StepExecError::Cpu(CpuError::Message(
-                        "div overflow".into(),
-                    )));
+                    return Err(StepExecError::Cpu(CpuError::Message("div overflow".into())));
                 }
                 regs.set_rax(q as u64);
                 regs.set_rdx(r as u64);
@@ -1044,14 +1065,107 @@ fn exec_sse_mov(
     write_sse_op(mem, regs, instr, 0, val, nbytes, scalar_merge)
 }
 
-fn exec_sse_xor(
+#[derive(Clone, Copy)]
+enum SseBitOp {
+    Xor,
+    And,
+    Or,
+    Andn,
+}
+
+fn exec_sse_bitwise(
     mem: &mut GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
+    op: SseBitOp,
 ) -> Result<(), StepExecError> {
     let a = read_sse_op(mem, regs, instr, 0, 16)?;
     let b = read_sse_op(mem, regs, instr, 1, 16)?;
-    write_sse_op(mem, regs, instr, 0, a ^ b, 16, false)
+    let r = match op {
+        SseBitOp::Xor => a ^ b,
+        SseBitOp::And => a & b,
+        SseBitOp::Or => a | b,
+        SseBitOp::Andn => (!a) & b,
+    };
+    write_sse_op(mem, regs, instr, 0, r, 16, false)
+}
+
+#[derive(Clone, Copy)]
+enum FpOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+fn fp32(op: FpOp, a: f32, b: f32) -> f32 {
+    match op {
+        FpOp::Add => a + b,
+        FpOp::Sub => a - b,
+        FpOp::Mul => a * b,
+        FpOp::Div => a / b,
+    }
+}
+
+fn fp64(op: FpOp, a: f64, b: f64) -> f64 {
+    match op {
+        FpOp::Add => a + b,
+        FpOp::Sub => a - b,
+        FpOp::Mul => a * b,
+        FpOp::Div => a / b,
+    }
+}
+
+fn exec_sse_scalar_fp(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    op: FpOp,
+    is_f64: bool,
+) -> Result<(), StepExecError> {
+    if is_f64 {
+        let a = read_sse_op(mem, regs, instr, 0, 8)?;
+        let b = read_sse_op(mem, regs, instr, 1, 8)?;
+        let fa = f64::from_bits(a as u64);
+        let fb = f64::from_bits(b as u64);
+        let r = u128::from(fp64(op, fa, fb).to_bits());
+        write_sse_op(mem, regs, instr, 0, r, 8, true)
+    } else {
+        let a = read_sse_op(mem, regs, instr, 0, 4)?;
+        let b = read_sse_op(mem, regs, instr, 1, 4)?;
+        let fa = f32::from_bits(a as u32);
+        let fb = f32::from_bits(b as u32);
+        let r = u128::from(fp32(op, fa, fb).to_bits());
+        write_sse_op(mem, regs, instr, 0, r, 4, true)
+    }
+}
+
+fn exec_sse_packed_fp(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    op: FpOp,
+    is_f64: bool,
+) -> Result<(), StepExecError> {
+    let a = read_sse_op(mem, regs, instr, 0, 16)?;
+    let b = read_sse_op(mem, regs, instr, 1, 16)?;
+    let mut out = 0_u128;
+    if is_f64 {
+        for i in 0..2 {
+            let shift = i * 64;
+            let fa = f64::from_bits(((a >> shift) & u128::from(u64::MAX)) as u64);
+            let fb = f64::from_bits(((b >> shift) & u128::from(u64::MAX)) as u64);
+            out |= u128::from(fp64(op, fa, fb).to_bits()) << shift;
+        }
+    } else {
+        for i in 0..4 {
+            let shift = i * 32;
+            let fa = f32::from_bits(((a >> shift) & 0xffff_ffff) as u32);
+            let fb = f32::from_bits(((b >> shift) & 0xffff_ffff) as u32);
+            out |= u128::from(fp32(op, fa, fb).to_bits()) << shift;
+        }
+    }
+    write_sse_op(mem, regs, instr, 0, out, 16, false)
 }
 
 fn exec_sse_movq(
@@ -1117,9 +1231,9 @@ fn read_sse_op(
         OpKind::Memory => {
             let addr = effective_address(regs, instr)?;
             let mut buf = [0_u8; 16];
-            let slice = buf.get_mut(..nbytes).ok_or_else(|| {
-                StepExecError::Cpu(CpuError::Message("sse read size".into()))
-            })?;
+            let slice = buf
+                .get_mut(..nbytes)
+                .ok_or_else(|| StepExecError::Cpu(CpuError::Message("sse read size".into())))?;
             if let Err(e) = mem.read(addr, slice) {
                 drop(e);
                 return Err(StepExecError::InvalidMemory(InvalidMem {
@@ -1187,9 +1301,9 @@ fn write_sse_op(
                     *b = ((value >> (i.saturating_mul(8))) & 0xff) as u8;
                 }
             }
-            let slice = buf.get(..nbytes).ok_or_else(|| {
-                StepExecError::Cpu(CpuError::Message("sse write size".into()))
-            })?;
+            let slice = buf
+                .get(..nbytes)
+                .ok_or_else(|| StepExecError::Cpu(CpuError::Message("sse write size".into())))?;
             if let Err(e) = mem.write(addr, slice) {
                 drop(e);
                 return Err(StepExecError::InvalidMemory(InvalidMem {
@@ -1214,11 +1328,7 @@ fn has_any_rep(instr: &Instruction) -> bool {
 
 fn df_step(regs: &RegFile, size: usize) -> i64 {
     let s = i64::try_from(size).unwrap_or(1);
-    if regs.flag(rflags::DF) {
-        -s
-    } else {
-        s
-    }
+    if regs.flag(rflags::DF) { -s } else { s }
 }
 
 /// Keep RIP on a REP-prefixed string insn (Unicorn `count=1` micro-step).
@@ -1231,11 +1341,45 @@ fn df_step(regs: &RegFile, size: usize) -> i64 {
 ///   no-op that finally falls through.
 /// - Entering with RCX=0 is a pure no-op that advances RIP (handled by callers
 ///   returning with the fall-through RIP already set in `execute_one`).
-fn string_rep_stay(regs: &mut RegFile, instr: &Instruction) {
-    if has_any_rep(instr) {
+fn apply_string_stay(regs: &mut RegFile, instr: &Instruction, stay: bool) {
+    if stay {
         regs.rip = instr.ip();
     }
 }
+
+/// String op kind for interpreter + JIT host helper.
+#[derive(Clone, Copy)]
+pub(crate) enum StringOpKind {
+    Stos = 0,
+    Movs = 1,
+    Lods = 2,
+    Scas = 3,
+    Cmps = 4,
+}
+
+/// Bulk string op shared by iced and JIT. Returns `true` if RIP should stay on the insn.
+///
+/// `rep` covers REP/REPE/REPNE presence; `repe`/`repne` select ZF early-exit for SCAS/CMPS.
+pub(crate) fn run_string_op(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    kind: StringOpKind,
+    size: usize,
+    rep: bool,
+    repe: bool,
+    repne: bool,
+) -> Result<bool, StepExecError> {
+    match kind {
+        StringOpKind::Stos => string_stos(mem, regs, size, rep),
+        StringOpKind::Movs => string_movs(mem, regs, size, rep),
+        StringOpKind::Lods => string_lods(mem, regs, size, rep),
+        StringOpKind::Scas => string_scas(mem, regs, size, rep, repe, repne),
+        StringOpKind::Cmps => string_cmps(mem, regs, size, rep, repe, repne),
+    }
+}
+
+/// Max elements processed in one bulk REP string step (faults still leave partial state).
+const REP_BULK_MAX: u64 = 1 << 20;
 
 fn exec_stos(
     mem: &mut GuestMemory,
@@ -1243,22 +1387,78 @@ fn exec_stos(
     instr: &Instruction,
     size: usize,
 ) -> Result<(), StepExecError> {
-    // REP MOVS/STOS/LODS: F3 may surface as has_rep and/or has_repe in iced.
-    let rep = has_any_rep(instr);
+    let stay = string_stos(mem, regs, size, has_any_rep(instr))?;
+    apply_string_stay(regs, instr, stay);
+    Ok(())
+}
+
+fn string_stos(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    size: usize,
+    rep: bool,
+) -> Result<bool, StepExecError> {
     if rep && regs.rcx() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let step = df_step(regs, size);
     let val = regs.rax() & regs::size_mask(size);
+    if rep {
+        let mut count = regs.rcx().min(REP_BULK_MAX);
+        let mut rdi = regs.rdi();
+        // Forward DF: page-chunked mem.write with a repeated pattern.
+        if step > 0 && count > 1 {
+            let mut buf = vec![0_u8; 4096];
+            fill_pattern(&mut buf, val, size);
+            let mut done_elems = 0_u64;
+            while done_elems < count {
+                let remain_elems = count - done_elems;
+                let remain_bytes =
+                    usize::try_from(remain_elems.saturating_mul(u64::try_from(size).unwrap_or(1)))
+                        .unwrap_or(0);
+                let chunk = remain_bytes.min(buf.len());
+                let aligned = chunk - (chunk % size.max(1));
+                if aligned == 0 {
+                    break;
+                }
+                if let Err(e) = mem.write(rdi, &buf[..aligned]) {
+                    drop(e);
+                    regs.set_rdi(rdi);
+                    regs.set_rcx(regs.rcx().saturating_sub(done_elems));
+                    write_mem_value(mem, rdi, val, size)?;
+                    return Ok(false);
+                }
+                let elems = u64::try_from(aligned / size).unwrap_or(0);
+                rdi = rdi.wrapping_add(elems.saturating_mul(u64::try_from(size).unwrap_or(1)));
+                done_elems = done_elems.saturating_add(elems);
+            }
+            regs.set_rdi(rdi);
+            regs.set_rcx(regs.rcx().saturating_sub(done_elems));
+            return Ok(done_elems > 0);
+        }
+        while count > 0 {
+            write_mem_value(mem, rdi, val, size)?;
+            rdi = rdi.wrapping_add(step as u64);
+            count = count.saturating_sub(1);
+            regs.set_rdi(rdi);
+            regs.set_rcx(regs.rcx().saturating_sub(1));
+        }
+        return Ok(true);
+    }
     let rdi = regs.rdi();
     write_mem_value(mem, rdi, val, size)?;
     regs.set_rdi(rdi.wrapping_add(step as u64));
-    if rep {
-        regs.set_rcx(regs.rcx().wrapping_sub(1));
-        // Always stay after a productive REP STOS/MOVS/LODS iteration.
-        string_rep_stay(regs, instr);
+    Ok(false)
+}
+
+fn fill_pattern(buf: &mut [u8], val: u64, size: usize) {
+    let bytes = val.to_le_bytes();
+    let pat = &bytes[..size.min(8)];
+    let mut i = 0;
+    while i + size <= buf.len() {
+        buf[i..i + size].copy_from_slice(pat);
+        i += size;
     }
-    Ok(())
 }
 
 fn exec_movs(
@@ -1267,22 +1467,97 @@ fn exec_movs(
     instr: &Instruction,
     size: usize,
 ) -> Result<(), StepExecError> {
-    let rep = has_any_rep(instr);
+    let stay = string_movs(mem, regs, size, has_any_rep(instr))?;
+    apply_string_stay(regs, instr, stay);
+    Ok(())
+}
+
+fn string_movs(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    size: usize,
+    rep: bool,
+) -> Result<bool, StepExecError> {
     if rep && regs.rcx() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let step = df_step(regs, size);
+    if rep {
+        let mut count = regs.rcx().min(REP_BULK_MAX);
+        let mut rsi = regs.rsi();
+        let mut rdi = regs.rdi();
+        let size_u = u64::try_from(size).unwrap_or(1);
+        let byte_len = count.saturating_mul(size_u);
+        let overlap = ranges_overlap(rsi, rdi, byte_len);
+        if step > 0 && count > 1 && !overlap {
+            let mut buf = vec![0_u8; 4096];
+            let mut done_elems = 0_u64;
+            while done_elems < count {
+                let remain_elems = count - done_elems;
+                let remain_bytes =
+                    usize::try_from(remain_elems.saturating_mul(size_u)).unwrap_or(0);
+                let chunk = remain_bytes.min(buf.len());
+                let aligned = chunk - (chunk % size.max(1));
+                if aligned == 0 {
+                    break;
+                }
+                if let Err(e) = mem.read(rsi, &mut buf[..aligned]) {
+                    drop(e);
+                    regs.set_rsi(rsi);
+                    regs.set_rdi(rdi);
+                    regs.set_rcx(regs.rcx().saturating_sub(done_elems));
+                    let v = read_mem_value(mem, rsi, size)?;
+                    write_mem_value(mem, rdi, v, size)?;
+                    return Ok(false);
+                }
+                if let Err(e) = mem.write(rdi, &buf[..aligned]) {
+                    drop(e);
+                    regs.set_rsi(rsi);
+                    regs.set_rdi(rdi);
+                    regs.set_rcx(regs.rcx().saturating_sub(done_elems));
+                    let v = read_mem_value(mem, rsi, size)?;
+                    write_mem_value(mem, rdi, v, size)?;
+                    return Ok(false);
+                }
+                let elems = u64::try_from(aligned / size).unwrap_or(0);
+                let delta = elems.saturating_mul(size_u);
+                rsi = rsi.wrapping_add(delta);
+                rdi = rdi.wrapping_add(delta);
+                done_elems = done_elems.saturating_add(elems);
+            }
+            regs.set_rsi(rsi);
+            regs.set_rdi(rdi);
+            regs.set_rcx(regs.rcx().saturating_sub(done_elems));
+            return Ok(done_elems > 0);
+        }
+        while count > 0 {
+            let v = read_mem_value(mem, rsi, size)?;
+            write_mem_value(mem, rdi, v, size)?;
+            rsi = rsi.wrapping_add(step as u64);
+            rdi = rdi.wrapping_add(step as u64);
+            count = count.saturating_sub(1);
+            regs.set_rsi(rsi);
+            regs.set_rdi(rdi);
+            regs.set_rcx(regs.rcx().saturating_sub(1));
+        }
+        return Ok(true);
+    }
     let rsi = regs.rsi();
     let rdi = regs.rdi();
     let v = read_mem_value(mem, rsi, size)?;
     write_mem_value(mem, rdi, v, size)?;
     regs.set_rsi(rsi.wrapping_add(step as u64));
     regs.set_rdi(rdi.wrapping_add(step as u64));
-    if rep {
-        regs.set_rcx(regs.rcx().wrapping_sub(1));
-        string_rep_stay(regs, instr);
+    Ok(false)
+}
+
+fn ranges_overlap(a: u64, b: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
     }
-    Ok(())
+    let a_end = a.wrapping_add(len.wrapping_sub(1));
+    let b_end = b.wrapping_add(len.wrapping_sub(1));
+    a <= b_end && b <= a_end
 }
 
 fn exec_lods(
@@ -1291,11 +1566,38 @@ fn exec_lods(
     instr: &Instruction,
     size: usize,
 ) -> Result<(), StepExecError> {
-    let rep = has_any_rep(instr);
+    let stay = string_lods(mem, regs, size, has_any_rep(instr))?;
+    apply_string_stay(regs, instr, stay);
+    Ok(())
+}
+
+fn string_lods(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    size: usize,
+    rep: bool,
+) -> Result<bool, StepExecError> {
     if rep && regs.rcx() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let step = df_step(regs, size);
+    if rep {
+        let mut count = regs.rcx().min(REP_BULK_MAX);
+        let mut rsi = regs.rsi();
+        while count > 0 {
+            let last = read_mem_value(mem, rsi, size)?;
+            rsi = rsi.wrapping_add(step as u64);
+            count = count.saturating_sub(1);
+            regs.set_rsi(rsi);
+            regs.set_rcx(regs.rcx().saturating_sub(1));
+            match size {
+                1 => regs.write_reg(Register::AL, last)?,
+                4 => regs.write_reg(Register::EAX, last)?,
+                _ => regs.set_rax(last),
+            }
+        }
+        return Ok(true);
+    }
     let rsi = regs.rsi();
     let v = read_mem_value(mem, rsi, size)?;
     match size {
@@ -1304,11 +1606,7 @@ fn exec_lods(
         _ => regs.set_rax(v),
     }
     regs.set_rsi(rsi.wrapping_add(step as u64));
-    if rep {
-        regs.set_rcx(regs.rcx().wrapping_sub(1));
-        string_rep_stay(regs, instr);
-    }
-    Ok(())
+    Ok(false)
 }
 
 fn exec_scas(
@@ -1317,28 +1615,58 @@ fn exec_scas(
     instr: &Instruction,
     size: usize,
 ) -> Result<(), StepExecError> {
-    let rep = has_any_rep(instr);
+    let stay = string_scas(
+        mem,
+        regs,
+        size,
+        has_any_rep(instr),
+        instr.has_repe_prefix(),
+        instr.has_repne_prefix(),
+    )?;
+    apply_string_stay(regs, instr, stay);
+    Ok(())
+}
+
+fn string_scas(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    size: usize,
+    rep: bool,
+    repe: bool,
+    repne: bool,
+) -> Result<bool, StepExecError> {
     if rep && regs.rcx() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let step = df_step(regs, size);
     let acc = regs.rax() & regs::size_mask(size);
+    if rep {
+        let mut count = regs.rcx().min(REP_BULK_MAX);
+        let mut rdi = regs.rdi();
+        let mut zf_stop = false;
+        while count > 0 {
+            let v = read_mem_value(mem, rdi, size)? & regs::size_mask(size);
+            let result = acc.wrapping_sub(v);
+            regs::set_sub_flags(regs, acc, v, result, size);
+            rdi = rdi.wrapping_add(step as u64);
+            count = count.saturating_sub(1);
+            regs.set_rdi(rdi);
+            regs.set_rcx(regs.rcx().saturating_sub(1));
+            let zf = regs.flag(rflags::ZF);
+            zf_stop = (repe && !zf) || (repne && zf);
+            if zf_stop {
+                break;
+            }
+        }
+        // ZF early-exit advances RIP; RCX exhaust stays for a follow-up no-op step.
+        return Ok(!zf_stop);
+    }
     let rdi = regs.rdi();
     let v = read_mem_value(mem, rdi, size)? & regs::size_mask(size);
     let result = acc.wrapping_sub(v);
     regs::set_sub_flags(regs, acc, v, result, size);
     regs.set_rdi(rdi.wrapping_add(step as u64));
-    if rep {
-        regs.set_rcx(regs.rcx().wrapping_sub(1));
-        let zf = regs.flag(rflags::ZF);
-        // REPE/REPZ: stop when ZF=0 (mismatch). REPNE/REPNZ: stop when ZF=1 (match).
-        let zf_stop = (instr.has_repe_prefix() && !zf) || (instr.has_repne_prefix() && zf);
-        // ZF early-exit advances RIP; RCX exhaust stays for a follow-up no-op step.
-        if !zf_stop {
-            string_rep_stay(regs, instr);
-        }
-    }
-    Ok(())
+    Ok(false)
 }
 
 fn exec_cmps(
@@ -1347,11 +1675,54 @@ fn exec_cmps(
     instr: &Instruction,
     size: usize,
 ) -> Result<(), StepExecError> {
-    let rep = has_any_rep(instr);
+    let stay = string_cmps(
+        mem,
+        regs,
+        size,
+        has_any_rep(instr),
+        instr.has_repe_prefix(),
+        instr.has_repne_prefix(),
+    )?;
+    apply_string_stay(regs, instr, stay);
+    Ok(())
+}
+
+fn string_cmps(
+    mem: &mut GuestMemory,
+    regs: &mut RegFile,
+    size: usize,
+    rep: bool,
+    repe: bool,
+    repne: bool,
+) -> Result<bool, StepExecError> {
     if rep && regs.rcx() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let step = df_step(regs, size);
+    if rep {
+        let mut count = regs.rcx().min(REP_BULK_MAX);
+        let mut rsi = regs.rsi();
+        let mut rdi = regs.rdi();
+        let mut zf_stop = false;
+        while count > 0 {
+            let a = read_mem_value(mem, rsi, size)? & regs::size_mask(size);
+            let b = read_mem_value(mem, rdi, size)? & regs::size_mask(size);
+            let result = a.wrapping_sub(b);
+            regs::set_sub_flags(regs, a, b, result, size);
+            rsi = rsi.wrapping_add(step as u64);
+            rdi = rdi.wrapping_add(step as u64);
+            count = count.saturating_sub(1);
+            regs.set_rsi(rsi);
+            regs.set_rdi(rdi);
+            regs.set_rcx(regs.rcx().saturating_sub(1));
+            let zf = regs.flag(rflags::ZF);
+            zf_stop = (repe && !zf) || (repne && zf);
+            if zf_stop {
+                break;
+            }
+        }
+        return Ok(!zf_stop);
+    }
     let rsi = regs.rsi();
     let rdi = regs.rdi();
     let a = read_mem_value(mem, rsi, size)? & regs::size_mask(size);
@@ -1360,15 +1731,7 @@ fn exec_cmps(
     regs::set_sub_flags(regs, a, b, result, size);
     regs.set_rsi(rsi.wrapping_add(step as u64));
     regs.set_rdi(rdi.wrapping_add(step as u64));
-    if rep {
-        regs.set_rcx(regs.rcx().wrapping_sub(1));
-        let zf = regs.flag(rflags::ZF);
-        let zf_stop = (instr.has_repe_prefix() && !zf) || (instr.has_repne_prefix() && zf);
-        if !zf_stop {
-            string_rep_stay(regs, instr);
-        }
-    }
-    Ok(())
+    Ok(false)
 }
 
 fn exec_test(
@@ -1498,10 +1861,7 @@ fn exec_shift(
         regs.set_flag(rflags::ZF, result == 0);
         let sign = 1_u64 << bits.saturating_sub(1);
         regs.set_flag(rflags::SF, (result & sign) != 0);
-        regs.set_flag(
-            rflags::PF,
-            (result as u8).count_ones().is_multiple_of(2),
-        );
+        regs.set_flag(rflags::PF, (result as u8).count_ones().is_multiple_of(2));
     }
     if count_mod == 1 {
         let sign = 1_u64 << bits.saturating_sub(1);
@@ -1750,10 +2110,9 @@ fn memory_op_size(instr: &Instruction) -> Result<usize, StepExecError> {
         MemorySize::UInt8 | MemorySize::Int8 => 1,
         MemorySize::UInt16 | MemorySize::Int16 => 2,
         MemorySize::UInt32 | MemorySize::Int32 => 4,
-        MemorySize::UInt64
-        | MemorySize::Int64
-        | MemorySize::QwordOffset
-        | MemorySize::SegPtr64 => 8,
+        MemorySize::UInt64 | MemorySize::Int64 | MemorySize::QwordOffset | MemorySize::SegPtr64 => {
+            8
+        }
         other => {
             // Fallback: use size of the other operand if register.
             if instr.op_count() > 0 && instr.op0_kind() == OpKind::Register {
@@ -1802,9 +2161,9 @@ fn read_mem_value(mem: &GuestMemory, addr: u64, size: usize) -> Result<u64, Step
         ))));
     }
     let mut buf = [0_u8; 8];
-    let slice = buf.get_mut(..size).ok_or_else(|| {
-        StepExecError::Cpu(CpuError::Message("mem read buffer".into()))
-    })?;
+    let slice = buf
+        .get_mut(..size)
+        .ok_or_else(|| StepExecError::Cpu(CpuError::Message("mem read buffer".into())))?;
     if let Err(e) = mem.read(addr, slice) {
         drop(e);
         return Err(StepExecError::InvalidMemory(InvalidMem {
@@ -1835,9 +2194,9 @@ fn write_mem_value(
         ))));
     }
     let bytes = value.to_le_bytes();
-    let slice = bytes.get(..size).ok_or_else(|| {
-        StepExecError::Cpu(CpuError::Message("mem write buffer".into()))
-    })?;
+    let slice = bytes
+        .get(..size)
+        .ok_or_else(|| StepExecError::Cpu(CpuError::Message("mem write buffer".into())))?;
     if let Err(e) = mem.write(addr, slice) {
         drop(e);
         return Err(StepExecError::InvalidMemory(InvalidMem {

@@ -12,19 +12,27 @@
 )]
 
 use super::JitEngine;
-use super::block::{BlockTerm, DecodedInsn, mem_width_bytes};
+use super::block::{BlockTerm, DecodedInsn, is_string_op, mem_width_bytes, string_op_size};
+use super::fast_api::{self, FastApiKind};
+use crate::exec::{self, StringOpKind};
 use crate::mem::{GuestMemory, PAGE_SIZE};
-use crate::regs::rflags;
-use cranelift::codegen::ir::{BlockArg, UserFuncName};
+use crate::regs::{RegFile, rflags};
+use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef, UserFuncName};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
-use cranelift_module::{Linkage, Module};
+use cranelift_module::{FuncId, Linkage, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
+use std::collections::HashMap;
 
 /// Associative guest-page TLB ways (stack vs heap thrashing).
-pub(super) const TLB_WAYS: usize = 4;
+pub(super) const TLB_WAYS: usize = 32;
 /// Empty TLB slot marker (`page_key == TLB_EMPTY`).
 pub(super) const TLB_EMPTY: u64 = u64::MAX;
+
+/// Open-addressing slots for guest-VA → host block fn (block chaining).
+pub(super) const CHAIN_SLOTS: usize = 512;
+/// Shadow return-stack depth (power of two; modular index).
+pub(super) const SHADOW_DEPTH: usize = 32;
 
 /// Guest register file snapshot for a compiled block (C ABI).
 ///
@@ -48,19 +56,81 @@ pub(super) struct JitCtx {
     pub tlb_ptr: [*mut u8; TLB_WAYS],
     /// Round-robin victim index for TLB fill.
     pub tlb_rr: u64,
+    /// XMM0..XMM15 as lo/hi u64 pairs (`xmm[2*i]` = low 64, `xmm[2*i+1]` = high 64).
+    /// Appended so existing OFF_* constants stay stable.
+    pub xmm: [u64; 32],
+    /// Shadow return stack: push count (modular index via `sp & (SHADOW_DEPTH-1)`).
+    pub shadow_sp: u64,
+    /// Predicted guest return addresses for `call`/`ret` chaining.
+    pub shadow_ret: [u64; SHADOW_DEPTH],
+    /// Pointer to [`CHAIN_SLOTS`] guest VAs (owned by `JitCpu`, live for `run_compiled`).
+    pub chain_va: *mut u64,
+    /// Parallel host fn pointers (`0` = empty), same lifetime as `chain_va`.
+    pub chain_fn: *mut u64,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
 // gpr[16] @ 0, rflags @ 128, rip @ 136, mem @ 144, fault @ 152, …
-const OFF_RFLAGS: i32 = 16 * 8;
-const OFF_RIP: i32 = OFF_RFLAGS + 8;
-const OFF_FAULT: i32 = OFF_RIP + 8 + 8; // skip mem ptr
+const OFF_RFLAGS: i32 = std::mem::offset_of!(JitCtx, rflags) as i32;
+const OFF_RIP: i32 = std::mem::offset_of!(JitCtx, rip) as i32;
+const OFF_FAULT: i32 = std::mem::offset_of!(JitCtx, fault) as i32;
+const OFF_SHADOW_SP: i32 = std::mem::offset_of!(JitCtx, shadow_sp) as i32;
+const OFF_XMM: i32 = std::mem::offset_of!(JitCtx, xmm) as i32;
+const OFF_SHADOW_RET: i32 = OFF_SHADOW_SP + 8;
+
+// Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
+const _: () = {
+    assert!(std::mem::offset_of!(JitCtx, rflags) as i32 == OFF_RFLAGS);
+    assert!(std::mem::offset_of!(JitCtx, rip) as i32 == OFF_RIP);
+    assert!(std::mem::offset_of!(JitCtx, fault) as i32 == OFF_FAULT);
+    assert!(std::mem::offset_of!(JitCtx, xmm) as i32 == OFF_XMM);
+    assert!(std::mem::offset_of!(JitCtx, shadow_sp) as i32 == OFF_SHADOW_SP);
+    assert!(std::mem::offset_of!(JitCtx, shadow_ret) as i32 == OFF_SHADOW_RET);
+    assert!(SHADOW_DEPTH.is_power_of_two());
+    assert!(CHAIN_SLOTS.is_power_of_two());
+};
 
 /// Finalized block ready to run.
 #[derive(Clone, Copy)]
 pub(super) struct CompiledBlock {
     pub func: unsafe extern "C" fn(*mut JitCtx),
+    /// Module function id (for block-chaining `declare_func_in_func`).
+    pub func_id: FuncId,
     pub insn_count: u32,
+}
+
+/// Hash a guest VA into a chain-table slot.
+#[inline]
+pub(super) fn chain_hash(va: u64) -> usize {
+    let h = va.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h as usize) & (CHAIN_SLOTS - 1)
+}
+
+/// Insert or update a compiled block in the open-addressing chain table.
+pub(super) fn chain_table_insert(chain_va: &mut [u64], chain_fn: &mut [u64], va: u64, fn_ptr: u64) {
+    if va == 0 || fn_ptr == 0 {
+        return;
+    }
+    let mut i = chain_hash(va);
+    for _ in 0..CHAIN_SLOTS {
+        let slot = chain_va[i];
+        if slot == 0 || slot == va {
+            chain_va[i] = va;
+            chain_fn[i] = fn_ptr;
+            return;
+        }
+        i = (i + 1) & (CHAIN_SLOTS - 1);
+    }
+    // Table full: overwrite hashed slot.
+    let i = chain_hash(va);
+    chain_va[i] = va;
+    chain_fn[i] = fn_ptr;
+}
+
+/// Clear all chain-table entries (cache invalidation).
+pub(super) fn chain_table_clear(chain_va: &mut [u64], chain_fn: &mut [u64]) {
+    chain_va.fill(0);
+    chain_fn.fill(0);
 }
 
 // --- Host mem helpers (registered as JIT symbols) ---
@@ -99,6 +169,36 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize) -> Option<*mut 
     ctx.tlb_rr = ctx.tlb_rr.wrapping_add(1);
     // SAFETY: page mapped; access stays within the page.
     Some(unsafe { ptr.add(page_off) })
+}
+
+/// Lookup host block pointer for `va` (0 = miss). Used for late-bound chaining.
+///
+/// `extern "C" fn(ctx, va) -> fn_ptr`
+pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) -> u64 {
+    if va == 0 || ctx.is_null() {
+        return 0;
+    }
+    // SAFETY: `run_compiled` sets chain_* to live tables for the block duration.
+    let ctx = unsafe { &*ctx };
+    if ctx.chain_va.is_null() || ctx.chain_fn.is_null() {
+        return 0;
+    }
+    // SAFETY: tables are `CHAIN_SLOTS` long and live for this call.
+    let keys = unsafe { std::slice::from_raw_parts(ctx.chain_va, CHAIN_SLOTS) };
+    let fns = unsafe { std::slice::from_raw_parts(ctx.chain_fn, CHAIN_SLOTS) };
+    let mut i = chain_hash(va);
+    // Bounded probe; empty slot ends search.
+    for _ in 0..16 {
+        let k = keys[i];
+        if k == va {
+            return fns[i];
+        }
+        if k == 0 {
+            return 0;
+        }
+        i = (i + 1) & (CHAIN_SLOTS - 1);
+    }
+    0
 }
 
 /// `extern "C" fn(ctx, addr, size, insn_ip) -> value`
@@ -185,18 +285,137 @@ pub(super) unsafe extern "C" fn wie_jit_store(
     }
 }
 
+/// Bulk string helper: `(ctx, op, size, flags, insn_ip) -> stay`.
+///
+/// `op`: 0=stos 1=movs 2=lods 3=scas 4=cmps
+/// `flags`: bit0=rep, bit1=repe, bit2=repne
+/// Returns 1 if RIP should stay on `insn_ip`, 0 to fall through (caller uses next_ip).
+pub(super) unsafe extern "C" fn wie_jit_string(
+    ctx: *mut JitCtx,
+    op: u64,
+    size: u64,
+    flags: u64,
+    insn_ip: u64,
+) -> u64 {
+    // SAFETY: live JitCtx for the block.
+    let ctx = unsafe { &mut *ctx };
+    if ctx.fault != 0 {
+        return 0;
+    }
+    let size_usize = usize::try_from(size).unwrap_or(0);
+    if !matches!(size_usize, 1 | 2 | 4 | 8) {
+        set_fault(ctx, insn_ip, 0, size, 0);
+        return 0;
+    }
+    let kind = match op {
+        0 => StringOpKind::Stos,
+        1 => StringOpKind::Movs,
+        2 => StringOpKind::Lods,
+        3 => StringOpKind::Scas,
+        4 => StringOpKind::Cmps,
+        _ => {
+            set_fault(ctx, insn_ip, 0, size, 0);
+            return 0;
+        }
+    };
+    let rep = (flags & 1) != 0;
+    let repe = (flags & 2) != 0;
+    let repne = (flags & 4) != 0;
+
+    let mut regs = RegFile::new();
+    for i in 0..16 {
+        regs.set_gpr(i, ctx.gpr[i]);
+    }
+    regs.rflags = ctx.rflags;
+    regs.rip = insn_ip;
+
+    // SAFETY: mem pointer set by run_compiled.
+    let mem = unsafe { &mut *ctx.mem };
+    match exec::run_string_op(mem, &mut regs, kind, size_usize, rep, repe, repne) {
+        Ok(stay) => {
+            for i in 0..16 {
+                ctx.gpr[i] = regs.gpr(i);
+            }
+            ctx.rflags = regs.rflags;
+            u64::from(stay)
+        }
+        Err(exec::StepExecError::InvalidMemory(inv)) => {
+            for i in 0..16 {
+                ctx.gpr[i] = regs.gpr(i);
+            }
+            ctx.rflags = regs.rflags;
+            set_fault(
+                ctx,
+                insn_ip,
+                inv.address,
+                u64::try_from(inv.size).unwrap_or(0),
+                u64::try_from(inv.access_type).unwrap_or(0),
+            );
+            0
+        }
+        Err(exec::StepExecError::Cpu(_)) => {
+            set_fault(ctx, insn_ip, 0, size, 0);
+            0
+        }
+    }
+}
+
+/// Scalar f32 binop: `op` 0=add 1=sub 2=mul 3=div; args/result in low 32 bits.
+pub(super) extern "C" fn wie_f32_binop(op: u64, a: u64, b: u64) -> u64 {
+    let fa = f32::from_bits(a as u32);
+    let fb = f32::from_bits(b as u32);
+    let r = match op {
+        0 => fa + fb,
+        1 => fa - fb,
+        2 => fa * fb,
+        3 => fa / fb,
+        _ => fa,
+    };
+    u64::from(r.to_bits())
+}
+
+/// Scalar f64 binop: `op` 0=add 1=sub 2=mul 3=div.
+pub(super) extern "C" fn wie_f64_binop(op: u64, a: u64, b: u64) -> u64 {
+    let fa = f64::from_bits(a);
+    let fb = f64::from_bits(b);
+    let r = match op {
+        0 => fa + fb,
+        1 => fa - fb,
+        2 => fa * fb,
+        3 => fa / fb,
+        _ => fa,
+    };
+    r.to_bits()
+}
+
 pub(super) fn compile_block(
     eng: &mut JitEngine,
     start_rip: u64,
     insns: &[DecodedInsn],
     end_rip: u64,
     term: Option<BlockTerm>,
+    call_fast: Option<FastApiKind>,
+    chain: &HashMap<u64, FuncId>,
 ) -> Result<CompiledBlock, String> {
-    let _ = start_rip;
     let live = analyze_live_gprs(insns);
+    let live_xmm = analyze_live_xmm(insns);
     let needs_flags = block_needs_flags(insns, term);
+    let has_fast_call = call_fast.is_some();
     let has_mem = block_has_mem(insns)
-        || matches!(term, Some(BlockTerm::Call { .. } | BlockTerm::Ret));
+        || matches!(term, Some(BlockTerm::Call { .. } | BlockTerm::Ret))
+        || has_fast_call;
+    let has_sse = live_xmm.iter().any(|&x| x);
+    let has_string = block_has_string(insns);
+    let has_fp = block_has_fp(insns);
+
+    // Self-loop if jcc/jmp targets this block's entry (stay in native code).
+    let self_loop = match term {
+        Some(BlockTerm::Jmp { target }) if target == start_rip => true,
+        Some(BlockTerm::Jcc {
+            taken, not_taken, ..
+        }) if taken == start_rip || not_taken == start_rip => true,
+        _ => false,
+    };
 
     let body: &[DecodedInsn];
     let term_insn: Option<&DecodedInsn>;
@@ -228,33 +447,102 @@ pub(super) fn compile_block(
         let entry = bcx.create_block();
         bcx.append_block_params_for_function_params(entry);
         bcx.switch_to_block(entry);
-        bcx.seal_block(entry);
+        // Leave entry unsealed when self-looping so we can jump back after writeback.
+        if !self_loop {
+            bcx.seal_block(entry);
+        }
 
         let ctx_ptr = bcx.block_params(entry)[0];
         let flags = MemFlagsData::trusted();
 
         // Exit: gpr[16] + rflags as block params → store and return.
+        // XMM is write-through to JitCtx (correct on mid-block mem faults).
         let exit = bcx.create_block();
         for _ in 0..16 {
             bcx.append_block_param(exit, types::I64);
         }
         bcx.append_block_param(exit, types::I64);
 
-        let load_ref = if has_mem {
+        // Host ABI signature for `call_indirect` late-bound chaining.
+        let block_sig_ref: SigRef = bcx.import_signature(eng.block_sig.clone());
+
+        let load_ref = if has_mem || has_sse {
             Some(eng.module.declare_func_in_func(eng.load_id, bcx.func))
         } else {
             None
         };
-        let store_ref = if has_mem {
+        let store_ref = if has_mem || has_sse {
             Some(eng.module.declare_func_in_func(eng.store_id, bcx.func))
         } else {
             None
         };
+        let string_ref = if has_string {
+            Some(eng.module.declare_func_in_func(eng.string_id, bcx.func))
+        } else {
+            None
+        };
+        let f32_ref = if has_fp {
+            Some(eng.module.declare_func_in_func(eng.f32_id, bcx.func))
+        } else {
+            None
+        };
+        let f64_ref = if has_fp {
+            Some(eng.module.declare_func_in_func(eng.f64_id, bcx.func))
+        } else {
+            None
+        };
+        // Dynamic chain lookup (late-bound successors + ret targets).
+        let lookup_ref = eng.module.declare_func_in_func(eng.lookup_id, bcx.func);
+
+        // Declare UCRT imports used by this block.
+        let mut ucrt_refs: [Option<FuncRef>; 7] = [None; 7];
+        if let Some(kind) = call_fast {
+            let id = eng.ucrt.for_kind(kind);
+            ucrt_refs[kind as usize] = Some(eng.module.declare_func_in_func(id, bcx.func));
+        }
+        // Chain successors (already compiled blocks) — direct call when known.
+        let mut chain_refs: HashMap<u64, FuncRef> = HashMap::new();
+        if let Some(t) = term {
+            for va in term_chain_targets(t) {
+                if va == start_rip {
+                    continue; // self-loop uses IR jump
+                }
+                if let Some(&fid) = chain.get(&va) {
+                    chain_refs.insert(va, eng.module.declare_func_in_func(fid, bcx.func));
+                }
+            }
+            // Also pre-declare return_ip for Call (common after callee returns).
+            if let BlockTerm::Call { return_ip, .. } = t
+                && return_ip != start_rip
+                && let Some(&fid) = chain.get(&return_ip)
+            {
+                chain_refs.insert(return_ip, eng.module.declare_func_in_func(fid, bcx.func));
+            }
+        }
+        // Fallthrough chain.
+        if term.is_none()
+            && let Some(&fid) = chain.get(&end_rip)
+        {
+            chain_refs.insert(end_rip, eng.module.declare_func_in_func(fid, bcx.func));
+        }
 
         let mut gpr_vals = [bcx.ins().iconst(types::I64, 0); 16];
         let mut gpr_loaded = [false; 16];
+        // For self-loops and fast calls, ensure Win64 arg/result regs are available.
+        let mut live_eff = live;
+        if has_fast_call {
+            live_eff[0] = true; // RAX result
+            live_eff[1] = true; // RCX
+            live_eff[2] = true; // RDX
+            live_eff[8] = true; // R8
+            live_eff[9] = true; // R9
+        }
+        if self_loop {
+            // Reload a broad set on re-entry (safe for loops).
+            live_eff.fill(true);
+        }
         for i in 0..16 {
-            if live[i] {
+            if live_eff[i] {
                 let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
                 let p = bcx.ins().iadd_imm(ctx_ptr, off);
                 gpr_vals[i] = bcx.ins().load(types::I64, flags, p, 0);
@@ -262,8 +550,17 @@ pub(super) fn compile_block(
             }
         }
 
+        // XMM SSA: [lo0, hi0, lo1, hi1, …]; write-through on stores.
+        let mut xmm_vals = [bcx.ins().iconst(types::I64, 0); 32];
+        let mut xmm_loaded = [false; 16];
+        for (i, &is_live) in live_xmm.iter().enumerate() {
+            if is_live {
+                load_xmm_pair(&mut bcx, ctx_ptr, flags, i, &mut xmm_vals, &mut xmm_loaded);
+            }
+        }
+
         let rflags_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RFLAGS));
-        let mut rflags_val = if needs_flags {
+        let mut rflags_val = if needs_flags || self_loop {
             bcx.ins().load(types::I64, flags, rflags_ptr, 0)
         } else {
             bcx.ins().iconst(types::I64, 0)
@@ -273,12 +570,19 @@ pub(super) fn compile_block(
             ctx_ptr,
             load_ref,
             store_ref,
+            string_ref,
+            f32_ref,
+            f64_ref,
             flags,
             exit,
+            ucrt_refs,
         };
 
         // Lazy flags: last ALU result deferred until a flag-reader (jcc/cmov/adc/…).
         let mut pending = PendingFlags::None;
+
+        // Dynamic exit RIP when the block ends with a string op (REP stay).
+        let mut string_exit_rip: Option<Value> = None;
 
         for d in body {
             ensure_gprs_loaded(
@@ -289,14 +593,35 @@ pub(super) fn compile_block(
                 &d.instr,
                 flags,
             );
-            lower_insn(
+            ensure_xmm_loaded(
                 &mut bcx,
+                ctx_ptr,
+                flags,
                 &d.instr,
-                &mut gpr_vals,
-                &mut rflags_val,
-                &mut pending,
-                &mut mem_env,
-            )?;
+                &mut xmm_vals,
+                &mut xmm_loaded,
+            );
+            if is_string_op(&d.instr) {
+                flush_pending(&mut bcx, &mut rflags_val, &mut pending);
+                string_exit_rip = Some(lower_string(
+                    &mut bcx,
+                    &d.instr,
+                    &mut gpr_vals,
+                    &mut rflags_val,
+                    &mut gpr_loaded,
+                    &mut mem_env,
+                )?);
+            } else {
+                lower_insn(
+                    &mut bcx,
+                    &d.instr,
+                    &mut gpr_vals,
+                    &mut rflags_val,
+                    &mut pending,
+                    &mut mem_env,
+                    &mut xmm_vals,
+                )?;
+            }
         }
 
         // Materialize flags before terminator that reads them, or before writeback.
@@ -304,7 +629,10 @@ pub(super) fn compile_block(
             flush_pending(&mut bcx, &mut rflags_val, &mut pending);
         }
 
-        let exit_rip = if let Some(t) = term {
+        // --- Terminator / exit ---
+        // Chain paths call the next compiled block (same host ABI), then return
+        // to the dispatcher. Self-loops use IR jump (no host stack growth).
+        if let Some(t) = term {
             if let Some(ti) = term_insn {
                 ensure_gprs_loaded(
                     &mut bcx,
@@ -315,32 +643,189 @@ pub(super) fn compile_block(
                     flags,
                 );
             }
-            // Call/ret always touch RSP.
-            if matches!(t, BlockTerm::Call { .. } | BlockTerm::Ret) && !gpr_loaded[4] {
+            // Call/ret always touch RSP (normal call path; fast call does not push).
+            if matches!(t, BlockTerm::Call { .. } | BlockTerm::Ret)
+                && call_fast.is_none()
+                && !gpr_loaded[4]
+            {
                 let p = bcx.ins().iadd_imm(ctx_ptr, 4 * 8);
                 gpr_vals[4] = bcx.ins().load(types::I64, flags, p, 0);
                 gpr_loaded[4] = true;
             }
             let term_ip = term_insn.map_or(0, |ti| ti.instr.ip());
-            lower_term(
-                &mut bcx,
-                t,
-                &mut gpr_vals,
-                rflags_val,
-                &mut mem_env,
-                term_ip,
-            )?
-        } else {
-            iconst_u64(&mut bcx, end_rip)
-        };
 
-        let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
-        bcx.ins().store(flags, exit_rip, rip_ptr, 0);
-        jump_exit(&mut bcx, exit, &gpr_vals, rflags_val);
+            // Fast UCRT: call host import, continue at return_ip (no host-stop).
+            if let (Some(kind), BlockTerm::Call { return_ip, .. }) = (call_fast, t) {
+                for idx in [1_usize, 2, 8, 9] {
+                    if !gpr_loaded[idx] {
+                        let p = bcx
+                            .ins()
+                            .iadd_imm(ctx_ptr, i64::try_from(idx * 8).unwrap_or(0));
+                        gpr_vals[idx] = bcx.ins().load(types::I64, flags, p, 0);
+                        gpr_loaded[idx] = true;
+                    }
+                }
+                if !gpr_loaded[0] {
+                    let p = bcx.ins().iadd_imm(ctx_ptr, 0);
+                    gpr_vals[0] = bcx.ins().load(types::I64, flags, p, 0);
+                    gpr_loaded[0] = true;
+                }
+                lower_fast_ucrt(&mut bcx, kind, &mut gpr_vals, rflags_val, &mut mem_env)?;
+                let exit_rip = iconst_u64(&mut bcx, return_ip);
+                emit_chain_or_exit(
+                    &mut bcx,
+                    ctx_ptr,
+                    flags,
+                    &gpr_vals,
+                    &gpr_loaded,
+                    rflags_val,
+                    rflags_ptr,
+                    true,
+                    exit,
+                    exit_rip,
+                    chain_refs.get(&return_ip).copied(),
+                    lookup_ref,
+                    block_sig_ref,
+                );
+            } else if self_loop {
+                let _ = lower_self_loop_term(
+                    &mut bcx,
+                    t,
+                    start_rip,
+                    entry,
+                    ctx_ptr,
+                    flags,
+                    &mut gpr_vals,
+                    &gpr_loaded,
+                    rflags_val,
+                    rflags_ptr,
+                    needs_flags,
+                    exit,
+                    &chain_refs,
+                    lookup_ref,
+                    block_sig_ref,
+                )?;
+            } else {
+                // Near call: push guest return + shadow stack for ret prediction.
+                if let BlockTerm::Call { return_ip, .. } = t {
+                    shadow_push(&mut bcx, ctx_ptr, flags, return_ip);
+                }
+                let exit_rip = lower_term(
+                    &mut bcx,
+                    t,
+                    &mut gpr_vals,
+                    rflags_val,
+                    &mut mem_env,
+                    term_ip,
+                )?;
+                // Near ret: validate shadow prediction (mismatch → clear stack).
+                let exit_rip = if matches!(t, BlockTerm::Ret) {
+                    shadow_pop_check(&mut bcx, ctx_ptr, flags, exit_rip)
+                } else {
+                    exit_rip
+                };
+                match t {
+                    BlockTerm::Jcc {
+                        mnemonic,
+                        taken,
+                        not_taken,
+                    } => {
+                        let t_ref = chain_refs.get(&taken).copied();
+                        let n_ref = chain_refs.get(&not_taken).copied();
+                        let _ = lower_jcc_chain(
+                            &mut bcx,
+                            mnemonic,
+                            taken,
+                            not_taken,
+                            t_ref,
+                            n_ref,
+                            ctx_ptr,
+                            flags,
+                            &gpr_vals,
+                            &gpr_loaded,
+                            rflags_val,
+                            rflags_ptr,
+                            needs_flags,
+                            exit,
+                            lookup_ref,
+                            block_sig_ref,
+                        )?;
+                    }
+                    BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
+                        emit_chain_or_exit(
+                            &mut bcx,
+                            ctx_ptr,
+                            flags,
+                            &gpr_vals,
+                            &gpr_loaded,
+                            rflags_val,
+                            rflags_ptr,
+                            needs_flags,
+                            exit,
+                            exit_rip,
+                            chain_refs.get(&target).copied(),
+                            lookup_ref,
+                            block_sig_ref,
+                        );
+                    }
+                    BlockTerm::Ret => {
+                        // Dynamic target: always late-bound lookup (shadow aids prediction only).
+                        emit_chain_or_exit(
+                            &mut bcx,
+                            ctx_ptr,
+                            flags,
+                            &gpr_vals,
+                            &gpr_loaded,
+                            rflags_val,
+                            rflags_ptr,
+                            needs_flags,
+                            exit,
+                            exit_rip,
+                            None,
+                            lookup_ref,
+                            block_sig_ref,
+                        );
+                    }
+                }
+            }
+        } else if let Some(sr) = string_exit_rip {
+            // REP stay/exit RIP is dynamic — try late-bound chain.
+            emit_chain_or_exit(
+                &mut bcx,
+                ctx_ptr,
+                flags,
+                &gpr_vals,
+                &gpr_loaded,
+                rflags_val,
+                rflags_ptr,
+                needs_flags,
+                exit,
+                sr,
+                None,
+                lookup_ref,
+                block_sig_ref,
+            );
+        } else {
+            let exit_rip = iconst_u64(&mut bcx, end_rip);
+            emit_chain_or_exit(
+                &mut bcx,
+                ctx_ptr,
+                flags,
+                &gpr_vals,
+                &gpr_loaded,
+                rflags_val,
+                rflags_ptr,
+                needs_flags,
+                exit,
+                exit_rip,
+                chain_refs.get(&end_rip).copied(),
+                lookup_ref,
+                block_sig_ref,
+            );
+        }
 
         bcx.switch_to_block(exit);
         bcx.seal_block(exit);
-        // Copy block params out so we can mutably use `bcx` while storing.
         let (exit_gpr, exit_rflags) = {
             let exit_params = bcx.block_params(exit);
             let mut g = [exit_params[0]; 16];
@@ -354,10 +839,13 @@ pub(super) fn compile_block(
                 bcx.ins().store(flags, exit_gpr[i], p, 0);
             }
         }
-        if needs_flags {
+        if needs_flags || self_loop {
             bcx.ins().store(flags, exit_rflags, rflags_ptr, 0);
         }
         bcx.ins().return_(&[]);
+        if self_loop {
+            bcx.seal_block(entry);
+        }
         bcx.seal_all_blocks();
         bcx.finalize();
     }
@@ -375,16 +863,410 @@ pub(super) fn compile_block(
 
     Ok(CompiledBlock {
         func,
+        func_id,
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
     })
+}
+
+fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
+    match t {
+        BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => vec![target],
+        BlockTerm::Jcc {
+            taken, not_taken, ..
+        } => vec![taken, not_taken],
+        BlockTerm::Ret => vec![],
+    }
+}
+
+fn writeback_gprs(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    gpr: &[Value; 16],
+    gpr_loaded: &[bool; 16],
+    rflags: Value,
+    rflags_ptr: Value,
+    store_flags: bool,
+) {
+    for i in 0..16 {
+        if gpr_loaded[i] {
+            let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+            let p = bcx.ins().iadd_imm(ctx_ptr, off);
+            bcx.ins().store(flags, gpr[i], p, 0);
+        }
+    }
+    if store_flags {
+        bcx.ins().store(flags, rflags, rflags_ptr, 0);
+    }
+}
+
+/// Push guest `return_ip` onto the software shadow return stack.
+fn shadow_push(bcx: &mut FunctionBuilder<'_>, ctx_ptr: Value, flags: MemFlagsData, return_ip: u64) {
+    let sp_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_SP));
+    let sp = bcx.ins().load(types::I64, flags, sp_ptr, 0);
+    let mask = iconst_u64(bcx, (SHADOW_DEPTH as u64) - 1);
+    let idx = bcx.ins().band(sp, mask);
+    let base = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_RET));
+    let three = iconst_u64(bcx, 3);
+    let off = bcx.ins().ishl(idx, three); // * sizeof(u64)
+    let slot = bcx.ins().iadd(base, off);
+    let retv = iconst_u64(bcx, return_ip);
+    bcx.ins().store(flags, retv, slot, 0);
+    let sp1 = bcx.ins().iadd_imm(sp, 1);
+    bcx.ins().store(flags, sp1, sp_ptr, 0);
+}
+
+/// On `ret`: if shadow top matches `ret_va`, pop; else clear shadow (mispredict / longjmp).
+/// Returns `ret_va` unchanged (prediction only affects chaining likelihood via continuity).
+fn shadow_pop_check(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    ret_va: Value,
+) -> Value {
+    let sp_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_SP));
+    let sp = bcx.ins().load(types::I64, flags, sp_ptr, 0);
+    let zero = iconst_u64(bcx, 0);
+    let has = bcx.ins().icmp(IntCC::NotEqual, sp, zero);
+    let do_blk = bcx.create_block();
+    let cont = bcx.create_block();
+    bcx.append_block_param(cont, types::I64); // ret_va passthrough
+    // Always continue with ret_va; side-effect is shadow maintenance.
+    bcx.ins()
+        .brif(has, do_blk, &[], cont, &[BlockArg::Value(ret_va)]);
+
+    bcx.switch_to_block(do_blk);
+    bcx.seal_block(do_blk);
+    let sp1 = bcx.ins().iadd_imm(sp, -1);
+    let mask = iconst_u64(bcx, (SHADOW_DEPTH as u64) - 1);
+    let idx = bcx.ins().band(sp1, mask);
+    let base = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_RET));
+    let three = iconst_u64(bcx, 3);
+    let off = bcx.ins().ishl(idx, three);
+    let slot = bcx.ins().iadd(base, off);
+    let predicted = bcx.ins().load(types::I64, flags, slot, 0);
+    let ok = bcx.ins().icmp(IntCC::Equal, predicted, ret_va);
+    // Match → commit pop; mismatch → clear entire shadow.
+    let new_sp = bcx.ins().select(ok, sp1, zero);
+    bcx.ins().store(flags, new_sp, sp_ptr, 0);
+    bcx.ins().jump(cont, &[BlockArg::Value(ret_va)]);
+
+    bcx.switch_to_block(cont);
+    bcx.seal_block(cont);
+    bcx.block_params(cont)[0]
+}
+
+/// Writeback + set RIP + call successor (direct or late-bound), then return.
+///
+/// Uses host C ABI `call`/`call_indirect` (not Tail/`return_call`) so blocks stay
+/// callable from Rust as `extern "C"`.
+fn emit_chain_or_exit(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    gpr: &[Value; 16],
+    gpr_loaded: &[bool; 16],
+    rflags: Value,
+    rflags_ptr: Value,
+    store_flags: bool,
+    exit: Block,
+    exit_rip: Value,
+    href: Option<FuncRef>,
+    lookup_ref: FuncRef,
+    block_sig_ref: SigRef,
+) {
+    let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
+    bcx.ins().store(flags, exit_rip, rip_ptr, 0);
+    writeback_gprs(
+        bcx,
+        ctx_ptr,
+        flags,
+        gpr,
+        gpr_loaded,
+        rflags,
+        rflags_ptr,
+        store_flags,
+    );
+    if let Some(f) = href {
+        bcx.ins().call(f, &[ctx_ptr]);
+        bcx.ins().return_(&[]);
+        return;
+    }
+    // Late-bound: open-addressing chain table (successors compiled after us).
+    let call = bcx.ins().call(lookup_ref, &[ctx_ptr, exit_rip]);
+    let fn_ptr = bcx.inst_results(call)[0];
+    let hit = bcx.ins().icmp_imm(IntCC::NotEqual, fn_ptr, 0);
+    let hit_blk = bcx.create_block();
+    let miss_blk = bcx.create_block();
+    bcx.ins().brif(hit, hit_blk, &[], miss_blk, &[]);
+    bcx.switch_to_block(hit_blk);
+    bcx.seal_block(hit_blk);
+    bcx.ins().call_indirect(block_sig_ref, fn_ptr, &[ctx_ptr]);
+    bcx.ins().return_(&[]);
+    bcx.switch_to_block(miss_blk);
+    bcx.seal_block(miss_blk);
+    jump_exit(bcx, exit, gpr, rflags);
+}
+
+/// Self-loop terminator: writeback + jump to entry (or chain non-loop edge).
+fn lower_self_loop_term(
+    bcx: &mut FunctionBuilder<'_>,
+    term: BlockTerm,
+    start_rip: u64,
+    entry: Block,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    gpr: &mut [Value; 16],
+    gpr_loaded: &[bool; 16],
+    rflags: Value,
+    rflags_ptr: Value,
+    _needs_flags: bool,
+    exit: Block,
+    chain_refs: &HashMap<u64, FuncRef>,
+    lookup_ref: FuncRef,
+    block_sig_ref: SigRef,
+) -> Result<bool, String> {
+    match term {
+        BlockTerm::Jmp { target } if target == start_rip => {
+            writeback_gprs(
+                bcx, ctx_ptr, flags, gpr, gpr_loaded, rflags, rflags_ptr, true,
+            );
+            // Re-enter: entry block param is ctx_ptr.
+            bcx.ins().jump(entry, &[BlockArg::Value(ctx_ptr)]);
+            Ok(true)
+        }
+        BlockTerm::Jcc {
+            mnemonic,
+            taken,
+            not_taken,
+        } => {
+            let cond = flag_cond(bcx, rflags, mnemonic)?;
+            let taken_blk = bcx.create_block();
+            let not_blk = bcx.create_block();
+            bcx.ins().brif(cond, taken_blk, &[], not_blk, &[]);
+
+            for (blk, va) in [(taken_blk, taken), (not_blk, not_taken)] {
+                bcx.switch_to_block(blk);
+                bcx.seal_block(blk);
+                if va == start_rip {
+                    writeback_gprs(
+                        bcx, ctx_ptr, flags, gpr, gpr_loaded, rflags, rflags_ptr, true,
+                    );
+                    bcx.ins().jump(entry, &[BlockArg::Value(ctx_ptr)]);
+                } else {
+                    let rv = iconst_u64(bcx, va);
+                    emit_chain_or_exit(
+                        bcx,
+                        ctx_ptr,
+                        flags,
+                        gpr,
+                        gpr_loaded,
+                        rflags,
+                        rflags_ptr,
+                        true,
+                        exit,
+                        rv,
+                        chain_refs.get(&va).copied(),
+                        lookup_ref,
+                        block_sig_ref,
+                    );
+                }
+            }
+            Ok(true)
+        }
+        _ => Err("self_loop term not jcc/jmp".into()),
+    }
+}
+
+fn lower_jcc_chain(
+    bcx: &mut FunctionBuilder<'_>,
+    mnemonic: Mnemonic,
+    taken: u64,
+    not_taken: u64,
+    t_ref: Option<FuncRef>,
+    n_ref: Option<FuncRef>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    gpr: &[Value; 16],
+    gpr_loaded: &[bool; 16],
+    rflags: Value,
+    rflags_ptr: Value,
+    needs_flags: bool,
+    exit: Block,
+    lookup_ref: FuncRef,
+    block_sig_ref: SigRef,
+) -> Result<bool, String> {
+    let cond = flag_cond(bcx, rflags, mnemonic)?;
+    let taken_blk = bcx.create_block();
+    let not_blk = bcx.create_block();
+    bcx.ins().brif(cond, taken_blk, &[], not_blk, &[]);
+    for (blk, va, href) in [(taken_blk, taken, t_ref), (not_blk, not_taken, n_ref)] {
+        bcx.switch_to_block(blk);
+        bcx.seal_block(blk);
+        let rv = iconst_u64(bcx, va);
+        emit_chain_or_exit(
+            bcx,
+            ctx_ptr,
+            flags,
+            gpr,
+            gpr_loaded,
+            rflags,
+            rflags_ptr,
+            needs_flags,
+            exit,
+            rv,
+            href,
+            lookup_ref,
+            block_sig_ref,
+        );
+    }
+    Ok(true)
+}
+
+/// Emit direct host call for a fast UCRT import (P1 + P3 inlines).
+fn lower_fast_ucrt(
+    bcx: &mut FunctionBuilder<'_>,
+    kind: FastApiKind,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let rcx = gpr[1];
+    let rdx = gpr[2];
+    let r8 = gpr[8];
+    let r9 = gpr[9];
+    match kind {
+        // P3: inline `__acrt_iob_func` (ix → FILE* cookie) without a host call.
+        FastApiKind::AcrtIobFunc => {
+            let zero = iconst_u64(bcx, 0);
+            let one = iconst_u64(bcx, 1);
+            let two = iconst_u64(bcx, 2);
+            let mask = iconst_u64(bcx, 0xffff_ffff);
+            let ix = bcx.ins().band(rcx, mask);
+            let is0 = bcx.ins().icmp(IntCC::Equal, ix, zero);
+            let is1 = bcx.ins().icmp(IntCC::Equal, ix, one);
+            let is2 = bcx.ins().icmp(IntCC::Equal, ix, two);
+            let f0 = iconst_u64(bcx, fast_api::file_cookie(0));
+            let f1 = iconst_u64(bcx, fast_api::file_cookie(1));
+            let f2 = iconst_u64(bcx, fast_api::file_cookie(2));
+            // is0→f0, else is1→f1, else is2→f2, else 0
+            let step2 = bcx.ins().select(is2, f2, zero);
+            let step1 = bcx.ins().select(is1, f1, step2);
+            gpr[0] = bcx.ins().select(is0, f0, step1);
+            Ok(())
+        }
+        // P3: inline `strlen` as a byte-scan loop in IR.
+        FastApiKind::Strlen => lower_inline_strlen(bcx, gpr, rflags, mem),
+        FastApiKind::Malloc => {
+            let fref = mem.ucrt_refs[kind as usize].ok_or("malloc import")?;
+            let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx]);
+            gpr[0] = bcx.inst_results(call)[0];
+            check_fault_after_ucrt(bcx, mem, gpr, rflags);
+            Ok(())
+        }
+        FastApiKind::Free => {
+            let fref = mem.ucrt_refs[kind as usize].ok_or("free import")?;
+            bcx.ins().call(fref, &[mem.ctx_ptr, rcx]);
+            gpr[0] = iconst_u64(bcx, 0);
+            check_fault_after_ucrt(bcx, mem, gpr, rflags);
+            Ok(())
+        }
+        FastApiKind::Memcpy => {
+            let fref = mem.ucrt_refs[kind as usize].ok_or("memcpy import")?;
+            let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx, rdx, r8]);
+            gpr[0] = bcx.inst_results(call)[0];
+            check_fault_after_ucrt(bcx, mem, gpr, rflags);
+            Ok(())
+        }
+        FastApiKind::Fwrite => {
+            let fref = mem.ucrt_refs[kind as usize].ok_or("fwrite import")?;
+            let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx, rdx, r8, r9]);
+            gpr[0] = bcx.inst_results(call)[0];
+            check_fault_after_ucrt(bcx, mem, gpr, rflags);
+            Ok(())
+        }
+        FastApiKind::Fflush => {
+            let fref = mem.ucrt_refs[kind as usize].ok_or("fflush import")?;
+            let call = bcx.ins().call(fref, &[rcx]);
+            gpr[0] = bcx.inst_results(call)[0];
+            Ok(())
+        }
+    }
+}
+
+/// Inline `strlen`: byte loop with load helper until NUL.
+fn lower_inline_strlen(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let s = gpr[1];
+    let zero = iconst_u64(bcx, 0);
+    // s == 0 → 0
+    let is_null = bcx.ins().icmp(IntCC::Equal, s, zero);
+    let cont = bcx.create_block();
+    let done = bcx.create_block();
+    bcx.append_block_param(done, types::I64);
+    let null_args = [BlockArg::Value(zero)];
+    bcx.ins().brif(is_null, done, &null_args, cont, &[]);
+
+    bcx.switch_to_block(cont);
+    bcx.seal_block(cont);
+    let header = bcx.create_block();
+    bcx.append_block_param(header, types::I64); // ptr
+    bcx.append_block_param(header, types::I64); // len
+    let s_arg = [BlockArg::Value(s), BlockArg::Value(zero)];
+    bcx.ins().jump(header, &s_arg);
+
+    bcx.switch_to_block(header);
+    let ptr = bcx.block_params(header)[0];
+    let len = bcx.block_params(header)[1];
+    let byte = call_load(bcx, mem, gpr, rflags, ptr, 1, 0)?;
+    let is_nul = bcx.ins().icmp(IntCC::Equal, byte, zero);
+    let next_ptr = bcx.ins().iadd_imm(ptr, 1);
+    let next_len = bcx.ins().iadd_imm(len, 1);
+    let body = bcx.create_block();
+    let done_args = [BlockArg::Value(len)];
+    bcx.ins().brif(is_nul, done, &done_args, body, &[]);
+    bcx.switch_to_block(body);
+    bcx.seal_block(body);
+    let back = [BlockArg::Value(next_ptr), BlockArg::Value(next_len)];
+    bcx.ins().jump(header, &back);
+    bcx.seal_block(header);
+
+    bcx.switch_to_block(done);
+    bcx.seal_block(done);
+    gpr[0] = bcx.block_params(done)[0];
+    Ok(())
+}
+
+fn check_fault_after_ucrt(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+) {
+    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
+    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
+    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
+    let cont = bcx.create_block();
+    let args = exit_args(gpr, rflags);
+    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
+    bcx.switch_to_block(cont);
+    bcx.seal_block(cont);
 }
 
 struct MemEnv {
     ctx_ptr: Value,
     load_ref: Option<cranelift::codegen::ir::FuncRef>,
     store_ref: Option<cranelift::codegen::ir::FuncRef>,
+    string_ref: Option<cranelift::codegen::ir::FuncRef>,
+    f32_ref: Option<cranelift::codegen::ir::FuncRef>,
+    f64_ref: Option<cranelift::codegen::ir::FuncRef>,
     flags: MemFlagsData,
     exit: Block,
+    ucrt_refs: [Option<FuncRef>; 7],
 }
 
 fn jump_exit(bcx: &mut FunctionBuilder<'_>, exit: Block, gpr: &[Value; 16], rflags: Value) {
@@ -409,11 +1291,439 @@ fn analyze_live_gprs(insns: &[DecodedInsn]) -> [bool; 16] {
     live
 }
 
+fn analyze_live_xmm(insns: &[DecodedInsn]) -> [bool; 16] {
+    let mut live = [false; 16];
+    for d in insns {
+        mark_insn_xmm(&d.instr, &mut live);
+    }
+    live
+}
+
+fn mark_insn_xmm(instr: &Instruction, live: &mut [bool; 16]) {
+    for i in 0..instr.op_count() {
+        if instr.op_kind(i) == OpKind::Register {
+            let r = instr.op_register(i);
+            if r.is_xmm() {
+                let n = r.number();
+                if n < 16 {
+                    live[n] = true;
+                }
+            }
+        }
+    }
+}
+
+fn load_xmm_pair(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    idx: usize,
+    xmm: &mut [Value; 32],
+    loaded: &mut [bool; 16],
+) {
+    if loaded[idx] {
+        return;
+    }
+    let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
+    let plo = bcx.ins().iadd_imm(ctx_ptr, base);
+    let phi = bcx.ins().iadd_imm(ctx_ptr, base + 8);
+    xmm[idx * 2] = bcx.ins().load(types::I64, flags, plo, 0);
+    xmm[idx * 2 + 1] = bcx.ins().load(types::I64, flags, phi, 0);
+    loaded[idx] = true;
+}
+
+fn ensure_xmm_loaded(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    instr: &Instruction,
+    xmm: &mut [Value; 32],
+    loaded: &mut [bool; 16],
+) {
+    let mut need = [false; 16];
+    mark_insn_xmm(instr, &mut need);
+    for i in 0..16 {
+        if need[i] && !loaded[i] {
+            load_xmm_pair(bcx, ctx_ptr, flags, i, xmm, loaded);
+        }
+    }
+}
+
+/// Write XMM lo/hi SSA and immediately store into JitCtx (fault-safe write-through).
+fn store_xmm_pair(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    xmm: &mut [Value; 32],
+    idx: usize,
+    lo: Value,
+    hi: Value,
+) {
+    xmm[idx * 2] = lo;
+    xmm[idx * 2 + 1] = hi;
+    let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
+    let plo = bcx.ins().iadd_imm(mem.ctx_ptr, base);
+    let phi = bcx.ins().iadd_imm(mem.ctx_ptr, base + 8);
+    bcx.ins().store(mem.flags, lo, plo, 0);
+    bcx.ins().store(mem.flags, hi, phi, 0);
+}
+
+fn xmm_index(reg: Register) -> Result<usize, String> {
+    if !reg.is_xmm() {
+        return Err(format!("not xmm {reg:?}"));
+    }
+    let n = reg.number();
+    if n < 16 {
+        Ok(n)
+    } else {
+        Err(format!("xmm OOB {n}"))
+    }
+}
+
+fn read_xmm_pair(xmm: &[Value; 32], reg: Register) -> Result<(Value, Value), String> {
+    let i = xmm_index(reg)?;
+    Ok((xmm[i * 2], xmm[i * 2 + 1]))
+}
+
+/// Load 4/8/16 bytes from guest mem into (lo, hi) u64 pair (hi=0 for <16).
+fn load_sse_mem(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+    addr: Value,
+    nbytes: u32,
+    insn_ip: u64,
+) -> Result<(Value, Value), String> {
+    match nbytes {
+        4 | 8 => {
+            let lo = call_load(bcx, mem, gpr, rflags, addr, nbytes, insn_ip)?;
+            let hi = iconst_u64(bcx, 0);
+            Ok((lo, hi))
+        }
+        16 => {
+            let lo = call_load(bcx, mem, gpr, rflags, addr, 8, insn_ip)?;
+            let addr_hi = bcx.ins().iadd_imm(addr, 8);
+            let hi = call_load(bcx, mem, gpr, rflags, addr_hi, 8, insn_ip)?;
+            Ok((lo, hi))
+        }
+        _ => Err(format!("sse load width {nbytes}")),
+    }
+}
+
+fn store_sse_mem(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+    addr: Value,
+    lo: Value,
+    hi: Value,
+    nbytes: u32,
+    insn_ip: u64,
+) -> Result<(), String> {
+    match nbytes {
+        4 | 8 => call_store(bcx, mem, gpr, rflags, addr, nbytes, lo, insn_ip),
+        16 => {
+            call_store(bcx, mem, gpr, rflags, addr, 8, lo, insn_ip)?;
+            let addr_hi = bcx.ins().iadd_imm(addr, 8);
+            call_store(bcx, mem, gpr, rflags, addr_hi, 8, hi, insn_ip)
+        }
+        _ => Err(format!("sse store width {nbytes}")),
+    }
+}
+
+/// movaps/movups/movdqa/movdqu/movss/movsd.
+fn lower_sse_mov(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    nbytes: u32,
+    scalar_merge: bool,
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let (src_lo, src_hi) = match instr.op1_kind() {
+        OpKind::Register if instr.op_register(1).is_xmm() => {
+            read_xmm_pair(xmm, instr.op_register(1))?
+        }
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, ip)?
+        }
+        _ => return Err("sse mov src".into()),
+    };
+
+    match instr.op0_kind() {
+        OpKind::Register if instr.op_register(0).is_xmm() => {
+            let dst = instr.op_register(0);
+            let di = xmm_index(dst)?;
+            let (lo, hi) = if scalar_merge && nbytes < 16 {
+                let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
+                match nbytes {
+                    4 => {
+                        // Keep bits [63:32] of old_lo; replace low 32 from src.
+                        let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+                        let mask = iconst_u64(bcx, 0xffff_ffff);
+                        let cleared = bcx.ins().band(old_lo, hi32);
+                        let low = bcx.ins().band(src_lo, mask);
+                        (bcx.ins().bor(cleared, low), old_hi)
+                    }
+                    8 => (src_lo, old_hi),
+                    _ => (src_lo, src_hi),
+                }
+            } else if nbytes < 16 {
+                // Non-merge partial: zero-extend into xmm (movdqa-style partial not used).
+                (src_lo, iconst_u64(bcx, 0))
+            } else {
+                (src_lo, src_hi)
+            };
+            store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+            Ok(())
+        }
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            store_sse_mem(bcx, mem, gpr, rflags, addr, src_lo, src_hi, nbytes, ip)
+        }
+        _ => Err("sse mov dst".into()),
+    }
+}
+
+fn lower_sse_movq(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    // xmm, xmm/m64
+    if r0.is_xmm() {
+        let (lo, _) = match instr.op1_kind() {
+            OpKind::Register if r1.is_xmm() => read_xmm_pair(xmm, r1)?,
+            OpKind::Register => {
+                let v = read_gpr(gpr, r1)?;
+                (v, iconst_u64(bcx, 0))
+            }
+            OpKind::Memory => {
+                let addr = effective_addr(bcx, instr, gpr)?;
+                load_sse_mem(bcx, mem, gpr, rflags, addr, 8, ip)?
+            }
+            _ => return Err("movq src".into()),
+        };
+        // movq to xmm: merge low 64, keep high (SSE legacy) — iced path uses scalar_merge.
+        let (_, old_hi) = read_xmm_pair(xmm, r0)?;
+        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, old_hi);
+        return Ok(());
+    }
+    // r64, xmm / m64 from xmm
+    if instr.op1_kind() == OpKind::Register && r1.is_xmm() {
+        let (lo, _) = read_xmm_pair(xmm, r1)?;
+        if instr.op0_kind() == OpKind::Memory {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            return call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip);
+        }
+        return write_gpr(bcx, gpr, r0, lo);
+    }
+    // mem, xmm
+    if instr.op0_kind() == OpKind::Memory && r1.is_xmm() {
+        let (lo, _) = read_xmm_pair(xmm, r1)?;
+        let addr = effective_addr(bcx, instr, gpr)?;
+        return call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip);
+    }
+    Err("movq form".into())
+}
+
+fn lower_sse_movd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    if r0.is_xmm() {
+        let lo = match instr.op1_kind() {
+            OpKind::Register => {
+                let v = read_gpr(gpr, r1)?;
+                let m = iconst_u64(bcx, 0xffff_ffff);
+                bcx.ins().band(v, m)
+            }
+            OpKind::Memory => {
+                let addr = effective_addr(bcx, instr, gpr)?;
+                call_load(bcx, mem, gpr, rflags, addr, 4, ip)?
+            }
+            _ => return Err("movd src".into()),
+        };
+        // Zero-extend into XMM.
+        let zero = iconst_u64(bcx, 0);
+        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, zero);
+        return Ok(());
+    }
+    if r1.is_xmm() {
+        let (lo, _) = read_xmm_pair(xmm, r1)?;
+        let m = iconst_u64(bcx, 0xffff_ffff);
+        let v = bcx.ins().band(lo, m);
+        if instr.op0_kind() == OpKind::Memory {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            return call_store(bcx, mem, gpr, rflags, addr, 4, v, ip);
+        }
+        return write_gpr(bcx, gpr, r0, v);
+    }
+    Err("movd form".into())
+}
+
+fn lower_sse_bitwise(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: SseBit,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("sse bitwise src".into()),
+    };
+    let (lo, hi) = match op {
+        SseBit::Xor => (bcx.ins().bxor(a_lo, b_lo), bcx.ins().bxor(a_hi, b_hi)),
+        SseBit::And => (bcx.ins().band(a_lo, b_lo), bcx.ins().band(a_hi, b_hi)),
+        SseBit::Or => (bcx.ins().bor(a_lo, b_lo), bcx.ins().bor(a_hi, b_hi)),
+        // andn: ~a & b  (Intel: dest = NOT(dest) AND src)
+        SseBit::Andn => {
+            let na_lo = bcx.ins().bnot(a_lo);
+            let na_hi = bcx.ins().bnot(a_hi);
+            (bcx.ins().band(na_lo, b_lo), bcx.ins().band(na_hi, b_hi))
+        }
+    };
+    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    Ok(())
+}
+
+/// Scalar SSE FP: ss (f32 merge) or sd (f64 merge). `op`: 0=add 1=sub 2=mul 3=div.
+fn lower_sse_scalar_fp(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: u64,
+    is_f64: bool,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            let nbytes = if is_f64 { 8 } else { 4 };
+            load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())?
+        }
+        _ => return Err("sse scalar fp src".into()),
+    };
+    let _ = b_hi;
+    let op_v = iconst_u64(bcx, op);
+    let (new_lo, new_hi) = if is_f64 {
+        let fref = mem.f64_ref.ok_or("f64 helper missing")?;
+        let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
+        let r = bcx.inst_results(call)[0];
+        (r, a_hi) // sd merges low 64, keeps high
+    } else {
+        let fref = mem.f32_ref.ok_or("f32 helper missing")?;
+        let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
+        let r = bcx.inst_results(call)[0];
+        let mask = iconst_u64(bcx, 0xffff_ffff);
+        let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+        let cleared = bcx.ins().band(a_lo, hi32);
+        let low = bcx.ins().band(r, mask);
+        (bcx.ins().bor(cleared, low), a_hi)
+    };
+    store_xmm_pair(bcx, mem, xmm, di, new_lo, new_hi);
+    Ok(())
+}
+
+/// Packed SSE FP: ps (4×f32) or pd (2×f64).
+fn lower_sse_packed_fp(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    op: u64,
+    is_f64: bool,
+) -> Result<(), String> {
+    let dst = instr.op_register(0);
+    let di = xmm_index(dst)?;
+    let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
+    let (b_lo, b_hi) = match instr.op1_kind() {
+        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
+        }
+        _ => return Err("sse packed fp src".into()),
+    };
+    let op_v = iconst_u64(bcx, op);
+    if is_f64 {
+        let fref = mem.f64_ref.ok_or("f64 helper missing")?;
+        let call0 = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
+        let r0 = bcx.inst_results(call0)[0];
+        let call1 = bcx.ins().call(fref, &[op_v, a_hi, b_hi]);
+        let r1 = bcx.inst_results(call1)[0];
+        store_xmm_pair(bcx, mem, xmm, di, r0, r1);
+    } else {
+        let fref = mem.f32_ref.ok_or("f32 helper missing")?;
+        let mask = iconst_u64(bcx, 0xffff_ffff);
+        let sh = iconst_u64(bcx, 32);
+        // lanes 0,1 in lo; 2,3 in hi
+        let mut pack_pair = |half_a: Value, half_b: Value| -> Result<Value, String> {
+            let a0 = bcx.ins().band(half_a, mask);
+            let b0 = bcx.ins().band(half_b, mask);
+            let a1 = bcx.ins().ushr(half_a, sh);
+            let b1 = bcx.ins().ushr(half_b, sh);
+            let call0 = bcx.ins().call(fref, &[op_v, a0, b0]);
+            let r0_raw = bcx.inst_results(call0)[0];
+            let r0 = bcx.ins().band(r0_raw, mask);
+            let call1 = bcx.ins().call(fref, &[op_v, a1, b1]);
+            let r1_raw = bcx.inst_results(call1)[0];
+            let r1 = bcx.ins().band(r1_raw, mask);
+            let r1s = bcx.ins().ishl(r1, sh);
+            Ok(bcx.ins().bor(r0, r1s))
+        };
+        let lo = pack_pair(a_lo, b_lo)?;
+        let hi = pack_pair(a_hi, b_hi)?;
+        store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    }
+    Ok(())
+}
+
 fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) -> bool {
     if matches!(term, Some(BlockTerm::Jcc { .. })) {
         return true;
     }
     insns.iter().any(|d| {
+        if is_string_op(&d.instr) {
+            // SCAS/CMPS write flags; DF is read by all string ops.
+            return true;
+        }
         matches!(
             d.instr.mnemonic(),
             Mnemonic::Add
@@ -474,7 +1784,13 @@ fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) -> bool {
 fn block_has_mem(insns: &[DecodedInsn]) -> bool {
     insns.iter().any(|d| {
         let m = d.instr.mnemonic();
-        if matches!(m, Mnemonic::Push | Mnemonic::Pop | Mnemonic::Call | Mnemonic::Ret) {
+        if matches!(
+            m,
+            Mnemonic::Push | Mnemonic::Pop | Mnemonic::Call | Mnemonic::Ret
+        ) {
+            return true;
+        }
+        if is_string_op(&d.instr) {
             return true;
         }
         for i in 0..d.instr.op_count() {
@@ -483,6 +1799,34 @@ fn block_has_mem(insns: &[DecodedInsn]) -> bool {
             }
         }
         false
+    })
+}
+
+fn block_has_string(insns: &[DecodedInsn]) -> bool {
+    insns.iter().any(|d| is_string_op(&d.instr))
+}
+
+fn block_has_fp(insns: &[DecodedInsn]) -> bool {
+    insns.iter().any(|d| {
+        matches!(
+            d.instr.mnemonic(),
+            Mnemonic::Addss
+                | Mnemonic::Subss
+                | Mnemonic::Mulss
+                | Mnemonic::Divss
+                | Mnemonic::Addsd
+                | Mnemonic::Subsd
+                | Mnemonic::Mulsd
+                | Mnemonic::Divsd
+                | Mnemonic::Addps
+                | Mnemonic::Subps
+                | Mnemonic::Mulps
+                | Mnemonic::Divps
+                | Mnemonic::Addpd
+                | Mnemonic::Subpd
+                | Mnemonic::Mulpd
+                | Mnemonic::Divpd
+        )
     })
 }
 
@@ -500,6 +1844,13 @@ fn mark_insn_gprs(instr: &Instruction, live: &mut [bool; 16]) {
         Mnemonic::Push | Mnemonic::Pop | Mnemonic::Call | Mnemonic::Ret
     ) {
         live[4] = true; // RSP
+    }
+    // String ops touch RAX/RCX/RSI/RDI implicitly (not always in operands).
+    if is_string_op(instr) {
+        live[0] = true; // RAX
+        live[1] = true; // RCX
+        live[6] = true; // RSI
+        live[7] = true; // RDI
     }
     for i in 0..instr.op_count() {
         if instr.op_kind(i) == OpKind::Memory || instr.mnemonic() == Mnemonic::Lea {
@@ -598,11 +1949,7 @@ enum PendingFlags {
     },
 }
 
-fn flush_pending(
-    bcx: &mut FunctionBuilder<'_>,
-    rflags: &mut Value,
-    pending: &mut PendingFlags,
-) {
+fn flush_pending(bcx: &mut FunctionBuilder<'_>, rflags: &mut Value, pending: &mut PendingFlags) {
     match *pending {
         PendingFlags::None => {}
         PendingFlags::Add { a, b, res, bits } => {
@@ -730,6 +2077,7 @@ fn lower_insn(
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
 ) -> Result<(), String> {
     match instr.mnemonic() {
         Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => Ok(()),
@@ -823,8 +2171,130 @@ fn lower_insn(
             flush_pending(bcx, rflags, pending);
             lower_setcc(bcx, instr, gpr, *rflags, mem, m)
         }
+        Mnemonic::Movaps
+        | Mnemonic::Movups
+        | Mnemonic::Movdqa
+        | Mnemonic::Movdqu
+        | Mnemonic::Movapd
+        | Mnemonic::Movupd => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 16, false),
+        Mnemonic::Movss => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 4, true),
+        Mnemonic::Movsd => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 8, true),
+        Mnemonic::Movq => lower_sse_movq(bcx, instr, gpr, *rflags, mem, xmm),
+        Mnemonic::Movd => lower_sse_movd(bcx, instr, gpr, *rflags, mem, xmm),
+        Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
+            lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Xor)
+        }
+        Mnemonic::Andps | Mnemonic::Andpd | Mnemonic::Pand => {
+            lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::And)
+        }
+        Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Por => {
+            lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Or)
+        }
+        Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
+            lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Andn)
+        }
+        Mnemonic::Addss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, false),
+        Mnemonic::Subss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, false),
+        Mnemonic::Mulss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, false),
+        Mnemonic::Divss => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, false),
+        Mnemonic::Addsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, true),
+        Mnemonic::Subsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
+        Mnemonic::Mulsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
+        Mnemonic::Divsd => lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
+        Mnemonic::Addps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, false),
+        Mnemonic::Subps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, false),
+        Mnemonic::Mulps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, false),
+        Mnemonic::Divps => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, false),
+        Mnemonic::Addpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 0, true),
+        Mnemonic::Subpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
+        Mnemonic::Mulpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
+        Mnemonic::Divpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
         other => Err(format!("not lowerable {other:?}")),
     }
+}
+
+/// Lower a string op via host bulk helper; returns exit RIP value.
+fn lower_string(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: &mut Value,
+    gpr_loaded: &mut [bool; 16],
+    mem: &mut MemEnv,
+) -> Result<Value, String> {
+    let string_ref = mem.string_ref.ok_or("string helper missing")?;
+    let size = string_op_size(instr).ok_or("string size")?;
+    let (op, size) = match instr.mnemonic() {
+        Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => (0_u64, size),
+        Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsq => (1, size),
+        Mnemonic::Movsd => (1, 4), // string form only reaches here
+        Mnemonic::Lodsb | Mnemonic::Lodsd | Mnemonic::Lodsq => (2, size),
+        Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq => (3, size),
+        Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd | Mnemonic::Cmpsq => (4, size),
+        other => return Err(format!("string op {other:?}")),
+    };
+    let mut flags = 0_u64;
+    if instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix() {
+        flags |= 1;
+    }
+    if instr.has_repe_prefix() {
+        flags |= 2;
+    }
+    if instr.has_repne_prefix() {
+        flags |= 4;
+    }
+
+    // Flush SSA GPRs + flags into JitCtx for the host helper.
+    for i in 0..16 {
+        if gpr_loaded[i] {
+            let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+            let p = bcx.ins().iadd_imm(mem.ctx_ptr, off);
+            bcx.ins().store(mem.flags, gpr[i], p, 0);
+        }
+    }
+    let rflags_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_RFLAGS));
+    bcx.ins().store(mem.flags, *rflags, rflags_ptr, 0);
+
+    let op_v = iconst_u64(bcx, op);
+    let size_v = iconst_u64(bcx, u64::from(size));
+    let flags_v = iconst_u64(bcx, flags);
+    let ip_v = iconst_u64(bcx, instr.ip());
+    let call = bcx
+        .ins()
+        .call(string_ref, &[mem.ctx_ptr, op_v, size_v, flags_v, ip_v]);
+    let stay = bcx.inst_results(call)[0];
+
+    // Reload GPRs / flags first so a fault exit carries partial string progress.
+    for &i in &[0_usize, 1, 6, 7] {
+        let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+        let p = bcx.ins().iadd_imm(mem.ctx_ptr, off);
+        gpr[i] = bcx.ins().load(types::I64, mem.flags, p, 0);
+        gpr_loaded[i] = true;
+    }
+    *rflags = bcx.ins().load(types::I64, mem.flags, rflags_ptr, 0);
+
+    // Fault check (exit_args now hold post-helper state).
+    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
+    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
+    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
+    let cont = bcx.create_block();
+    let args = exit_args(gpr, *rflags);
+    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
+    bcx.switch_to_block(cont);
+    bcx.seal_block(cont);
+
+    let next = iconst_u64(bcx, instr.next_ip());
+    let cur = iconst_u64(bcx, instr.ip());
+    let stay_nz = bcx.ins().icmp_imm(IntCC::NotEqual, stay, 0);
+    Ok(bcx.ins().select(stay_nz, cur, next))
+}
+
+#[derive(Clone, Copy)]
+enum SseBit {
+    Xor,
+    And,
+    Or,
+    Andn,
 }
 
 fn lower_term(
@@ -1261,9 +2731,7 @@ fn call_load(
     let load_ref = mem.load_ref.ok_or("load helper missing")?;
     let size_v = bcx.ins().iconst(types::I64, i64::from(size));
     let ip_v = iconst_u64(bcx, insn_ip);
-    let call = bcx
-        .ins()
-        .call(load_ref, &[mem.ctx_ptr, addr, size_v, ip_v]);
+    let call = bcx.ins().call(load_ref, &[mem.ctx_ptr, addr, size_v, ip_v]);
     let val = bcx.inst_results(call)[0];
     let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
     let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
@@ -1520,12 +2988,7 @@ fn lower_cmp_test_lazy(
     if is_cmp {
         let res_raw = bcx.ins().isub(a, b);
         let res = mask_width(bcx, res_raw, bits);
-        *pending = PendingFlags::Sub {
-            a,
-            b,
-            res,
-            bits,
-        };
+        *pending = PendingFlags::Sub { a, b, res, bits };
     } else {
         let res_raw = bcx.ins().band(a, b);
         let res = mask_width(bcx, res_raw, bits);

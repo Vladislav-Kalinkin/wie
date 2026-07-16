@@ -4144,18 +4144,22 @@ fn handle_tls_free(
 
 /// Handles `KERNEL32.dll!Sleep`.
 ///
-/// By default this is a **no-op** so smokes/diff-traces stay deterministic and fast.
-/// Set `WIE_HOST_SLEEP=1` to block the host thread for up to 60s (interactive / idle CPU).
+/// Idle policy:
+/// - `Sleep(0)` always yields the host thread (`yield_now`) — cheap cooperative park.
+/// - Non-zero sleeps: by default a **no-op** so smokes/diff-traces stay deterministic
+///   and fast. Set `WIE_HOST_SLEEP=1` to park the host thread for up to 60s
+///   (interactive / idle CPU).
 pub fn handle_sleep(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let milliseconds = engine.read_rcx().context("failed to read RCX for Sleep")?;
+    let low32 = milliseconds & u64::from(u32::MAX);
 
-    if host_sleep_enabled() {
+    if low32 == 0 {
+        // Guest idle spin: park briefly so a tight Sleep(0) loop does not burn a core.
+        std::thread::yield_now();
+    } else if host_sleep_enabled() {
         // INFINITE / huge values: cap so the host cannot hang forever.
-        let low32 = milliseconds & u64::from(u32::MAX);
         let ms = low32.min(60_000);
-        if ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-        }
+        std::thread::sleep(std::time::Duration::from_millis(ms));
     }
 
     let return_value = 0;
@@ -4170,7 +4174,7 @@ pub fn handle_sleep(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandler
     })
 }
 
-/// Whether `Sleep` should block the host thread (`WIE_HOST_SLEEP=1`).
+/// Whether `Sleep(n>0)` should block the host thread (`WIE_HOST_SLEEP=1`).
 fn host_sleep_enabled() -> bool {
     std::env::var_os("WIE_HOST_SLEEP").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }

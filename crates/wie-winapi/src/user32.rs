@@ -1,8 +1,7 @@
 use crate::guest_memory::{
-    checked_address, checked_field_address, read_bytes as read_guest_bytes,
-    read_i32 as read_guest_i32, read_u32 as read_guest_u32, read_u64 as read_guest_u64,
-    write_bytes as write_guest_bytes, write_i32 as write_guest_i32, write_u32 as write_guest_u32,
-    write_u64 as write_guest_u64,
+    checked_field_address, read_bytes as read_guest_bytes, read_i32 as read_guest_i32,
+    read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_bytes as write_guest_bytes,
+    write_i32 as write_guest_i32, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
 use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
@@ -21,7 +20,7 @@ use anyhow::{Context, Result};
 const FAKE_ICON_HANDLE: u64 = 0x0000_0000_6600_0001;
 const FAKE_CURSOR_HANDLE: u64 = 0x0000_0000_6600_0002;
 const IDOK: u64 = 1;
-const WM_CREATE: u32 = 0x0001;
+
 const WM_MDICREATE: u32 = 0x0220;
 const FAKE_MONITOR_HANDLE: u64 = 0x0000_0000_6600_0010;
 const DISPLAY_DEVICE_ATTACHED_TO_DESKTOP: u32 = 0x0000_0001;
@@ -31,7 +30,6 @@ const FAKE_DEVICE_CONTEXT_HANDLE: u64 = 0x0000_0000_6600_0200;
 const FAKE_IMAGE_HANDLE: u64 = 0x0000_0000_6600_0300;
 const FAKE_DESKTOP_WINDOW_HANDLE: u64 = 0x0000_0000_6600_0110;
 const FAKE_SYSTEM_COLOR_BRUSH_BASE: u64 = 0x0000_0000_6601_0000;
-
 const FAKE_PROCESS_ID: u32 = 1;
 const FAKE_THREAD_ID: u64 = 1;
 
@@ -982,182 +980,6 @@ pub fn handle_enum_display_devices_w(
         return_address,
         return_value,
     })
-}
-
-/// Handles `USER32.dll!CreateWindowExA`.
-pub fn handle_create_window_ex_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    let extended_style_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateWindowExA")?;
-
-    let class_name_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateWindowExA")?;
-
-    let window_name_ptr = engine
-        .read_r8()
-        .context("failed to read R8 for CreateWindowExA")?;
-
-    let style_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateWindowExA")?;
-
-    /*
-     * Win64 stack layout at callee entry:
-     *
-     * [RSP + 0x00] return address
-     * [RSP + 0x08] shadow RCX
-     * [RSP + 0x10] shadow RDX
-     * [RSP + 0x18] shadow R8
-     * [RSP + 0x20] shadow R9
-     * [RSP + 0x28] X
-     * [RSP + 0x30] Y
-     * [RSP + 0x38] nWidth
-     * [RSP + 0x40] nHeight
-     * [RSP + 0x48] hWndParent
-     * [RSP + 0x50] hMenu
-     * [RSP + 0x58] hInstance
-     * [RSP + 0x60] lpParam
-     */
-
-    let x_raw = read_stack_argument(engine, 0x28, "CreateWindowExA X")?;
-
-    let y_raw = read_stack_argument(engine, 0x30, "CreateWindowExA Y")?;
-
-    let width_raw = read_stack_argument(engine, 0x38, "CreateWindowExA nWidth")?;
-
-    let height_raw = read_stack_argument(engine, 0x40, "CreateWindowExA nHeight")?;
-
-    let parent_handle = read_stack_argument(engine, 0x48, "CreateWindowExA hWndParent")?;
-
-    let menu_handle = read_stack_argument(engine, 0x50, "CreateWindowExA hMenu")?;
-
-    let instance_handle = read_stack_argument(engine, 0x58, "CreateWindowExA hInstance")?;
-
-    let _creation_parameter = read_stack_argument(engine, 0x60, "CreateWindowExA lpParam")?;
-
-    let extended_style = low_u32(extended_style_raw, "CreateWindowExA dwExStyle")?;
-
-    let style = low_u32(style_raw, "CreateWindowExA dwStyle")?;
-
-    let x = low_u32_as_i32(x_raw, "CreateWindowExA X")?;
-
-    let y = low_u32_as_i32(y_raw, "CreateWindowExA Y")?;
-
-    let width = low_u32_as_i32(width_raw, "CreateWindowExA nWidth")?;
-
-    let height = low_u32_as_i32(height_raw, "CreateWindowExA nHeight")?;
-
-    let class_identifier = read_window_class_identifier_a(engine, class_name_ptr)?;
-
-    let title = if window_name_ptr == 0 {
-        String::new()
-    } else {
-        read_guest_ansi_lossy(engine, window_name_ptr, 512)
-            .context("failed to read CreateWindowExA window title")?
-    };
-
-    finish_create_window(
-        engine,
-        state,
-        CreateWindowRequest {
-            class_identifier,
-            title,
-            style,
-            extended_style,
-            parent_handle,
-            menu_handle,
-            instance_handle,
-            x,
-            y,
-            width,
-            height,
-        },
-        false,
-        "CreateWindowExA",
-    )
-}
-
-/// Handles `USER32.dll!CreateWindowExW`.
-pub fn handle_create_window_ex_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-) -> Result<WinApiHandlerResult> {
-    let extended_style_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateWindowExW")?;
-
-    let class_name_ptr = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateWindowExW")?;
-
-    let window_name_ptr = engine
-        .read_r8()
-        .context("failed to read R8 for CreateWindowExW")?;
-
-    let style_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateWindowExW")?;
-
-    let x_raw = read_stack_argument(engine, 0x28, "CreateWindowExW X")?;
-
-    let y_raw = read_stack_argument(engine, 0x30, "CreateWindowExW Y")?;
-
-    let width_raw = read_stack_argument(engine, 0x38, "CreateWindowExW nWidth")?;
-
-    let height_raw = read_stack_argument(engine, 0x40, "CreateWindowExW nHeight")?;
-
-    let parent_handle = read_stack_argument(engine, 0x48, "CreateWindowExW hWndParent")?;
-
-    let menu_handle = read_stack_argument(engine, 0x50, "CreateWindowExW hMenu")?;
-
-    let instance_handle = read_stack_argument(engine, 0x58, "CreateWindowExW hInstance")?;
-
-    let _creation_parameter = read_stack_argument(engine, 0x60, "CreateWindowExW lpParam")?;
-
-    let extended_style = low_u32(extended_style_raw, "CreateWindowExW dwExStyle")?;
-
-    let style = low_u32(style_raw, "CreateWindowExW dwStyle")?;
-
-    let x = low_u32_as_i32(x_raw, "CreateWindowExW X")?;
-
-    let y = low_u32_as_i32(y_raw, "CreateWindowExW Y")?;
-
-    let width = low_u32_as_i32(width_raw, "CreateWindowExW nWidth")?;
-
-    let height = low_u32_as_i32(height_raw, "CreateWindowExW nHeight")?;
-
-    let class_identifier = read_window_class_identifier_w(engine, class_name_ptr)?;
-
-    let title = if window_name_ptr == 0 {
-        String::new()
-    } else {
-        read_guest_utf16_lossy(engine, window_name_ptr, 512)
-            .context("failed to read CreateWindowExW window title")?
-    };
-
-    finish_create_window(
-        engine,
-        state,
-        CreateWindowRequest {
-            class_identifier,
-            title,
-            style,
-            extended_style,
-            parent_handle,
-            menu_handle,
-            instance_handle,
-            x,
-            y,
-            width,
-            height,
-        },
-        true,
-        "CreateWindowExW",
-    )
 }
 
 /// Handles `USER32.dll!GetWindowRect`.
@@ -4245,61 +4067,6 @@ fn find_window_class<'a>(
         })
 }
 
-fn finish_create_window(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
-    request: CreateWindowRequest,
-    unicode: bool,
-    api_name: &str,
-) -> Result<WinApiHandlerResult> {
-    let class_name_for_create = match &request.class_identifier {
-        WindowClassIdentifier::Name(name) => name.clone(),
-        WindowClassIdentifier::Atom(atom) => format!("#{atom}"),
-    };
-
-    let (handle, window_proc, class_unicode) = create_window_record(state, request, unicode)?;
-
-    if handle == 0 {
-        let return_address = engine
-            .return_from_win64_api(0)
-            .with_context(|| format!("failed to return from {api_name}"))?;
-
-        return Ok(WinApiHandlerResult {
-            return_address,
-            return_value: 0,
-        });
-    }
-
-    // Real Windows sends WM_CREATE before CreateWindow returns. We only do this
-    // for WIEFrame today: that path creates the MDI client/document HWND used by
-    // File→Open ROM. Broadcasting WM_CREATE to every guest window pulls in a
-    // large amount of extra UI API surface during bootstrap.
-    let send_wm_create = window_proc != 0 && class_name_for_create.eq_ignore_ascii_case("WIEFrame");
-
-    if send_wm_create {
-        return Err(WinApiControlSignal::GuestCallbackRequested {
-            request: GuestCallbackRequest {
-                callback_address: window_proc,
-                window_handle: handle,
-                message: WM_CREATE,
-                word_parameter: 0,
-                long_parameter: 0,
-                unicode: class_unicode,
-            },
-        }
-        .into());
-    }
-
-    let return_address = engine
-        .return_from_win64_api(handle)
-        .with_context(|| format!("failed to return from {api_name}"))?;
-
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: handle,
-    })
-}
-
 fn create_window_record(
     state: &mut WinApiState,
     request: CreateWindowRequest,
@@ -4451,32 +4218,6 @@ fn create_mdi_child_from_struct(
     )?;
 
     Ok(handle)
-}
-
-fn read_stack_argument(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    offset: u64,
-    argument_name: &str,
-) -> Result<u64> {
-    let stack_pointer = engine
-        .read_rsp()
-        .with_context(|| format!("failed to read RSP for {argument_name}"))?;
-
-    let argument_address = checked_address(stack_pointer, offset, argument_name)?;
-
-    read_guest_u64(engine, argument_address)
-        .with_context(|| format!("failed to read stack argument {argument_name}"))
-}
-
-fn low_u32(value: u64, argument_name: &str) -> Result<u32> {
-    u32::try_from(value & u64::from(u32::MAX))
-        .with_context(|| format!("{argument_name} does not fit u32"))
-}
-
-fn low_u32_as_i32(value: u64, argument_name: &str) -> Result<i32> {
-    let low = low_u32(value, argument_name)?;
-
-    Ok(i32::from_ne_bytes(low.to_ne_bytes()))
 }
 
 fn find_window(state: &WinApiState, handle: u64) -> Option<&WindowRecord> {

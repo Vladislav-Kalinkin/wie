@@ -17,6 +17,7 @@ use crate::{WinApiEnvironment, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
 /// Guest VA base for synthetic CRT objects (FILE cookies, env pointers, etc.).
+const ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
 const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
 const FILE_STDIN: u64 = CRT_GUEST_BASE;
 const FILE_STDOUT: u64 = CRT_GUEST_BASE + 0x100;
@@ -53,6 +54,7 @@ pub fn dispatch_ucrt(
         "free" => handle_free(engine, state),
         "_set_new_mode" => handle_set_new_mode(engine),
         "__p__environ" => handle_p_environ(engine),
+        "__p__acmdln" => handle_p_acmdln(engine),
         "__p___argc" => handle_p_argc(engine),
         "__p___argv" => handle_p_argv(engine),
         "__p__commode" => handle_p_commode(engine),
@@ -119,10 +121,9 @@ fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     }
 
     // Host stdout/stderr for console programs (independent CRT expects console I/O).
+    // Fast-path: direct libc::write — skips Rust stdio mutex (matches JIT helper).
     if stream == FILE_STDOUT || stream == FILE_STDERR {
-        use std::io::Write;
-        drop(std::io::stdout().write_all(&bytes));
-        drop(std::io::stdout().flush());
+        write_host_console(stream, &bytes);
     }
 
     ret(engine, count)
@@ -130,8 +131,61 @@ fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 
 fn handle_fflush(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _stream = engine.read_rcx()?;
-    drop(std::io::Write::flush(&mut std::io::stdout()));
+    // Console I/O uses unbuffered `libc::write`; no userspace buffer / no stdio lock.
     ret(engine, 0)
+}
+
+/// Host console write without `std::io::{stdout,stderr}` lock.
+#[cfg(unix)]
+fn write_host_console(stream: u64, bytes: &[u8]) {
+    let fd = if stream == FILE_STDOUT {
+        libc::STDOUT_FILENO
+    } else {
+        // FILE_STDERR (caller already filtered).
+        libc::STDERR_FILENO
+    };
+    write_all_fd(fd, bytes);
+}
+
+/// Write the full buffer to `fd`, retrying EINTR; give up on other errors.
+#[cfg(unix)]
+fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let Some(chunk) = bytes.get(offset..) else {
+            break;
+        };
+        // SAFETY: `chunk` is a valid contiguous slice; write does not retain the pointer.
+        #[allow(unsafe_code)]
+        let n = unsafe {
+            libc::write(
+                fd,
+                chunk.as_ptr().cast::<libc::c_void>(),
+                chunk.len(),
+            )
+        };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        offset = offset.saturating_add(usize::try_from(n).unwrap_or(0));
+    }
+}
+
+#[cfg(not(unix))]
+fn write_host_console(stream: u64, bytes: &[u8]) {
+    use std::io::Write;
+    if stream == FILE_STDOUT {
+        drop(std::io::stdout().write_all(bytes));
+    } else if stream == FILE_STDERR {
+        drop(std::io::stderr().write_all(bytes));
+    }
 }
 
 fn handle_setvbuf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
@@ -143,7 +197,9 @@ fn handle_setvbuf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
 }
 
 /// Minimal stub: treat as success / no output formatting for CRT init paths.
-fn handle_stdio_common_vfprintf(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_stdio_common_vfprintf(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
     // Signature is options, FILE*, format, locale, va_list — ignore and return 0 chars.
     ret(engine, 0)
 }
@@ -202,6 +258,11 @@ fn handle_p_environ(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandler
     // char*** — point at a slot holding NULL (empty environment block list).
     engine.mem_write(ENVIRON_PTR_SLOT, &0_u64.to_le_bytes())?;
     ret(engine, ENVIRON_PTR_SLOT)
+}
+
+fn handle_p_acmdln(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    engine.mem_write(ACMDLN_PTR_SLOT, &0_u64.to_le_bytes())?;
+    ret(engine, ACMDLN_PTR_SLOT)
 }
 
 fn handle_p_argc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
@@ -313,7 +374,9 @@ fn handle_initterm_e(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandle
     ret(engine, 0)
 }
 
-fn handle_configure_narrow_argv(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+fn handle_configure_narrow_argv(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
     let _mode = engine.read_rcx()?;
     ret(engine, 0)
 }

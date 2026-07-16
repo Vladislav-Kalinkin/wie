@@ -6,7 +6,7 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKin
 /// Max instructions per compiled block (keeps compile time bounded).
 pub(super) const MAX_BLOCK_INSNS: usize = 32;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
-pub(super) const MIN_BLOCK_INSNS: usize = 4;
+pub(super) const MIN_BLOCK_INSNS: usize = 8;
 
 /// One decoded guest insn kept for the lowerer.
 #[derive(Debug, Clone)]
@@ -92,12 +92,27 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
         if !is_lowerable(&instr) {
             break;
         }
+        let ends_string = is_string_op(&instr);
         insns.push(DecodedInsn { instr });
         bytes_len = bytes_len.saturating_add(len_u32);
         rip = next;
+        // String ops end the block: REP stay needs dynamic exit RIP from the host helper.
+        if ends_string {
+            break;
+        }
     }
 
-    if insns.len() < MIN_BLOCK_INSNS {
+    // Lone / short blocks ending in bulk string, near-call (UCRT), or near-ret
+    // (shadow-stack chaining) are worth compiling — beat iced + host-stop.
+    let min = if insns.last().is_some_and(|d| {
+        is_string_op(&d.instr)
+            || matches!(d.instr.mnemonic(), Mnemonic::Call | Mnemonic::Ret)
+    }) {
+        1
+    } else {
+        MIN_BLOCK_INSNS
+    };
+    if insns.len() < min {
         BlockKind::NotPure
     } else {
         BlockKind::Pure {
@@ -163,10 +178,11 @@ fn is_near_branch(instr: &Instruction) -> bool {
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
         Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => true,
-        // iced encodes LEA's address as OpKind::Memory — allow simple forms only.
+        // LEA: all standard SIB forms (base/index*1|2|4|8 + disp) + RIP-relative.
         Mnemonic::Lea => lea_is_simple(instr),
         Mnemonic::Mov => mov_is_lowerable(instr),
         Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => movx_is_lowerable(instr),
+        // Push/pop: r64, imm, and simple memory operands.
         Mnemonic::Push => push_is_lowerable(instr),
         Mnemonic::Pop => pop_is_lowerable(instr),
         Mnemonic::Add
@@ -219,8 +235,219 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Setns
         | Mnemonic::Setp
         | Mnemonic::Setnp => setcc_is_lowerable(instr),
+        // SSE: packed/scalar moves + xor (CRT memcpy / zeroing helpers).
+        Mnemonic::Movaps | Mnemonic::Movups | Mnemonic::Movdqa | Mnemonic::Movdqu => {
+            sse_mov_is_lowerable(instr, 16)
+        }
+        Mnemonic::Movss => sse_mov_is_lowerable(instr, 4),
+        Mnemonic::Movsd if sse_movsd_is_sse(instr) => sse_mov_is_lowerable(instr, 8),
+        Mnemonic::Movq => sse_movq_is_lowerable(instr),
+        Mnemonic::Movd => sse_movd_is_lowerable(instr),
+        Mnemonic::Xorps
+        | Mnemonic::Xorpd
+        | Mnemonic::Pxor
+        | Mnemonic::Andps
+        | Mnemonic::Andpd
+        | Mnemonic::Pand
+        | Mnemonic::Orps
+        | Mnemonic::Orpd
+        | Mnemonic::Por
+        | Mnemonic::Andnps
+        | Mnemonic::Andnpd
+        | Mnemonic::Pandn => sse_bitwise_is_lowerable(instr),
+        Mnemonic::Movapd | Mnemonic::Movupd => sse_mov_is_lowerable(instr, 16),
+        // Scalar / packed FP arithmetic (lowered via small host f32/f64 helpers).
+        Mnemonic::Addss
+        | Mnemonic::Subss
+        | Mnemonic::Mulss
+        | Mnemonic::Divss
+        | Mnemonic::Addsd
+        | Mnemonic::Subsd
+        | Mnemonic::Mulsd
+        | Mnemonic::Divsd => sse_scalar_fp_is_lowerable(instr),
+        Mnemonic::Addps
+        | Mnemonic::Subps
+        | Mnemonic::Mulps
+        | Mnemonic::Divps
+        | Mnemonic::Addpd
+        | Mnemonic::Subpd
+        | Mnemonic::Mulpd
+        | Mnemonic::Divpd => sse_packed_fp_is_lowerable(instr),
+        // String ops (REP bulk via JIT host helper); ends block in decoder.
+        Mnemonic::Stosb
+        | Mnemonic::Stosw
+        | Mnemonic::Stosd
+        | Mnemonic::Stosq
+        | Mnemonic::Movsb
+        | Mnemonic::Movsw
+        | Mnemonic::Movsq
+        | Mnemonic::Lodsb
+        | Mnemonic::Lodsd
+        | Mnemonic::Lodsq
+        | Mnemonic::Scasb
+        | Mnemonic::Scasw
+        | Mnemonic::Scasd
+        | Mnemonic::Scasq
+        | Mnemonic::Cmpsb
+        | Mnemonic::Cmpsw
+        | Mnemonic::Cmpsd
+        | Mnemonic::Cmpsq => string_mnemonic_ok(),
+        // Movsd string form only (SSE form handled above).
+        Mnemonic::Movsd if !sse_movsd_is_sse(instr) => string_mnemonic_ok(),
         _ => false,
     }
+}
+
+#[inline]
+const fn string_mnemonic_ok() -> bool {
+    true
+}
+
+/// True for MOVS/STOS/LODS/SCAS/CMPS (including REP forms).
+pub(super) fn is_string_op(instr: &Instruction) -> bool {
+    match instr.mnemonic() {
+        Mnemonic::Stosb
+        | Mnemonic::Stosw
+        | Mnemonic::Stosd
+        | Mnemonic::Stosq
+        | Mnemonic::Movsb
+        | Mnemonic::Movsw
+        | Mnemonic::Movsq
+        | Mnemonic::Lodsb
+        | Mnemonic::Lodsd
+        | Mnemonic::Lodsq
+        | Mnemonic::Scasb
+        | Mnemonic::Scasw
+        | Mnemonic::Scasd
+        | Mnemonic::Scasq
+        | Mnemonic::Cmpsb
+        | Mnemonic::Cmpsw
+        | Mnemonic::Cmpsd
+        | Mnemonic::Cmpsq => true,
+        Mnemonic::Movsd => !sse_movsd_is_sse(instr),
+        _ => false,
+    }
+}
+
+pub(super) fn string_op_size(instr: &Instruction) -> Option<u32> {
+    match instr.mnemonic() {
+        Mnemonic::Stosb | Mnemonic::Movsb | Mnemonic::Lodsb | Mnemonic::Scasb | Mnemonic::Cmpsb => {
+            Some(1)
+        }
+        Mnemonic::Stosw | Mnemonic::Movsw | Mnemonic::Scasw | Mnemonic::Cmpsw => Some(2),
+        Mnemonic::Stosd | Mnemonic::Lodsd | Mnemonic::Scasd | Mnemonic::Cmpsd => Some(4),
+        Mnemonic::Movsd if !sse_movsd_is_sse(instr) => Some(4),
+        Mnemonic::Stosq | Mnemonic::Movsq | Mnemonic::Lodsq | Mnemonic::Scasq | Mnemonic::Cmpsq => {
+            Some(8)
+        }
+        _ => None,
+    }
+}
+
+/// `movsd` mnemonic is shared with string MOVS DWORD — only XMM forms are SSE.
+fn sse_movsd_is_sse(instr: &Instruction) -> bool {
+    instr.op0_register().is_xmm()
+        || instr.op1_register().is_xmm()
+        || matches!(
+            instr.code(),
+            iced_x86::Code::Movsd_xmm_xmmm64 | iced_x86::Code::Movsd_xmmm64_xmm
+        )
+}
+
+/// movaps/movups/movdqa/movdqu/movss/movsd: xmm↔xmm or xmm↔simple mem.
+fn sse_mov_is_lowerable(instr: &Instruction, width: u32) -> bool {
+    let _ = width;
+    let k0 = instr.op0_kind();
+    let k1 = instr.op1_kind();
+    match (k0, k1) {
+        (OpKind::Register, OpKind::Register) => {
+            instr.op_register(0).is_xmm() && instr.op_register(1).is_xmm()
+        }
+        (OpKind::Register, OpKind::Memory) => {
+            instr.op_register(0).is_xmm() && mem_ea_ok(instr) && mem_size_ok_sse(instr)
+        }
+        (OpKind::Memory, OpKind::Register) => {
+            instr.op_register(1).is_xmm() && mem_ea_ok(instr) && mem_size_ok_sse(instr)
+        }
+        _ => false,
+    }
+}
+
+/// movq: xmm↔xmm/m64, or xmm↔r64, or r64↔xmm.
+fn sse_movq_is_lowerable(instr: &Instruction) -> bool {
+    let k0 = instr.op0_kind();
+    let k1 = instr.op1_kind();
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    match (k0, k1) {
+        (OpKind::Register, OpKind::Register) => {
+            (r0.is_xmm() && r1.is_xmm())
+                || (r0.is_xmm() && r1.size() == 8)
+                || (r0.size() == 8 && r1.is_xmm())
+        }
+        (OpKind::Register, OpKind::Memory) => {
+            (r0.is_xmm() || r0.size() == 8) && mem_ea_ok(instr) && mem_size_ok_sse(instr)
+        }
+        (OpKind::Memory, OpKind::Register) => {
+            (r1.is_xmm() || r1.size() == 8) && mem_ea_ok(instr) && mem_size_ok_sse(instr)
+        }
+        _ => false,
+    }
+}
+
+/// movd: xmm↔r32/m32.
+fn sse_movd_is_lowerable(instr: &Instruction) -> bool {
+    let k0 = instr.op0_kind();
+    let k1 = instr.op1_kind();
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    match (k0, k1) {
+        (OpKind::Register, OpKind::Register) => {
+            (r0.is_xmm() && r1.size() == 4) || (r0.size() == 4 && r1.is_xmm())
+        }
+        (OpKind::Register, OpKind::Memory) => {
+            r0.is_xmm() && mem_ea_ok(instr) && mem_size_ok_sse(instr)
+        }
+        (OpKind::Memory, OpKind::Register) => {
+            r1.is_xmm() && mem_ea_ok(instr) && mem_size_ok_sse(instr)
+        }
+        _ => false,
+    }
+}
+
+/// xorps/andps/orps/andnps (+ pd / pand forms): xmm, xmm/m128.
+fn sse_bitwise_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return false;
+    }
+    match instr.op1_kind() {
+        OpKind::Register => instr.op_register(1).is_xmm(),
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
+}
+
+/// addss/subss/… / addsd/…: xmm, xmm/m32|m64.
+fn sse_scalar_fp_is_lowerable(instr: &Instruction) -> bool {
+    if instr.op0_kind() != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return false;
+    }
+    match instr.op1_kind() {
+        OpKind::Register => instr.op_register(1).is_xmm(),
+        OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+        _ => false,
+    }
+}
+
+/// addps/mulpd/…: xmm, xmm/m128.
+fn sse_packed_fp_is_lowerable(instr: &Instruction) -> bool {
+    sse_bitwise_is_lowerable(instr)
+}
+
+/// Memory sizes used by SSE loads/stores (4/8/16).
+fn mem_size_ok_sse(instr: &Instruction) -> bool {
+    let sz = instr.memory_size().size();
+    matches!(sz, 4 | 8 | 16) || mem_size_ok(instr)
 }
 
 /// Shift/rotate: dst reg or simple mem; count imm or CL.
@@ -382,7 +609,8 @@ fn is_imm_kind(k: OpKind) -> bool {
     )
 }
 
-/// Allow `lea r64, [base+index*scale+disp]` / `[rip+disp]` (scale 1/2/4/8).
+/// Allow full LEA address forms: `[base]`, `[disp]`, `[base+disp]`,
+/// `[index*scale+disp]`, `[base+index*scale+disp]`, `[rip+disp]` (scale 1/2/4/8).
 fn lea_is_simple(instr: &Instruction) -> bool {
     if instr.op0_kind() != OpKind::Register {
         return false;
@@ -427,27 +655,34 @@ fn mem_size_ok(instr: &Instruction) -> bool {
     }
 }
 
-/// Byte width of a memory operand (1/2/4/8).
+/// Byte width of a memory operand (1/2/4/8/16).
 pub(super) fn mem_width_bytes(instr: &Instruction) -> Result<u32, String> {
+    // Prefer iced's size table (covers Packed128_*, Float64, UInt128, …).
+    let table_sz = instr.memory_size().size();
+    if matches!(table_sz, 1 | 2 | 4 | 8 | 16) {
+        return Ok(u32::try_from(table_sz).unwrap_or(0));
+    }
     let sz = match instr.memory_size() {
         MemorySize::UInt8 | MemorySize::Int8 => 1,
         MemorySize::UInt16 | MemorySize::Int16 => 2,
         MemorySize::UInt32 | MemorySize::Int32 => 4,
-        MemorySize::UInt64
-        | MemorySize::Int64
-        | MemorySize::QwordOffset
-        | MemorySize::SegPtr64 => 8,
+        MemorySize::UInt64 | MemorySize::Int64 | MemorySize::QwordOffset | MemorySize::SegPtr64 => {
+            8
+        }
+        MemorySize::UInt128 | MemorySize::Int128 | MemorySize::Float128 => 16,
         _ => {
             if instr.op0_kind() == OpKind::Register {
-                instr.op_register(0).size()
+                let r = instr.op_register(0);
+                if r.is_xmm() { 16 } else { r.size() }
             } else if instr.op1_kind() == OpKind::Register {
-                instr.op_register(1).size()
+                let r = instr.op_register(1);
+                if r.is_xmm() { 16 } else { r.size() }
             } else {
                 return Err("unsupported mem size".into());
             }
         }
     };
-    if matches!(sz, 1 | 2 | 4 | 8) {
+    if matches!(sz, 1 | 2 | 4 | 8 | 16) {
         Ok(u32::try_from(sz).unwrap_or(0))
     } else {
         Err(format!("bad mem width {sz}"))

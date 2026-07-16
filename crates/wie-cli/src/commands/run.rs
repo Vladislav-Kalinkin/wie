@@ -39,6 +39,10 @@ pub(crate) fn run_micro(
         );
     }
 
+    if let Some(profile) = &summary.profile {
+        println!("{}", profile.report());
+    }
+
     match summary.exit_code {
         Some(code) if code == expect_code => {
             println!("run_micro: ok exit={code}");

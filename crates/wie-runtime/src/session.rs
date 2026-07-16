@@ -1,9 +1,9 @@
 //! Persistent `RuntimeSession`: guest setup, yield/resume, and API hook loop.
 
-use crate::hooks::{build_all_runtime_fake_api_entries, find_fake_api_entry, RuntimeFakeApiEntry};
+use crate::hooks::{RuntimeFakeApiEntry, build_all_runtime_fake_api_entries, find_fake_api_entry};
 use crate::memory::{
-    build_default_environment_strings_w, default_winapi_environment, default_winapi_state,
-    write_process_identity_strings, RuntimeMemoryLayout, DEFAULT_LAYOUT,
+    DEFAULT_LAYOUT, RuntimeMemoryLayout, build_default_environment_strings_w,
+    default_winapi_environment, default_winapi_state, write_process_identity_strings,
 };
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
@@ -79,7 +79,7 @@ impl RuntimeProfile {
             total as f64 / 1e6,
         ));
         let mut ranked: Vec<_> = self.by_export.iter().collect();
-        ranked.sort_by(|a, b| b.1 .1.cmp(&a.1 .1).then(b.1 .0.cmp(&a.1 .0)));
+        ranked.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)));
         lines.push("top exports by handler time:".to_owned());
         for (name, (count, ns)) in ranked.into_iter().take(20) {
             lines.push(format!(
@@ -333,6 +333,27 @@ impl RuntimeSession {
             &layout,
         )?;
 
+        // JIT: direct UCRT imports (malloc/memcpy/strlen/…) + guest heap layout.
+        {
+            let mut by_va = std::collections::HashMap::new();
+            for entry in &fake_api_entries {
+                if let Some(kind) = wie_cpu::FastApiKind::from_export_name(&entry.name) {
+                    by_va.insert(entry.fake_target_va, kind);
+                }
+            }
+            let heap_end = layout
+                .process_heap_base
+                .saturating_add(layout.process_heap_size as u64);
+            engine.configure_jit_fast_path(wie_cpu::JitFastPathConfig {
+                heap: wie_cpu::JitHeapLayout {
+                    ctrl_va: guest_heap_cfg.ctrl_va,
+                    base: layout.process_heap_base,
+                    end: heap_end,
+                },
+                by_va,
+            });
+        }
+
         engine
             .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
             .context("failed to install persistent Unicorn runtime hooks")?;
@@ -388,6 +409,17 @@ impl RuntimeSession {
         engine
             .mem_map(0x0000_0000_6800_0000, 0x1000, wie_cpu::perm::ALL)
             .context("failed to map guest UCRT data page")?;
+        // Pre-init slots so guest `__p__*` stubs can return pointers without a host stop.
+        // argc=1; environ/argv/acmdln null; commode/fmode 0 (matches ucrt host handlers).
+        {
+            const CRT: u64 = 0x0000_0000_6800_0000;
+            engine.mem_write(CRT + 0x300, &0_u64.to_le_bytes())?; // environ ptr
+            engine.mem_write(CRT + 0x308, &0_u64.to_le_bytes())?; // argv ptr
+            engine.mem_write(CRT + 0x310, &1_u32.to_le_bytes())?; // argc
+            engine.mem_write(CRT + 0x318, &0_u32.to_le_bytes())?; // commode
+            engine.mem_write(CRT + 0x320, &0_u32.to_le_bytes())?; // fmode
+            engine.mem_write(CRT + 0x328, &0_u64.to_le_bytes())?; // acmdln
+        }
 
         let command_line_a_ptr = layout
             .env_data_base
@@ -1118,27 +1150,6 @@ impl RuntimeSession {
                 )
             })
             .collect()
-    }
-
-    /// Prefers the main Lunar Magic frame window when choosing a WM_COMMAND target.
-    #[must_use]
-    pub fn preferred_command_window_handle(&self) -> Option<u64> {
-        let windows = &self.winapi_state.windows;
-
-        windows
-            .iter()
-            .find(|window| {
-                window.window_proc != 0
-                    && (window.title.to_ascii_lowercase().contains("lunar")
-                        || window.class_name.to_ascii_lowercase().contains("lunar"))
-            })
-            .or_else(|| {
-                windows
-                    .iter()
-                    .find(|window| window.window_proc != 0 && window.visible && window.width >= 200)
-            })
-            .or_else(|| windows.iter().find(|window| window.window_proc != 0))
-            .map(|window| window.handle)
     }
 
     /// Number of guest callbacks currently nested on the bridge stack.

@@ -237,6 +237,19 @@ impl RegFile {
         Ok(())
     }
 
+    /// Read XMM by index 0..15 (JIT snapshot).
+    #[must_use]
+    pub fn xmm_at(&self, idx: usize) -> u128 {
+        self.xmm.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Write XMM by index 0..15 (JIT write-back).
+    pub fn set_xmm_at(&mut self, idx: usize, value: u128) {
+        if let Some(slot) = self.xmm.get_mut(idx) {
+            *slot = value;
+        }
+    }
+
     pub(crate) fn set_flag(&mut self, mask: u64, on: bool) {
         if on {
             self.rflags |= mask;
