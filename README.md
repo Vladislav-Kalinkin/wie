@@ -11,7 +11,7 @@
 
 > At the moment, WIE cannot run user executable files and is still a research and experimental project
 
-> The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%). At this early stage of running ultra-small executable files, initial optimization attempts have not yet yielded positive results, and the engine lacks proper optimization passes.
+> The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%). 
 
 **Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
 
