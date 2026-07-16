@@ -447,13 +447,24 @@ pub(super) fn compile_block(
         let entry = bcx.create_block();
         bcx.append_block_params_for_function_params(entry);
         bcx.switch_to_block(entry);
-        // Leave entry unsealed when self-looping so we can jump back after writeback.
-        if !self_loop {
-            bcx.seal_block(entry);
-        }
+        // Cranelift forbids CFG edges into the function entry block (remove_constant_phis
+        // asserts `edge.block != entry_block`). Self-loops therefore re-enter a dedicated
+        // header block, never `entry`.
+        bcx.seal_block(entry);
 
         let ctx_ptr = bcx.block_params(entry)[0];
         let flags = MemFlagsData::trusted();
+
+        // Loop header: body + self-loop back-edges land here (reload GPRs from JitCtx).
+        let loop_header = if self_loop {
+            let h = bcx.create_block();
+            bcx.ins().jump(h, &[]);
+            bcx.switch_to_block(h);
+            // Leave unsealed until after self-loop back-edges are emitted.
+            h
+        } else {
+            entry
+        };
 
         // Exit: gpr[16] + rflags as block params → store and return.
         // XMM is write-through to JitCtx (correct on mid-block mem faults).
@@ -692,7 +703,7 @@ pub(super) fn compile_block(
                     &mut bcx,
                     t,
                     start_rip,
-                    entry,
+                    loop_header,
                     ctx_ptr,
                     flags,
                     &mut gpr_vals,
@@ -844,7 +855,7 @@ pub(super) fn compile_block(
         }
         bcx.ins().return_(&[]);
         if self_loop {
-            bcx.seal_block(entry);
+            bcx.seal_block(loop_header);
         }
         bcx.seal_all_blocks();
         bcx.finalize();
@@ -1008,12 +1019,15 @@ fn emit_chain_or_exit(
     jump_exit(bcx, exit, gpr, rflags);
 }
 
-/// Self-loop terminator: writeback + jump to entry (or chain non-loop edge).
+/// Self-loop terminator: writeback + jump to loop header (or chain non-loop edge).
+///
+/// `loop_header` must **not** be the function entry block — Cranelift rejects
+/// edges into entry (`remove_constant_phis` / `edge.block != entry_block`).
 fn lower_self_loop_term(
     bcx: &mut FunctionBuilder<'_>,
     term: BlockTerm,
     start_rip: u64,
-    entry: Block,
+    loop_header: Block,
     ctx_ptr: Value,
     flags: MemFlagsData,
     gpr: &mut [Value; 16],
@@ -1031,8 +1045,8 @@ fn lower_self_loop_term(
             writeback_gprs(
                 bcx, ctx_ptr, flags, gpr, gpr_loaded, rflags, rflags_ptr, true,
             );
-            // Re-enter: entry block param is ctx_ptr.
-            bcx.ins().jump(entry, &[BlockArg::Value(ctx_ptr)]);
+            // Re-enter header (reload GPRs from JitCtx); no block params.
+            bcx.ins().jump(loop_header, &[]);
             Ok(true)
         }
         BlockTerm::Jcc {
@@ -1052,7 +1066,7 @@ fn lower_self_loop_term(
                     writeback_gprs(
                         bcx, ctx_ptr, flags, gpr, gpr_loaded, rflags, rflags_ptr, true,
                     );
-                    bcx.ins().jump(entry, &[BlockArg::Value(ctx_ptr)]);
+                    bcx.ins().jump(loop_header, &[]);
                 } else {
                     let rv = iconst_u64(bcx, va);
                     emit_chain_or_exit(

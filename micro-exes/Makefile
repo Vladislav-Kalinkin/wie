@@ -10,9 +10,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -25,6 +25,7 @@ read_file: $(OUT)/read_file.exe
 modules: $(OUT)/modules.exe
 relative_path: $(OUT)/relative_path.exe
 crt_hello: $(OUT)/crt_hello.exe
+long_loop: $(OUT)/long_loop.exe
 
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
@@ -57,6 +58,11 @@ $(OUT)/relative_path.exe: relative_path/main.c | $(OUT)
 # Normal Windows console + CRT (UCRT api-ms-win-crt-*), not freestanding.
 $(OUT)/crt_hello.exe: crt_hello/main.c | $(OUT)
 	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $<
+	@echo "built $@"
+
+
+$(OUT)/long_loop.exe: long_loop/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
 clean:
