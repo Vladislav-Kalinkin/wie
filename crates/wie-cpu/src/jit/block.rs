@@ -114,11 +114,7 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
     // - jcc/jmp: tight loops (often < MIN_BLOCK_INSNS) must not stay on iced
     // - string ops: bulk REP helper
     // Fallthrough-only fragments keep MIN_BLOCK_INSNS to avoid compile tax.
-    let min = if term.is_some()
-        || insns
-            .last()
-            .is_some_and(|d| is_string_op(&d.instr))
-    {
+    let min = if term.is_some() || insns.last().is_some_and(|d| is_string_op(&d.instr)) {
         1
     } else {
         MIN_BLOCK_INSNS
@@ -144,10 +140,9 @@ pub(super) fn pure_is_self_loop(kind: &BlockKind, start: u64) -> bool {
             ..
         } => *target == start,
         BlockKind::Pure {
-            term:
-                Some(BlockTerm::Jcc {
-                    taken, not_taken, ..
-                }),
+            term: Some(BlockTerm::Jcc {
+                taken, not_taken, ..
+            }),
             ..
         } => *taken == start || *not_taken == start,
         _ => false,

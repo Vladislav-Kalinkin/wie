@@ -75,7 +75,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 - Guest pages: `HashMap` ownership + radix walk for JIT O(1) page base.
 - Process heap: segregated freelists (**24** size classes, up to 64 KiB) + bump for virgin space; 8-byte size header before each payload.
 - Host `GuestHeap` and optional in-guest `HeapAlloc`/`HeapFree` share a control block (bump + freelist heads). Default path is **host freelist** (`WIE_GUEST_HEAP=1` enables full guest rewire).
-- `HeapFree` of a live block → TRUE; **double-free / unknown** → FALSE + `ERROR_INVALID_HANDLE` (6). `HeapReAlloc(..., 0)` frees and returns NULL.
+- `HeapFree` of a live block → TRUE; **double-free / unknown** → FALSE + `ERROR_INVALID_HANDLE` (6). `HeapAlloc(..., 0)` returns a valid freeable pointer; `HeapReAlloc(..., 0)` frees and returns NULL. `HEAP_ZERO_MEMORY` zeros the payload.
 
 ## Environment knobs
 

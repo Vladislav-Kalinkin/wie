@@ -1327,12 +1327,16 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Getstringtypew => kernel32::handle_get_string_type_w(engine),
         WinApiId::Kernel32Multibytetowidechar => kernel32::handle_multi_byte_to_wide_char(engine),
         WinApiId::Kernel32Lcmapstringw => kernel32::handle_lc_map_string_w(engine),
-        WinApiId::Kernel32Getmodulefilenamea => {
-            kernel32::handle_get_module_file_name_a(engine, environment.module_file_name_a_ptr)
-        }
-        WinApiId::Kernel32Getmodulefilenamew => {
-            kernel32::handle_get_module_file_name_w(engine, environment.module_file_name_w_ptr)
-        }
+        WinApiId::Kernel32Getmodulefilenamea => kernel32::handle_get_module_file_name_a(
+            engine,
+            state,
+            environment.module_file_name_a_ptr,
+        ),
+        WinApiId::Kernel32Getmodulefilenamew => kernel32::handle_get_module_file_name_w(
+            engine,
+            state,
+            environment.module_file_name_w_ptr,
+        ),
         WinApiId::Kernel32Setunhandledexceptionfilter => {
             kernel32::handle_set_unhandled_exception_filter(engine)
         }

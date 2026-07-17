@@ -20,11 +20,13 @@ const STD_INPUT_HANDLE_ID: u32 = 0xffff_fff6;
 const STD_OUTPUT_HANDLE_ID: u32 = 0xffff_fff5;
 const STD_ERROR_HANDLE_ID: u32 = 0xffff_fff4;
 
+/// Fake console handles returned by `GetStdHandle` (Microsoft Learn std ids).
 const FAKE_STDIN_HANDLE: u64 = 0x0000_0000_6000_0001;
 const FAKE_STDOUT_HANDLE: u64 = 0x0000_0000_6000_0002;
 const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
 
 const FILE_TYPE_UNKNOWN: u64 = 0x0000;
+const FILE_TYPE_DISK: u64 = 0x0001;
 const FILE_TYPE_CHAR: u64 = 0x0002;
 
 const ANSI_CODE_PAGE: u64 = 1252;
@@ -43,6 +45,8 @@ const C1_XDIGIT: u16 = 0x0080;
 const C1_ALPHA: u16 = 0x0100;
 
 const HEAP_SIZE_FAILURE: u64 = u64::MAX;
+/// `HEAP_ZERO_MEMORY` (heapapi.h / Microsoft Learn).
+const HEAP_ZERO_MEMORY: u64 = 0x0000_0008;
 
 const FAKE_KERNEL32_MODULE: u64 = 0x0000_0000_6100_0000;
 const FAKE_USER32_MODULE: u64 = 0x0000_0000_6100_1000;
@@ -60,7 +64,6 @@ const FILE_ATTRIBUTE_ARCHIVE: u64 = 0x0000_0020;
 
 const INVALID_HANDLE_VALUE: u64 = u64::MAX;
 const ERROR_NO_MORE_FILES: u32 = 18;
-const ERROR_FILE_NOT_FOUND_U32: u32 = 2;
 
 const FAKE_RESOURCE_DATA_BASE: u64 = 0x0000_0000_6400_0000;
 const FAKE_RESOURCE_SIZE: u32 = 16;
@@ -71,14 +74,9 @@ const FAKE_RESOURCE_BYTES: [u8; 16] = [
 
 const LANG_EN_US: u64 = 0x0409;
 
-const FILE_TYPE_DISK: u64 = 1;
-
-const STD_INPUT_HANDLE_VALUE: u64 = 0x0000_0000_6000_0001;
-const STD_OUTPUT_HANDLE_VALUE: u64 = 0x0000_0000_6000_0002;
-const STD_ERROR_HANDLE_VALUE: u64 = 0x0000_0000_6000_0003;
 const ERROR_INVALID_HANDLE: u32 = 6;
-const FILE_ATTRIBUTE_ARCHIVE_U32: u32 = 0x20;
 const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 const TIME_ZONE_ID_UNKNOWN: u64 = 0;
 const TIME_ZONE_ID_INVALID: u64 = 0xffff_ffff;
@@ -170,20 +168,31 @@ pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
 ///
 /// `lpModuleName == NULL` returns the main module image base from the PE
 /// (`WinApiEnvironment::image_base`), not a hardcoded Lunar Magic address.
+/// Handles `KERNEL32.dll!GetModuleHandleA`.
+///
+/// Microsoft Learn: `lpModuleName == NULL` → handle of the calling process's
+/// `.exe`. Named module must already be loaded; otherwise returns `NULL`.
 pub fn handle_get_module_handle_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let module_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleHandleA")?;
 
     let return_value = if module_name_ptr == 0 {
+        state.last_error = 0;
         environment.image_base
     } else {
         let module_name = read_ansi_string_from_cpu(engine, module_name_ptr, 260)?;
-        resolve_module_handle(&module_name, environment.image_base, state)
+        let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
+        if handle == 0 {
+            state.last_error = ERROR_MOD_NOT_FOUND;
+        } else {
+            state.last_error = 0;
+        }
+        handle
     };
 
     let return_address = engine
@@ -487,99 +496,120 @@ fn multibyte_bytes_to_utf16_units(bytes: &[u8]) -> Result<Vec<u16>> {
     Ok(units)
 }
 
-fn copy_bytes_to_guest_buffer(
+/// Copy a NUL-terminated ANSI path into a guest buffer.
+///
+/// Returns `(chars_written_or_nSize, truncated)` per Microsoft Learn
+/// `GetModuleFileNameA` semantics.
+fn copy_path_a_to_guest_buffer(
     engine: &mut dyn wie_cpu::CpuEngine,
     source_ptr: u64,
     dest_ptr: u64,
     dest_len: u64,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     if dest_ptr == 0 || dest_len == 0 {
-        return Ok(0);
+        return Ok((0, false));
     }
 
     let dest_len_usize =
         usize::try_from(dest_len).context("guest buffer length does not fit usize")?;
 
+    // Read full source path (bounded) including room to detect truncation.
     let mut source_bytes = Vec::new();
-
-    for index in 0..dest_len_usize {
+    let max_scan = dest_len_usize.saturating_add(1).max(1);
+    for index in 0..max_scan {
         let index_u64 = u64::try_from(index).context("guest string index does not fit u64")?;
         let source_address = checked_address(source_ptr, index_u64, "guest source string")?;
-
         let mut byte = [0_u8; 1];
         engine
             .mem_read(source_address, &mut byte)
             .context("failed to read guest source string byte")?;
-
-        source_bytes.push(byte[0]);
-
         if byte[0] == 0 {
             break;
         }
+        source_bytes.push(byte[0]);
     }
 
-    let bytes_to_write = if source_bytes.len() > dest_len_usize {
-        source_bytes
-            .get(..dest_len_usize)
-            .context("failed to slice guest output bytes")?
+    let path_len = source_bytes.len();
+    // Need room for path + NUL. If dest_len is too small, truncate and NUL-terminate.
+    let truncated = path_len >= dest_len_usize;
+    if truncated {
+        let keep = dest_len_usize.saturating_sub(1);
+        let mut out = source_bytes.get(..keep).unwrap_or(&[]).to_vec();
+        out.push(0);
+        engine
+            .mem_write(dest_ptr, &out)
+            .context("failed to write truncated guest path")?;
+        Ok((dest_len, true))
     } else {
-        source_bytes.as_slice()
-    };
-
-    engine
-        .mem_write(dest_ptr, bytes_to_write)
-        .context("failed to write guest buffer")?;
-
-    let written_without_nul = bytes_to_write
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes_to_write.len());
-
-    u64::try_from(written_without_nul).context("written byte count does not fit u64")
+        let mut out = source_bytes;
+        out.push(0);
+        engine
+            .mem_write(dest_ptr, &out)
+            .context("failed to write guest path")?;
+        let written = u64::try_from(path_len).context("path length does not fit u64")?;
+        Ok((written, false))
+    }
 }
 
-fn copy_wide_string_to_guest_buffer(
+/// Copy a NUL-terminated UTF-16 path into a guest buffer (WCHAR units).
+fn copy_path_w_to_guest_buffer(
     engine: &mut dyn wie_cpu::CpuEngine,
     source_ptr: u64,
     dest_ptr: u64,
     dest_len: u64,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     if dest_ptr == 0 || dest_len == 0 {
-        return Ok(0);
+        return Ok((0, false));
     }
 
     let dest_len_usize =
         usize::try_from(dest_len).context("wide guest buffer length does not fit usize")?;
 
-    let mut output_bytes = Vec::new();
-    let mut written_units = 0_u64;
-
-    for index in 0..dest_len_usize {
+    let mut units = Vec::new();
+    let max_scan = dest_len_usize.saturating_add(1).max(1);
+    for index in 0..max_scan {
         let index_u64 = u64::try_from(index).context("wide guest string index does not fit u64")?;
         let source_offset = index_u64
             .checked_mul(2)
             .context("wide guest string source offset overflow")?;
-
         let source_address =
             checked_address(source_ptr, source_offset, "wide guest source string")?;
         let unit = read_guest_u16(engine, source_address)?;
-
-        output_bytes.extend_from_slice(&unit.to_le_bytes());
-
         if unit == 0 {
             break;
         }
-
-        written_units = written_units
-            .checked_add(1)
-            .context("wide guest written unit count overflow")?;
+        units.push(unit);
     }
 
-    engine
-        .mem_write(dest_ptr, &output_bytes)
-        .context("failed to write wide guest buffer")?;
-
-    Ok(written_units)
+    let path_len = units.len();
+    let truncated = path_len >= dest_len_usize;
+    if truncated {
+        let keep = dest_len_usize.saturating_sub(1);
+        let mut out_units = units.get(..keep).unwrap_or(&[]).to_vec();
+        out_units.push(0);
+        let byte_cap = out_units.len().saturating_mul(2);
+        let mut bytes = Vec::with_capacity(byte_cap);
+        for unit in out_units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        engine
+            .mem_write(dest_ptr, &bytes)
+            .context("failed to write truncated wide guest path")?;
+        Ok((dest_len, true))
+    } else {
+        let mut out_units = units;
+        out_units.push(0);
+        let byte_cap = out_units.len().saturating_mul(2);
+        let mut bytes = Vec::with_capacity(byte_cap);
+        for unit in out_units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        engine
+            .mem_write(dest_ptr, &bytes)
+            .context("failed to write wide guest path")?;
+        let written = u64::try_from(path_len).context("wide path length does not fit u64")?;
+        Ok((written, false))
+    }
 }
 
 fn normalize_module_name(name: &str) -> String {
@@ -607,7 +637,10 @@ fn is_main_module_path(state: &WinApiState, path: &str) -> bool {
         || guest_basename(path).eq_ignore_ascii_case(&state.main_module_file_name)
 }
 
-fn resolve_module_handle(name: &str, main_image_base: u64, state: &WinApiState) -> u64 {
+/// Resolve a module that is considered already loaded (`GetModuleHandle*`).
+///
+/// Microsoft Learn: returns `NULL` when the named module is not in the process.
+fn resolve_loaded_module_handle(name: &str, main_image_base: u64, state: &WinApiState) -> u64 {
     if is_main_module_name(state, name) {
         return main_image_base;
     }
@@ -620,12 +653,67 @@ fn resolve_module_handle(name: &str, main_image_base: u64, state: &WinApiState) 
         "shell32.dll" => FAKE_SHELL32_MODULE,
         "comdlg32.dll" => FAKE_COMDLG32_MODULE,
         "winmm.dll" => FAKE_WINMM_MODULE,
-        _ => FAKE_GENERIC_MODULE,
+        // Not pre-loaded: GetModuleHandle must return NULL (LoadLibrary is separate).
+        _ => 0,
     }
 }
 
-fn fake_module_handle_for_name(name: &str, main_image_base: u64, state: &WinApiState) -> u64 {
-    resolve_module_handle(name, main_image_base, state)
+/// Resolve or synthesize a module handle for `LoadLibrary*` (prototype always “loads”).
+fn load_module_handle(name: &str, main_image_base: u64, state: &WinApiState) -> u64 {
+    let loaded = resolve_loaded_module_handle(name, main_image_base, state);
+    if loaded != 0 {
+        loaded
+    } else if name.trim().is_empty() {
+        0
+    } else {
+        FAKE_GENERIC_MODULE
+    }
+}
+
+/// Write an unlocked `RTL_CRITICAL_SECTION` (Win64 layout) at `critical_section_ptr`.
+fn write_critical_section_unlocked(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    critical_section_ptr: u64,
+    spin_count: u64,
+) -> Result<()> {
+    // RTL_CRITICAL_SECTION on Win64:
+    // +0x00 DebugInfo      pointer
+    // +0x08 LockCount      LONG, initialized to -1 (unlocked)
+    // +0x0c RecursionCount LONG
+    // +0x10 OwningThread   HANDLE
+    // +0x18 LockSemaphore  HANDLE
+    // +0x20 SpinCount      ULONG_PTR
+    write_guest_u64(
+        engine,
+        checked_field_address(critical_section_ptr, 0, "DebugInfo")?,
+        0,
+    )?;
+    write_guest_u32(
+        engine,
+        checked_field_address(critical_section_ptr, 8, "LockCount")?,
+        u32::MAX,
+    )?;
+    write_guest_u32(
+        engine,
+        checked_field_address(critical_section_ptr, 12, "RecursionCount")?,
+        0,
+    )?;
+    write_guest_u64(
+        engine,
+        checked_field_address(critical_section_ptr, 16, "OwningThread")?,
+        0,
+    )?;
+    write_guest_u64(
+        engine,
+        checked_field_address(critical_section_ptr, 24, "LockSemaphore")?,
+        0,
+    )?;
+    write_guest_u64(
+        engine,
+        checked_field_address(critical_section_ptr, 32, "SpinCount")?,
+        spin_count,
+    )?;
+    Ok(())
 }
 
 fn read_ansi_string_from_cpu(
@@ -944,18 +1032,35 @@ pub fn handle_get_current_thread_id(
 }
 
 /// Handles `KERNEL32.dll!HeapAlloc`.
+///
+/// Microsoft Learn (`heapapi.h`):
+/// - success → pointer to allocated block (at least `dwBytes`)
+/// - failure → `NULL` (does not call `SetLastError`)
+/// - `HEAP_ZERO_MEMORY` zeros the block
+/// - `dwBytes == 0` allocates a zero-length item and still returns a valid pointer
+///   (same practical behaviour as the Windows process heap / CRT `malloc(0)`)
 pub fn handle_heap_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let heap_handle = engine.read_rcx()?;
-    let _flags = engine.read_rdx()?;
+    let flags = engine.read_rdx()?;
     let size = engine.read_r8()?;
 
     let return_value = if heap_handle == 0 {
         0
     } else {
-        state.heap.alloc_coherent(engine, size)
+        // Zero-byte requests still need a live block (round-up in GuestHeap).
+        let alloc_size = if size == 0 { 1 } else { size };
+        let addr = state.heap.alloc_coherent(engine, alloc_size);
+        if addr != 0 && (flags & HEAP_ZERO_MEMORY) != 0 {
+            let zero_len = state.heap.size_of(addr).unwrap_or(alloc_size);
+            if let Ok(len) = usize::try_from(zero_len) {
+                let zeros = vec![0_u8; len];
+                engine.mem_write(addr, &zeros)?;
+            }
+        }
+        addr
     };
 
     let return_address = engine.return_from_win64_api(return_value)?;
@@ -967,6 +1072,10 @@ pub fn handle_heap_alloc(
 }
 
 /// Handles `KERNEL32.dll!HeapFree`.
+///
+/// Microsoft Learn: `lpMem` may be `NULL` (no-op, success). Double-free /
+/// unknown pointer fails with a non-zero last-error in this emulator
+/// (`ERROR_INVALID_HANDLE`) so freestanding tests can detect the failure.
 pub fn handle_heap_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -975,8 +1084,6 @@ pub fn handle_heap_free(
     let _flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
 
-    // HeapFree(NULL) → TRUE. Live block → TRUE. Double-free / unknown → FALSE +
-    // ERROR_INVALID_HANDLE (matches micro-exes/winapi_heap and MSVC heap checks).
     let ok = memory == 0 || state.heap.free_coherent(engine, memory);
     let return_value = if ok {
         1
@@ -994,22 +1101,26 @@ pub fn handle_heap_free(
 }
 
 /// Handles `KERNEL32.dll!HeapReAlloc`.
+///
+/// Microsoft Learn: preserves contents; failure leaves the original block valid
+/// and returns `NULL`. `dwBytes == 0` is treated as free + `NULL` (common Windows
+/// process-heap behaviour used by the micro-suite).
 pub fn handle_heap_realloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let heap_handle = engine.read_rcx()?;
-    let _flags = engine.read_rdx()?;
+    let flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
     let new_size = engine.read_r9()?;
 
-    // dwBytes == 0: free the block and return NULL (documented HeapReAlloc behaviour).
     let return_value = if heap_handle == 0 || memory == 0 {
         0
     } else if new_size == 0 {
         let _ = state.heap.free_coherent(engine, memory);
         0
     } else if let Some(same) = state.heap.try_realloc_in_place(memory, new_size) {
+        // In-place only succeeds when the block already fits; no new bytes to zero.
         same
     } else {
         let old_size = state
@@ -1025,6 +1136,7 @@ pub fn handle_heap_realloc(
             .unwrap_or(0);
         let new_addr = state.heap.alloc_coherent(engine, new_size);
         if new_addr == 0 {
+            // Failure must leave the original block live (Microsoft Learn).
             0
         } else {
             let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
@@ -1032,6 +1144,14 @@ pub fn handle_heap_realloc(
                 let mut bytes = vec![0_u8; copy_len];
                 engine.mem_read(memory, &mut bytes)?;
                 engine.mem_write(new_addr, &bytes)?;
+            }
+            if (flags & HEAP_ZERO_MEMORY) != 0 && new_size > old_size {
+                let zero_start = old_size;
+                let zero_len = usize::try_from(new_size.saturating_sub(old_size)).unwrap_or(0);
+                if zero_len > 0 {
+                    let zeros = vec![0_u8; zero_len];
+                    engine.mem_write(new_addr.wrapping_add(zero_start), &zeros)?;
+                }
             }
             let _ = state.heap.free_coherent(engine, memory);
             new_addr
@@ -1108,31 +1228,10 @@ pub fn handle_initialize_critical_section(
         .context("failed to read RCX for InitializeCriticalSection")?;
 
     if critical_section_ptr != 0 {
-        // RTL_CRITICAL_SECTION on Win64:
-        // +0x00 DebugInfo      pointer
-        // +0x08 LockCount      LONG, initialized to -1
-        // +0x0c RecursionCount LONG
-        // +0x10 OwningThread   HANDLE
-        // +0x18 LockSemaphore  HANDLE
-        // +0x20 SpinCount      ULONG_PTR
-        let debug_info_address = checked_field_address(critical_section_ptr, 0, "DebugInfo")?;
-        let lock_count_address = checked_field_address(critical_section_ptr, 8, "LockCount")?;
-        let recursion_count_address =
-            checked_field_address(critical_section_ptr, 12, "RecursionCount")?;
-        let owning_thread_address =
-            checked_field_address(critical_section_ptr, 16, "OwningThread")?;
-        let lock_semaphore_address =
-            checked_field_address(critical_section_ptr, 24, "LockSemaphore")?;
-        let spin_count_address = checked_field_address(critical_section_ptr, 32, "SpinCount")?;
-
-        write_guest_u64(engine, debug_info_address, 0)?;
-        write_guest_u32(engine, lock_count_address, u32::MAX)?;
-        write_guest_u32(engine, recursion_count_address, 0)?;
-        write_guest_u64(engine, owning_thread_address, 0)?;
-        write_guest_u64(engine, lock_semaphore_address, 0)?;
-        write_guest_u64(engine, spin_count_address, 0)?;
+        write_critical_section_unlocked(engine, critical_section_ptr, 0)?;
     }
 
+    // void return; RAX is unused but cleared for determinism.
     let return_address = engine
         .return_from_win64_api(0)
         .context("failed to return from InitializeCriticalSection")?;
@@ -1339,7 +1438,8 @@ pub fn handle_get_std_handle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
         STD_INPUT_HANDLE_ID => FAKE_STDIN_HANDLE,
         STD_OUTPUT_HANDLE_ID => FAKE_STDOUT_HANDLE,
         STD_ERROR_HANDLE_ID => FAKE_STDERR_HANDLE,
-        _ => 0,
+        // Microsoft Learn: invalid standard device → INVALID_HANDLE_VALUE.
+        _ => INVALID_HANDLE_VALUE,
     };
 
     let return_address = engine
@@ -1362,7 +1462,7 @@ pub fn handle_get_file_type(
         .context("failed to read RCX for GetFileType")?;
 
     let return_value = match handle {
-        STD_INPUT_HANDLE_VALUE | STD_OUTPUT_HANDLE_VALUE | STD_ERROR_HANDLE_VALUE => FILE_TYPE_CHAR,
+        FAKE_STDIN_HANDLE | FAKE_STDOUT_HANDLE | FAKE_STDERR_HANDLE => FILE_TYPE_CHAR,
         _ if is_open_file_handle(state, handle) => FILE_TYPE_DISK,
         _ => FILE_TYPE_UNKNOWN,
     };
@@ -1806,8 +1906,13 @@ pub fn handle_lc_map_string_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
 }
 
 /// Handles `KERNEL32.dll!GetModuleFileNameA`.
+///
+/// Microsoft Learn: returns character count excluding NUL. If the buffer is too
+/// small, the path is truncated (NUL-terminated), the return value is `nSize`,
+/// and last-error is `ERROR_INSUFFICIENT_BUFFER`.
 pub fn handle_get_module_file_name_a(
     engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
     module_file_name_a_ptr: u64,
 ) -> Result<WinApiHandlerResult> {
     let _module_handle = engine
@@ -1822,8 +1927,14 @@ pub fn handle_get_module_file_name_a(
         .read_r8()
         .context("failed to read R8 for GetModuleFileNameA")?;
 
-    let return_value =
-        copy_bytes_to_guest_buffer(engine, module_file_name_a_ptr, buffer_ptr, buffer_len)?;
+    let (return_value, truncated) =
+        copy_path_a_to_guest_buffer(engine, module_file_name_a_ptr, buffer_ptr, buffer_len)?;
+
+    state.last_error = if truncated {
+        ERROR_INSUFFICIENT_BUFFER
+    } else {
+        0
+    };
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1838,6 +1949,7 @@ pub fn handle_get_module_file_name_a(
 /// Handles `KERNEL32.dll!GetModuleFileNameW`.
 pub fn handle_get_module_file_name_w(
     engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
     module_file_name_w_ptr: u64,
 ) -> Result<WinApiHandlerResult> {
     let _module_handle = engine
@@ -1852,8 +1964,14 @@ pub fn handle_get_module_file_name_w(
         .read_r8()
         .context("failed to read R8 for GetModuleFileNameW")?;
 
-    let return_value =
-        copy_wide_string_to_guest_buffer(engine, module_file_name_w_ptr, buffer_ptr, buffer_len)?;
+    let (return_value, truncated) =
+        copy_path_w_to_guest_buffer(engine, module_file_name_w_ptr, buffer_ptr, buffer_len)?;
+
+    state.last_error = if truncated {
+        ERROR_INSUFFICIENT_BUFFER
+    } else {
+        0
+    };
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1917,17 +2035,30 @@ pub fn handle_heap_size(
 }
 
 /// Handles `KERNEL32.dll!LoadLibraryA`.
+///
+/// Microsoft Learn: empty / NULL name fails with `ERROR_MOD_NOT_FOUND`.
 pub fn handle_load_library_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let library_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryA")?;
 
-    let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
-    let return_value = fake_module_handle_for_name(&library_name, environment.image_base, state);
+    let return_value = if library_name_ptr == 0 {
+        state.last_error = ERROR_MOD_NOT_FOUND;
+        0
+    } else {
+        let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
+        let handle = load_module_handle(&library_name, environment.image_base, state);
+        if handle == 0 {
+            state.last_error = ERROR_MOD_NOT_FOUND;
+        } else {
+            state.last_error = 0;
+        }
+        handle
+    };
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -1943,14 +2074,25 @@ pub fn handle_load_library_a(
 pub fn handle_load_library_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let library_name_ptr = engine
         .read_rcx()
         .context("failed to read RCX for LoadLibraryW")?;
 
-    let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
-    let return_value = fake_module_handle_for_name(&library_name, environment.image_base, state);
+    let return_value = if library_name_ptr == 0 {
+        state.last_error = ERROR_MOD_NOT_FOUND;
+        0
+    } else {
+        let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
+        let handle = load_module_handle(&library_name, environment.image_base, state);
+        if handle == 0 {
+            state.last_error = ERROR_MOD_NOT_FOUND;
+        } else {
+            state.last_error = 0;
+        }
+        handle
+    };
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2115,7 +2257,7 @@ pub fn handle_find_first_file_w(
     let pattern = read_wide_string_from_cpu(engine, pattern_ptr, 1024)?;
 
     let return_value = if pattern.trim().is_empty() {
-        state.last_error = ERROR_FILE_NOT_FOUND_U32;
+        state.last_error = ERROR_FILE_NOT_FOUND;
         INVALID_HANDLE_VALUE
     } else {
         let file_name = fake_find_file_name_for_pattern(&pattern);
@@ -2167,7 +2309,7 @@ pub fn handle_find_first_file_a(
     let pattern = read_ansi_string_from_cpu(engine, pattern_ptr, 1024)?;
 
     let return_value = if pattern.trim().is_empty() {
-        state.last_error = ERROR_FILE_NOT_FOUND_U32;
+        state.last_error = ERROR_FILE_NOT_FOUND;
         INVALID_HANDLE_VALUE
     } else {
         let file_name = fake_find_file_name_for_pattern(&pattern);
@@ -2305,7 +2447,7 @@ pub fn handle_load_library_ex_a(
         .context("failed to read R8 for LoadLibraryExA")?;
 
     let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
-    let return_value = fake_module_handle_for_name(&library_name, environment.image_base, state);
+    let return_value = load_module_handle(&library_name, environment.image_base, state);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2336,7 +2478,7 @@ pub fn handle_load_library_ex_w(
         .context("failed to read R8 for LoadLibraryExW")?;
 
     let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
-    let return_value = fake_module_handle_for_name(&library_name, environment.image_base, state);
+    let return_value = load_module_handle(&library_name, environment.image_base, state);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2735,6 +2877,10 @@ fn finish_create_file(
 }
 
 /// Handles `KERNEL32.dll!CloseHandle`.
+///
+/// Microsoft Learn: success → nonzero; failure → zero + last-error.
+/// `NULL` / `INVALID_HANDLE_VALUE` fail with `ERROR_INVALID_HANDLE`.
+/// Open guest files are flushed to the virtual store / bottle host path.
 pub fn handle_close_handle(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -2743,23 +2889,34 @@ pub fn handle_close_handle(
         .read_rcx()
         .context("failed to read RCX for CloseHandle")?;
 
-    // Flush written bytes to virtual store and/or bottle host path.
-    if let Some(open_file) = find_open_file(state, handle) {
-        let path = open_file.path.clone();
-        sync_open_bytes_to_virtual(state, &path, handle);
-    }
-    persist_open_file_to_host(state, handle);
-
-    let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
-    state.open_files.remove(&handle);
+    let return_value = if handle == 0 || handle == INVALID_HANDLE_VALUE {
+        state.last_error = ERROR_INVALID_HANDLE;
+        0
+    } else if is_open_file_handle(state, handle) {
+        // Flush written bytes to virtual store and/or bottle host path.
+        if let Some(open_file) = find_open_file(state, handle) {
+            let path = open_file.path.clone();
+            sync_open_bytes_to_virtual(state, &path, handle);
+        }
+        persist_open_file_to_host(state, handle);
+        let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
+        state.open_files.remove(&handle);
+        state.last_error = 0;
+        1
+    } else {
+        // Console / module / other fake kernel objects: accept and no-op so
+        // CRT and UI stubs that close non-file handles keep working.
+        state.last_error = 0;
+        1
+    };
 
     let return_address = engine
-        .return_from_win64_api(1)
+        .return_from_win64_api(return_value)
         .context("failed to return from CloseHandle")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value,
     })
 }
 
@@ -2806,7 +2963,11 @@ pub fn handle_get_file_information_by_handle(
         let file_size =
             u64::try_from(open_file.bytes.len()).context("open file size does not fit u64")?;
 
-        write_guest_u32(engine, attributes_address, FILE_ATTRIBUTE_ARCHIVE_U32)?;
+        write_guest_u32(
+            engine,
+            attributes_address,
+            u32::try_from(FILE_ATTRIBUTE_ARCHIVE).unwrap_or(0x20),
+        )?;
         write_guest_u64(engine, creation_time_address, FIXED_SYSTEM_FILETIME)?;
         write_guest_u64(engine, last_access_time_address, FIXED_SYSTEM_FILETIME)?;
         write_guest_u64(engine, last_write_time_address, FIXED_SYSTEM_FILETIME)?;
@@ -3605,6 +3766,8 @@ pub fn handle_decode_pointer(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinA
 }
 
 /// Handles dynamic `KERNEL32.dll!InitializeCriticalSectionAndSpinCount`.
+///
+/// Microsoft Learn: returns nonzero on success; stores the spin count in the CS.
 pub fn handle_initialize_critical_section_and_spin_count(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
@@ -3612,48 +3775,12 @@ pub fn handle_initialize_critical_section_and_spin_count(
         .read_rcx()
         .context("failed to read RCX for InitializeCriticalSectionAndSpinCount")?;
 
-    let _spin_count = engine
+    let spin_count = engine
         .read_rdx()
         .context("failed to read RDX for InitializeCriticalSectionAndSpinCount")?;
 
     if critical_section_ptr != 0 {
-        // RTL_CRITICAL_SECTION approximation:
-        // DebugInfo      offset 0
-        // LockCount      offset 8
-        // RecursionCount offset 12
-        // OwningThread   offset 16
-        // LockSemaphore  offset 24
-        // SpinCount      offset 32
-        write_guest_u64(
-            engine,
-            checked_field_address(critical_section_ptr, 0, "DebugInfo")?,
-            0,
-        )?;
-        write_guest_u32(
-            engine,
-            checked_field_address(critical_section_ptr, 8, "LockCount")?,
-            u32::MAX,
-        )?;
-        write_guest_u32(
-            engine,
-            checked_field_address(critical_section_ptr, 12, "RecursionCount")?,
-            0,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(critical_section_ptr, 16, "OwningThread")?,
-            0,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(critical_section_ptr, 24, "LockSemaphore")?,
-            0,
-        )?;
-        write_guest_u64(
-            engine,
-            checked_field_address(critical_section_ptr, 32, "SpinCount")?,
-            0,
-        )?;
+        write_critical_section_unlocked(engine, critical_section_ptr, spin_count)?;
     }
 
     let return_address = engine
@@ -3675,6 +3802,11 @@ pub fn handle_read_file(
     let buffer_ptr = engine.read_rdx()?;
     let bytes_to_read = engine.read_r8()?;
     let bytes_read_ptr = engine.read_r9()?;
+
+    // Microsoft Learn: sets *lpNumberOfBytesRead to zero before any work/error check.
+    if bytes_read_ptr != 0 {
+        write_guest_u32(engine, bytes_read_ptr, 0)?;
+    }
 
     let success = buffer_ptr != 0 && is_open_file_handle(state, handle);
 
@@ -3733,9 +3865,6 @@ pub fn handle_read_file(
         state.last_error = 0;
         let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
     } else {
-        if bytes_read_ptr != 0 {
-            write_guest_u32(engine, bytes_read_ptr, 0)?;
-        }
         state.last_error = ERROR_INVALID_HANDLE;
     }
 
@@ -3768,6 +3897,11 @@ pub fn handle_write_file(
     let bytes_written_ptr = engine
         .read_r9()
         .context("failed to read R9 for WriteFile")?;
+
+    // Mirror ReadFile: zero the optional out-count before validation.
+    if bytes_written_ptr != 0 {
+        write_guest_u32(engine, bytes_written_ptr, 0)?;
+    }
 
     let success = buffer_ptr != 0 && is_open_file_handle(state, handle);
 
@@ -3853,11 +3987,6 @@ pub fn handle_write_file(
             requested = bytes_to_write,
             "WriteFile invalid handle"
         );
-
-        if bytes_written_ptr != 0 {
-            write_guest_u32(engine, bytes_written_ptr, 0)?;
-        }
-
         state.last_error = ERROR_INVALID_HANDLE;
     }
 

@@ -40,8 +40,8 @@ use lower::{
     compile_block, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_load, wie_jit_store,
     wie_jit_string,
 };
-use trampolines::match_micro_stub;
 use std::collections::HashMap;
+use trampolines::match_micro_stub;
 
 /// Compile after this many visits to the same guest entry (skip cold code).
 /// Higher values cut compile tax on open-rom (mem/push coverage widens Pure set).
@@ -374,12 +374,7 @@ impl JitCpu {
                     };
                     self.stats.compiles = self.stats.compiles.saturating_add(1);
                     let fn_ptr = compiled.func as usize as u64;
-                    chain_table_insert(
-                        self.chain_va.as_mut(),
-                        self.chain_fn.as_mut(),
-                        rip,
-                        fn_ptr,
-                    );
+                    chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), rip, fn_ptr);
                     tracing::debug!(
                         start = format_args!("{rip:#x}"),
                         insns = compiled.insn_count,
@@ -408,14 +403,7 @@ impl JitCpu {
                 } = self;
                 let eng = engine.as_mut()?;
                 match compile_block(
-                    eng,
-                    rip,
-                    &insns,
-                    end_rip,
-                    term,
-                    call_fast,
-                    chain_ids,
-                    bytes_len,
+                    eng, rip, &insns, end_rip, term, call_fast, chain_ids, bytes_len,
                 ) {
                     Ok(compiled) => {
                         stats.compiles = stats.compiles.saturating_add(1);
@@ -452,7 +440,10 @@ impl JitCpu {
         if let Some(inv) = self.run_compiled(entry_rip, meta) {
             (StepResult::InvalidMemory(inv), 0)
         } else {
-            self.stats.jit_insns = self.stats.jit_insns.saturating_add(u64::from(meta.insn_count));
+            self.stats.jit_insns = self
+                .stats
+                .jit_insns
+                .saturating_add(u64::from(meta.insn_count));
             (
                 StepResult::Continue,
                 usize::try_from(meta.insn_count).unwrap_or(1),
@@ -461,11 +452,7 @@ impl JitCpu {
     }
 
     /// Returns `Some(InvalidMem)` when a host mem helper faulted.
-    fn run_compiled(
-        &mut self,
-        entry_rip: u64,
-        meta: CompiledRunMeta,
-    ) -> Option<exec::InvalidMem> {
+    fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
         let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
         let regs = self.iced.regs_mut();
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from

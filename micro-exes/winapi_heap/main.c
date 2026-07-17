@@ -48,15 +48,24 @@ void entry(void) {
   CHECK(result == 0, 9);
   CHECK(GetLastError() != 0, 10);
 
-  // 9. HeapAlloc с нулевым размером – возвращает NULL (документировано)
+  // 9. HeapAlloc with dwBytes==0 still returns a valid pointer (process heap /
+  //    Microsoft Learn practical behaviour; freeable like any other block).
   p = HeapAlloc(heap, 0, 0);
-  CHECK(p == NULL, 11);
+  CHECK(p != NULL, 11);
+  CHECK(HeapFree(heap, 0, p) != 0, 12);
 
-  // 10. HeapReAlloc с нулевым размером – освобождает блок и возвращает NULL
+  // 10. HeapReAlloc with dwBytes==0 frees the block and returns NULL.
   q = HeapAlloc(heap, 0, 64);
-  CHECK(q != NULL, 12);
+  CHECK(q != NULL, 13);
   p = HeapReAlloc(heap, 0, q, 0);
-  CHECK(p == NULL, 13);
+  CHECK(p == NULL, 14);
+
+  // 11. HEAP_ZERO_MEMORY clears the payload.
+  p = HeapAlloc(heap, HEAP_ZERO_MEMORY, 32);
+  CHECK(p != NULL, 15);
+  CHECK(*(volatile unsigned char *)p == 0, 16);
+  CHECK(*((volatile unsigned char *)p + 31) == 0, 17);
+  CHECK(HeapFree(heap, 0, p) != 0, 18);
 
   ExitProcess(0);
 }
