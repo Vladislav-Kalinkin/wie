@@ -706,6 +706,12 @@ impl CpuEngine for JitCpu {
         self.invalidate_chain_and_shadow();
     }
 
+    fn precompile_at(&mut self, address: u64) {
+        if self.engine.is_some() {
+            let _ = self.try_compile(address);
+        }
+    }
+
     fn run_until_stop(
         &mut self,
         begin: u64,

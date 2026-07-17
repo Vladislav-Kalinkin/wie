@@ -1954,18 +1954,29 @@ pub fn handle_load_library_w(
 }
 
 /// Handles `KERNEL32.dll!FreeLibrary`.
-pub fn handle_free_library(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _module_handle = engine
+pub fn handle_free_library(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let module_handle = engine
         .read_rcx()
         .context("failed to read RCX for FreeLibrary")?;
 
+    // Return TRUE if handle is non-zero (valid-looking module handle).
+    let return_value = u64::from(module_handle != 0);
+    state.last_error = if module_handle == 0 {
+        ERROR_INVALID_HANDLE
+    } else {
+        0
+    };
+
     let return_address = engine
-        .return_from_win64_api(1)
+        .return_from_win64_api(return_value)
         .context("failed to return from FreeLibrary")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value,
     })
 }
 
@@ -2007,7 +2018,7 @@ pub fn handle_get_proc_address(
         state.get_proc_address_cache.insert(
             name_key,
             crate::GetProcAddressCacheEntry {
-                name: proc_name.clone(),
+                name: proc_name.clone().into(),
                 module_handle,
                 address,
                 hit_count: 1,
@@ -2188,7 +2199,7 @@ pub fn handle_find_next_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _find_handle = engine
+    let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindNextFileW")?;
 
@@ -2196,7 +2207,12 @@ pub fn handle_find_next_file_w(
         .read_rdx()
         .context("failed to read RDX for FindNextFileW")?;
 
-    state.last_error = ERROR_NO_MORE_FILES;
+    let valid = state.find_handles.iter().any(|h| h.handle == find_handle);
+    state.last_error = if valid {
+        ERROR_NO_MORE_FILES
+    } else {
+        ERROR_INVALID_HANDLE
+    };
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -2213,7 +2229,7 @@ pub fn handle_find_next_file_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _find_handle = engine
+    let find_handle = engine
         .read_rcx()
         .context("failed to read RCX for FindNextFileA")?;
 
@@ -2221,7 +2237,12 @@ pub fn handle_find_next_file_a(
         .read_rdx()
         .context("failed to read RDX for FindNextFileA")?;
 
-    state.last_error = ERROR_NO_MORE_FILES;
+    let valid = state.find_handles.iter().any(|h| h.handle == find_handle);
+    state.last_error = if valid {
+        ERROR_NO_MORE_FILES
+    } else {
+        ERROR_INVALID_HANDLE
+    };
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -2698,11 +2719,7 @@ fn finish_create_file(
             handle = return_value,
             "{api_name}"
         );
-        if let Some(file) = find_open_file(state, return_value) {
-            let bytes = file.bytes.clone();
-            let _ =
-                crate::guest_io_host::register_open_file(engine, state, return_value, &bytes).ok();
-        }
+        let _ = crate::guest_io_host::register_open_file(engine, state, return_value).ok();
     }
 
     return_value
@@ -2725,7 +2742,7 @@ pub fn handle_close_handle(
     persist_open_file_to_host(state, handle);
 
     let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
-    state.open_files.retain(|file| file.handle != handle);
+    state.open_files.remove(&handle);
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -2833,19 +2850,16 @@ fn paths_match_guest(requested: &str, candidate: &str) -> bool {
         || guest_basename(&requested_norm) == guest_basename(&candidate_norm)
 }
 
-fn find_open_file_mut(state: &mut WinApiState, handle: u64) -> Option<&mut OpenGuestFile> {
-    state
-        .open_files
-        .iter_mut()
-        .find(|file| file.handle == handle)
+fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
+    state.open_files.get(&handle)
 }
 
-fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
-    state.open_files.iter().find(|file| file.handle == handle)
+fn find_open_file_mut(state: &mut WinApiState, handle: u64) -> Option<&mut OpenGuestFile> {
+    state.open_files.get_mut(&handle)
 }
 
 fn is_open_file_handle(state: &WinApiState, handle: u64) -> bool {
-    find_open_file(state, handle).is_some()
+    state.open_files.contains_key(&handle)
 }
 
 /// Opens a guest path using the same resolution rules as `CreateFile*`.
@@ -3082,15 +3096,18 @@ fn allocate_open_file(
         .checked_add(1)
         .context("guest file handle allocator overflow")?;
 
-    state.open_files.push(OpenGuestFile {
+    state.open_files.insert(
         handle,
-        path: path.to_owned(),
-        bytes,
-        cursor: 0,
-        host_path,
-        guest_data_va: None,
-        guest_slot_index: None,
-    });
+        OpenGuestFile {
+            handle,
+            path: path.to_owned(),
+            bytes,
+            cursor: 0,
+            host_path,
+            guest_data_va: None,
+            guest_slot_index: None,
+        },
+    );
 
     // Keep legacy single-handle fields in sync when opening the main executable.
     if is_main_module_path(state, path) {
@@ -4133,7 +4150,11 @@ fn handle_tls_free(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _index = engine.read_rcx()?;
+    let index_raw = engine.read_rcx()?;
+    let index = usize::try_from(index_raw).unwrap_or(usize::MAX);
+    if let Some(slot) = state.tls_slots.get_mut(index) {
+        *slot = 0;
+    }
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?;
     Ok(WinApiHandlerResult {

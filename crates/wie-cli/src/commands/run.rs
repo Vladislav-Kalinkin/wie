@@ -4,7 +4,6 @@ use super::util::write_entry_trace_summary;
 use anyhow::{Result, bail};
 use std::io;
 use std::path::Path;
-
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
 pub(crate) fn run_micro(
     path: &Path,
@@ -35,7 +34,7 @@ pub(crate) fn run_micro(
     for event in &summary.run.events {
         println!(
             "  [{:>4}] {}!{} handled={} ret={:?}",
-            event.index, event.library, event.name, event.handled, event.return_value
+            event.index, event.library.as_ref(), event.name.as_ref(), event.handled, event.return_value
         );
     }
 

@@ -7,7 +7,6 @@
 #![allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects,
     clippy::indexing_slicing, // fixed-size PT_SIZE arrays, masked indices
     unsafe_code // page-table raw pointers for Drop + install
 )]
@@ -223,7 +222,7 @@ impl GuestMemory {
             let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
                 CpuError::Message("page offset does not fit usize".into())
             })?;
-            let page = self.pages.get_mut(&pkey).ok_or_else(|| {
+            let page = self.page_data_mut(pkey).ok_or_else(|| {
                 CpuError::Message(format!("mem_write unmapped {va:#x}"))
             })?;
             let room = (PAGE_SIZE as usize).saturating_sub(page_off);
@@ -232,11 +231,7 @@ impl GuestMemory {
             let src = bytes
                 .get(offset..offset.saturating_add(chunk))
                 .ok_or_else(|| CpuError::Message("mem_write slice OOB".into()))?;
-            let dst = page
-                .data
-                .get_mut(page_off..page_off.saturating_add(chunk))
-                .ok_or_else(|| CpuError::Message("mem_write page OOB".into()))?;
-            dst.copy_from_slice(src);
+            page[page_off..page_off.saturating_add(chunk)].copy_from_slice(src);
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
             // PT already points at page data (Box heap ptr is stable across HashMap moves).
@@ -256,20 +251,16 @@ impl GuestMemory {
             let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
                 CpuError::Message("page offset does not fit usize".into())
             })?;
-            let page = self.pages.get(&pkey).ok_or_else(|| {
+            let page = self.page_data_ref(pkey).ok_or_else(|| {
                 CpuError::Message(format!("mem_read unmapped {va:#x}"))
             })?;
             let room = (PAGE_SIZE as usize).saturating_sub(page_off);
             let remaining = bytes.len().saturating_sub(offset);
             let chunk = room.min(remaining);
-            let src = page
-                .data
-                .get(page_off..page_off.saturating_add(chunk))
-                .ok_or_else(|| CpuError::Message("mem_read page OOB".into()))?;
             let dst = bytes
                 .get_mut(offset..offset.saturating_add(chunk))
                 .ok_or_else(|| CpuError::Message("mem_read slice OOB".into()))?;
-            dst.copy_from_slice(src);
+            dst.copy_from_slice(&page[page_off..page_off.saturating_add(chunk)]);
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
         }
@@ -289,6 +280,25 @@ impl GuestMemory {
         };
         self.install_pt(page_key, ptr);
         Some(ptr)
+    }
+
+    /// Shared reference to a mapped page's data via radix-page-table walk
+    /// (4 pointer loads, no HashMap).  Safe wrapper around [`page_data_ptr_walk`].
+    fn page_data_ref(&self, page_key: u64) -> Option<&[u8; PAGE_SIZE as usize]> {
+        let ptr = self.page_data_ptr_walk(page_key)?;
+        // SAFETY: `ptr` was installed by `install_pt` from a `Box<[u8; PAGE_SIZE]>`.
+        // It remains valid for the lifetime of `self` because `GuestMemory` owns
+        // the backing `pages` HashMap and never deallocates individual pages.
+        // There is no mutable aliasing through `&self`.
+        Some(unsafe { &*ptr.cast::<[u8; PAGE_SIZE as usize]>() })
+    }
+
+    /// Mutable reference to a mapped page's data via radix-page-table walk
+    /// (4 pointer loads, no HashMap).  Safe wrapper around [`page_data_ptr_walk`].
+    fn page_data_mut(&mut self, page_key: u64) -> Option<&mut [u8; PAGE_SIZE as usize]> {
+        let ptr = self.page_data_ptr_walk(page_key)?;
+        // SAFETY: same as `page_data_ref`, and `&mut self` guarantees unique access.
+        Some(unsafe { &mut *ptr.cast::<[u8; PAGE_SIZE as usize]>() })
     }
 
     /// Fast page-table walk (no HashMap). Used by JIT host helper and tests.
@@ -345,7 +355,7 @@ impl GuestMemory {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
 

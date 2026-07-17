@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
+use std::sync::Arc;
 use wie_winapi::{resolve_winapi_id, WinApiId, WinApiTraits};
 
 /// Runtime fake API dispatch entry.
@@ -11,10 +12,10 @@ pub struct RuntimeFakeApiEntry {
     pub fake_target_va: u64,
 
     /// Imported library name.
-    pub library: String,
+    pub library: Arc<str>,
 
     /// Imported function name.
-    pub name: String,
+    pub name: Arc<str>,
 
     /// Runtime `IAT` slot virtual address.
     pub iat_slot_va: u64,
@@ -51,8 +52,8 @@ fn make_entry(
 
     RuntimeFakeApiEntry {
         fake_target_va,
-        library,
-        name,
+        library: library.into(),
+        name: name.into(),
         iat_slot_va,
         winapi_id,
         traits,

@@ -8,6 +8,7 @@ use crate::memory::{
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Saved frame for one in-flight guest window-procedure call.
@@ -18,9 +19,9 @@ struct PendingGuestCallback {
     /// Original callback request metadata.
     request: wie_winapi::GuestCallbackRequest,
     /// Outer host API that requested the callback (`DispatchMessageA`, `SendMessageA`, …).
-    outer_library: String,
+    outer_library: Arc<str>,
     /// Outer host API export name.
-    outer_name: String,
+    outer_name: Arc<str>,
     /// Fake VA of the outer host API entry.
     outer_fake_va: u64,
     /// When set, outer API is `CreateWindowEx*` and must return this HWND
@@ -31,7 +32,9 @@ struct PendingGuestCallback {
 /// Host-side timing breakdown for one session (enabled via `WIE_RUNTIME_PROFILE=1`).
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeProfile {
-    /// Wall time spent inside Unicorn `emu_start` (guest instruction execution).
+    /// Wall time spent in session init (PE loading, patch, pre-compilation).
+    pub init_ns: u128,
+    /// Wall time spent inside `run_until_stop` (guest instruction execution).
     pub emu_ns: u128,
     /// Wall time spent in WinAPI handlers / dispatch / return_from_win64_api.
     pub handler_ns: u128,
@@ -69,7 +72,7 @@ impl RuntimeProfile {
             self.host_stops, self.noisy_calls, self.charged_calls
         ));
         lines.push(format!(
-            "emu_ms={:.2} ({:.1}%)  handler_ms={:.2} ({:.1}%)  resolve_ms={:.2} ({:.1}%)  total_accounted_ms={:.2}",
+            "emu_ms={:.2} ({:.1}%)  handler_ms={:.2} ({:.1}%)  resolve_ms={:.2} ({:.1}%)  total_accounted_ms={:.2}  init_ms={:.2}",
             self.emu_ns as f64 / 1e6,
             pct(self.emu_ns),
             self.handler_ns as f64 / 1e6,
@@ -77,6 +80,7 @@ impl RuntimeProfile {
             self.resolve_ns as f64 / 1e6,
             pct(self.resolve_ns),
             total as f64 / 1e6,
+            self.init_ns as f64 / 1e6,
         ));
         let mut ranked: Vec<_> = self.by_export.iter().collect();
         ranked.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)));
@@ -201,6 +205,7 @@ impl RuntimeSession {
         idle_policy: wie_winapi::MessageQueueIdlePolicy,
         layout: RuntimeMemoryLayout,
     ) -> Result<Self> {
+        let t_init = Instant::now();
         let (image, image_summary, patched_imports) =
             wie_pe::build_loaded_image_with_fake_imports(path)?;
 
@@ -356,7 +361,13 @@ impl RuntimeSession {
 
         engine
             .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
-            .context("failed to install persistent Unicorn runtime hooks")?;
+            .context("failed to install persistent runtime hooks")?;
+
+        // Pre-compile all known fake-API stubs so they are Ready in the JIT
+        // cache when first hit, avoiding the cold-start compilation tax.
+        for entry in &fake_api_entries {
+            engine.precompile_at(entry.fake_target_va);
+        }
 
         engine
             .mem_map(layout.stack_base, layout.stack_size, wie_cpu::perm::ALL)
@@ -513,7 +524,7 @@ impl RuntimeSession {
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
 
-        Ok(Self::from_init(SessionInit {
+        let mut session = Self::from_init(SessionInit {
             engine,
             environment,
             winapi_state,
@@ -522,7 +533,11 @@ impl RuntimeSession {
             layout,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
-        }))
+        });
+        if session.profile_enabled {
+            session.profile.init_ns = t_init.elapsed().as_nanos();
+        }
+        Ok(session)
     }
 
     /// Returns the PE entry-point address associated with this session.
@@ -647,7 +662,7 @@ impl RuntimeSession {
                         .ok()
                         .map(|()| u64::from_le_bytes(slot));
                     let last_api = match events.last() {
-                        Some(e) => format!("{}!{}", e.library, e.name),
+                        Some(e) => format!("{}!{}", e.library.as_ref(), e.name.as_ref()),
                         None => "-".into(),
                     };
                     termination = EntryTraceTermination::RuntimeStop(format!(
@@ -822,7 +837,7 @@ impl RuntimeSession {
             }
 
             let export_key = if self.profile_enabled {
-                Some(format!("{}!{}", resolved.library, resolved.name))
+                Some(format!("{}!{}", resolved.library.as_ref(), resolved.name.as_ref()))
             } else {
                 None
             };
@@ -988,7 +1003,7 @@ impl RuntimeSession {
                     let j_retaddr = handler_result.return_address;
                     self.publish_last_error_to_guest();
                     // WIE_API_JOURNAL=path — one line per host return for dual-backend diff.
-                    journal_api_return(index, &j_lib, &j_name, &mut self.engine, j_ret, j_retaddr);
+                    journal_api_return(index, j_lib.as_ref(), j_name.as_ref(), &mut self.engine, j_ret, j_retaddr);
                 }
 
                 Err(error) => {
@@ -1055,7 +1070,7 @@ impl RuntimeSession {
                         }
 
                         None => {
-                            let api = format!("{}!{}: {error}", resolved.library, resolved.name,);
+                            let api = format!("{}!{}: {error}", resolved.library.as_ref(), resolved.name.as_ref(),);
 
                             events.push(EntryTraceEvent {
                                 index,
@@ -1188,8 +1203,7 @@ impl RuntimeSession {
         let file = self
             .winapi_state
             .open_files
-            .iter()
-            .find(|file| file.handle == handle)
+            .get(&handle)
             .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
 
         u64::try_from(file.bytes.len()).context("guest file size does not fit u64")
@@ -1200,8 +1214,7 @@ impl RuntimeSession {
         let file = self
             .winapi_state
             .open_files
-            .iter()
-            .find(|file| file.handle == handle)
+            .get(&handle)
             .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
 
         let end = offset
@@ -1224,9 +1237,9 @@ impl RuntimeSession {
         self.winapi_state
             .open_files
             .iter()
-            .filter_map(|file| {
+            .filter_map(|(&handle, file)| {
                 let size = u64::try_from(file.bytes.len()).ok()?;
-                Some((file.handle, file.path.clone(), size))
+                Some((handle, file.path.clone(), size))
             })
             .collect()
     }
@@ -1259,8 +1272,8 @@ impl RuntimeSession {
         self.pending_callbacks.push(PendingGuestCallback {
             dispatch_rsp,
             request,
-            outer_library: outer_library.to_owned(),
-            outer_name: outer_name.to_owned(),
+            outer_library: outer_library.into(),
+            outer_name: outer_name.into(),
             outer_fake_va,
             create_window_hwnd,
         });
@@ -1282,7 +1295,7 @@ impl RuntimeSession {
         )?;
 
         tracing::debug!(
-            outer = %format!("{}!{}", pending.outer_library, pending.outer_name),
+            outer = %format!("{}!{}", pending.outer_library.as_ref(), pending.outer_name.as_ref()),
             callback = pending.request.callback_address,
             hwnd = pending.request.window_handle,
             message = pending.request.message,
@@ -1303,8 +1316,8 @@ impl RuntimeSession {
 
 /// Result of finishing one bridged guest WndProc call.
 struct GuestCallbackCompletion {
-    outer_library: String,
-    outer_name: String,
+    outer_library: Arc<str>,
+    outer_name: Arc<str>,
     outer_fake_va: u64,
     return_value: u64,
     return_address: u64,

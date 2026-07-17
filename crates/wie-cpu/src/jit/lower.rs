@@ -1,12 +1,9 @@
 //! Lower pure-GPR (+ simple mem / jcc) blocks to Cranelift IR and finalize host code.
+//!
+//! Cast/index/arithmetic allows shared with other JIT modules live on `jit/mod.rs`.
 
 #![allow(
-    clippy::indexing_slicing, // fixed gpr[0..16] / TLB ways
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
+    clippy::cast_possible_wrap, // mem width / offset → i32 for Cranelift
     clippy::many_single_char_names, // flag temps d/s/r in flags_* helpers
     clippy::too_many_arguments
 )]

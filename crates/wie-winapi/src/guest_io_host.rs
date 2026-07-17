@@ -15,18 +15,29 @@ pub const GUEST_IO_SLOT_SIZE: usize = 40;
 pub const GUEST_IO_FLAG_VALID: u64 = 1;
 
 /// Publishes an open file into the guest handle table and file-data arena.
+///
+/// Looks up the file content inside `state` to avoid the caller having to clone
+/// the (potentially large) byte Vec across a borrow boundary.
 pub fn register_open_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
     handle: u64,
-    bytes: &[u8],
 ) -> Result<()> {
     let Some(cfg) = state.guest_io.clone() else {
         return Ok(());
     };
 
-    let size = u64::try_from(bytes.len()).context("file size does not fit u64")?;
-    let aligned_size = size.wrapping_add(15) & !15_u64;
+    let size = match state.open_files.get(&handle) {
+        Some(f) => f.bytes.len(),
+        None => return Ok(()),
+    };
+
+    if size == 0 {
+        return Ok(());
+    }
+
+    let size_u64 = u64::try_from(size).context("file size does not fit u64")?;
+    let aligned_size = size_u64.wrapping_add(15) & !15_u64;
     let data_va = state.guest_file_data_next;
     let file_end = cfg
         .file_data_base
@@ -40,9 +51,9 @@ pub fn register_open_file(
         return Ok(());
     }
 
-    if !bytes.is_empty() {
+    if let Some(file) = state.open_files.get(&handle) {
         engine
-            .mem_write(data_va, bytes)
+            .mem_write(data_va, &file.bytes)
             .context("failed to mirror file bytes into guest I/O arena")?;
     }
 
@@ -69,13 +80,13 @@ pub fn register_open_file(
     };
     write_u64(engine, slot_va, handle)?;
     write_u64(engine, slot_va.wrapping_add(8), data_va)?;
-    write_u64(engine, slot_va.wrapping_add(16), size)?;
+    write_u64(engine, slot_va.wrapping_add(16), size_u64)?;
     write_u64(engine, slot_va.wrapping_add(24), 0)?;
     write_u64(engine, slot_va.wrapping_add(32), GUEST_IO_FLAG_VALID)?;
 
     state.guest_file_data_next = new_next;
 
-    if let Some(file) = state.open_files.iter_mut().find(|f| f.handle == handle) {
+    if let Some(file) = state.open_files.get_mut(&handle) {
         file.guest_data_va = Some(data_va);
         file.guest_slot_index = Some(u32::try_from(i).unwrap_or(u32::MAX));
     }
@@ -104,7 +115,7 @@ pub fn unregister_open_file(
             break;
         }
     }
-    if let Some(file) = state.open_files.iter_mut().find(|f| f.handle == handle) {
+    if let Some(file) = state.open_files.get_mut(&handle) {
         file.guest_data_va = None;
         file.guest_slot_index = None;
     }
@@ -117,7 +128,7 @@ pub fn sync_slot_from_host(
     state: &WinApiState,
     handle: u64,
 ) -> Result<()> {
-    let Some(file) = state.open_files.iter().find(|f| f.handle == handle) else {
+    let Some(file) = state.open_files.get(&handle) else {
         return Ok(());
     };
     let Some(slot_i) = file.guest_slot_index else {
@@ -164,7 +175,7 @@ pub fn sync_host_cursor_from_guest(
     let Some(cfg) = state.guest_io.clone() else {
         return Ok(());
     };
-    let Some(file) = state.open_files.iter_mut().find(|f| f.handle == handle) else {
+    let Some(file) = state.open_files.get_mut(&handle) else {
         return Ok(());
     };
     let Some(slot_i) = file.guest_slot_index else {

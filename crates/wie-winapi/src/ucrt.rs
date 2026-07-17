@@ -8,9 +8,7 @@
 
 #![allow(
     clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
+    clippy::cast_sign_loss // libc / CRT status values i32 → u64
 )]
 
 use crate::{WinApiEnvironment, WinApiHandlerResult, WinApiState};
@@ -156,7 +154,7 @@ fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
             break;
         };
         // SAFETY: `chunk` is a valid contiguous slice; write does not retain the pointer.
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code)]
         let n = unsafe {
             libc::write(
                 fd,

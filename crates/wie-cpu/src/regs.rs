@@ -2,9 +2,7 @@
 
 #![allow(
     clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects
+    clippy::cast_possible_truncation // GPR width narrowing (u64 → u8/u16/u32)
 )]
 
 use crate::CpuError;

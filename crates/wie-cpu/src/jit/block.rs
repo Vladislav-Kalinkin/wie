@@ -76,6 +76,13 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
         let next = instr.next_ip();
 
         if let Some(t) = classify_terminator(&instr) {
+            // Unconditional jmp to the very next instruction: treat as no-op
+            // and keep decoding to merge the fallthrough block into this one.
+            if matches!(t, BlockTerm::Jmp { target } if target == next) {
+                rip = next;
+                bytes_len = bytes_len.saturating_add(len_u32);
+                continue;
+            }
             insns.push(DecodedInsn { instr });
             bytes_len = bytes_len.saturating_add(len_u32);
             term = Some(t);

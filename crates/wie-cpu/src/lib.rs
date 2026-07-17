@@ -106,6 +106,10 @@ pub trait CpuEngine {
     /// Configure JIT direct-UCRT / heap fast path (no-op for non-JIT backends).
     fn configure_jit_fast_path(&mut self, _cfg: JitFastPathConfig) {}
 
+    /// Eagerly compile guest code at `address` into the JIT cache.
+    /// No-op for non-JIT backends or when the block is not compilable.
+    fn precompile_at(&mut self, _address: u64) {}
+
     /// Run until a stop-bitmap hit, invalid memory, or instruction budget.
     ///
     /// # Errors
@@ -180,6 +184,9 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn configure_jit_fast_path(&mut self, cfg: JitFastPathConfig) {
         (**self).configure_jit_fast_path(cfg);
+    }
+    fn precompile_at(&mut self, address: u64) {
+        (**self).precompile_at(address);
     }
     fn run_until_stop(
         &mut self,
@@ -278,7 +285,7 @@ pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
 #[cfg(unix)]
 pub fn process_cpu_times_us() -> (u64, u64) {
     // SAFETY: getrusage(RUSAGE_SELF) with a valid rusage pointer is well-defined.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &raw mut usage) != 0 {

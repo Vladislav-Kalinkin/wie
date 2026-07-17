@@ -749,6 +749,7 @@ pub fn build_fake_api_lookup(patched: &[PePatchedImport]) -> Vec<PeFakeApiEntry>
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -764,6 +765,33 @@ mod tests {
     }
 
     #[test]
+    fn process_identity_no_basename_falls_back() {
+        let path = Path::new(r"");
+        let id = process_identity_from_host_path(path);
+        assert_eq!(id.module_file_name, "app.exe");
+    }
+
+    #[test]
+    fn process_identity_no_extension() {
+        let path = Path::new(r"my_binary");
+        let id = process_identity_from_host_path(path);
+        assert_eq!(id.module_file_name, "my_binary");
+    }
+
+    #[test]
+    fn process_identity_does_not_parse_pe() {
+        let path = Path::new(r"/tmp/some_random_file.xyz");
+        let id = process_identity_from_host_path(path);
+        assert_eq!(id.module_file_name, "some_random_file.xyz");
+    }
+
+    #[test]
+    fn pe_identity_rejects_invalid_bytes() {
+        let result = pe_identity_from_bytes(Path::new("test.exe"), b"not a PE");
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn pe_identity_from_micro_heap_alloc_if_present() {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.pop();
@@ -775,8 +803,8 @@ mod tests {
         let id = pe_identity_from_file(&path).expect("parse micro PE");
         assert!(id.is_pe64);
         assert_eq!(id.entry_va, id.image_base.saturating_add(id.entry_rva));
-        // mingw default ImageBase for modern PE64
         assert_eq!(id.image_base, 0x0000_0001_4000_0000);
         assert_eq!(id.entry_rva, 0x1000);
     }
+
 }

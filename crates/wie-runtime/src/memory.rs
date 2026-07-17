@@ -259,7 +259,7 @@ pub(crate) fn default_winapi_state(
         comm_dlg_extended_error: 0,
         host_file_mounts: Vec::new(),
         virtual_files: Vec::new(),
-        open_files: Vec::new(),
+        open_files: std::collections::HashMap::new(),
         next_file_handle: 0x0000_0000_6700_0001,
         next_menu_handle: 0x0000_0000_6800_1000,
         guest_io: None,

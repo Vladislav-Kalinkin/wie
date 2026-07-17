@@ -3,14 +3,8 @@
 //! When a guest `call` resolves to one of these fake-API VAs, the lowerer emits a
 //! Cranelift `call` to a host helper instead of exiting to the runtime host-stop
 //! loop (saves most of the CRT startup / `printf` path stops).
-
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing
-)]
+//!
+//! Clippy cast/index allows are inherited from `jit/mod.rs`.
 
 use super::lower::JitCtx;
 use crate::mem::GuestMemory;
@@ -392,7 +386,7 @@ fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
             break;
         };
         // SAFETY: `chunk` is a valid contiguous slice; write does not retain the pointer.
-        #[allow(unsafe_code)]
+        // SAFETY: `fd` is a host stdout/stderr descriptor; `chunk` is a live buffer.
         let n = unsafe { libc::write(fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
