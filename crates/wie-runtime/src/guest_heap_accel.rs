@@ -401,6 +401,8 @@ fn write_heap_free_impl(
     c.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x06, 0x08]); // mov rcx, [rsi+rax+8]
     c.extend_from_slice(&[0x48, 0x89, 0x0f]); // mov [rdi], rcx
     c.extend_from_slice(&[0x48, 0x89, 0x7c, 0x06, 0x08]); // mov [rsi+rax+8], rdi
+    // Zero size header so a second free (or host free_coherent) sees double-free.
+    c.extend_from_slice(&[0x48, 0xc7, 0x47, 0xf8, 0x00, 0x00, 0x00, 0x00]); // mov qword [rdi-8], 0
 
     let success = c.len();
     c.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00]);

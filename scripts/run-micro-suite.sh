@@ -28,6 +28,7 @@ run_one() {
 run_one "$ROOT/micro-exes/out/process_ids.exe"
 run_one "$ROOT/micro-exes/out/heap_alloc.exe"
 run_one "$ROOT/micro-exes/out/heap_core.exe"
+run_one "$ROOT/micro-exes/out/winapi_heap.exe"
 run_one "$ROOT/micro-exes/out/modules.exe"
 run_one "$ROOT/micro-exes/out/long_loop.exe"
 run_one "$ROOT/micro-exes/out/cpu_string.exe"

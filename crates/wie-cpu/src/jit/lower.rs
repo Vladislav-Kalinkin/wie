@@ -102,6 +102,9 @@ pub(super) struct CompiledBlock {
     /// Module function id (for block-chaining `declare_func_in_func`).
     pub func_id: FuncId,
     pub insn_count: u32,
+    /// Block touches XMM/SSE state — host must sync the full XMM bank.
+    /// Pure GPR blocks skip XMM copy on entry/exit (CPU + cache win).
+    pub uses_sse: bool,
 }
 
 /// Hash a guest VA into a chain-table slot.
@@ -960,6 +963,7 @@ pub(super) fn compile_block(
         func,
         func_id,
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
+        uses_sse: has_sse || has_fp,
     })
 }
 

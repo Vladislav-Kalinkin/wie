@@ -3,102 +3,92 @@
 [![Project status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)](https://github.com/Vladislav-Kalinkin/wie)
 [![License](https://img.shields.io/github/license/Vladislav-Kalinkin/wie?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97+-blue?style=flat-square)](https://www.rust-lang.org/)
-[![CI](https://github.com/Vladislav-Kalinkin/wie/actions/workflows/ci.yml/badge.svg)](https://github.com/Vladislav-Kalinkin/wie/actions/workflows/rust.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/Vladislav-Kalinkin/wie/ci.yml?style=flat-square)](https://github.com/Vladislav-Kalinkin/wie/actions)
 [![GitHub stars](https://img.shields.io/github/stars/Vladislav-Kalinkin/wie?style=social)](https://github.com/Vladislav-Kalinkin/wie)
 
 > [!WARNING]
 > **Work In Progress (WIP):** This is an early-stage experimental prototype.
+>
+> WIE is a research engine for freestanding and CRT micro-PEs. It is **not** a general Windows app runner yet. Pure guest compute (e.g. `long_loop`) will pin a core near 100% by design — that is useful work in the JIT, not a hang.
 
-> At the moment, WIE cannot run user executable files and is still a research and experimental project
+**Idea** — Emulate custom **64-bit Windows** user-mode binaries on **macOS Apple Silicon**.
 
-> The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%).
+**Not goals** — 32-bit apps; full historical Windows compatibility. Focus is Windows 10-era PE64 + the APIs real tools actually call.
 
-**Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
-
-**Not goals** - Running 32-bit applications, creating a universal emulator of the entire windows history. Only Windows 10 and applications running on it of older versions of the OS
-
-At the moment, the project has more than a hundred different plugs made only to build the emulator engine and are not the final solution
+The WinAPI surface is intentionally incomplete: many handlers are stubs sufficient for the micro-suite and engine bring-up, not a final product surface.
 
 ## Examples of launch
 
-```
-time ./target/release/wie-cli run micro-exes/out/crt_hello.exe
-hello from crt
-entry=0x0000000140001440 initial_rsp=0x000000002000eff8 termination=ExitProcess { code: 0 } final_rip=0x00007000000001f0 final_rsp=0x000000002000ef28
-api[0] handled fake=0x0000700000000050 ret=0x0000000000000000 resume=0x000000014000118d KERNEL32.dll!SetUnhandledExceptionFilter
-api[1] handled fake=0x00007000000001f0 ret=- resume=- api-ms-win-crt-runtime-l1-1-0.dll!exit
-./target/release/wie-cli run micro-exes/out/crt_hello.exe  0.02s user 0.03s system 81% cpu 0.059 total
+```bash
+time ./target/release/wie-cli run-micro micro-exes/out/crt_hello.exe
+# hello from crt
+# run_micro: ok exit=0
+
+time ./target/release/wie-cli run-micro micro-exes/out/winapi_heap.exe
+# HeapAlloc / HeapSize / HeapReAlloc / HeapFree / double-free / size-0 paths
+# run_micro: ok exit=0
+
+time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
+# ~100M loop iterations under Cranelift JIT; expect ~1.3–1.5s wall, ~100% CPU
 ```
 
-```
-time WIE_RUNTIME_PROFILE=1  ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
-run_micro: path=micro-exes/out/long_loop.exe
-cpu_backend: jit
-entry=0x0000000140001000 initial_rsp=0x000000002000eff8
-events=1 termination=ExitProcess { code: 0 }
-  [   0] KERNEL32.dll!ExitProcess handled=true ret=None
-=== WIE_RUNTIME_PROFILE ===
-host_stops=1 noisy=0 charged=1
-emu_ms=1366.56 (100.0%)  handler_ms=0.00 (0.0%)  resolve_ms=0.00 (0.0%)  total_accounted_ms=1366.56
-top exports by handler time:
-        1      0.00 ms  KERNEL32.dll!ExitProcess
-top exports by count:
-        1      0.00 ms  KERNEL32.dll!ExitProcess
-run_micro: ok exit=0
-WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro   1,37s user 0,03s system 99% cpu 1,420 total
+```bash
+# Full clean-room gate
+make -C micro-exes && ./scripts/run-micro-suite.sh
 ```
 
 ## Core Components
 
-- **`wie-cpu`** – the CPU core. Provides two backends:
-  - **`JitCpu`** (default) – compiles x86‑64 basic blocks into ARM64 machine code via **Cranelift**. Compiled blocks are cached and can be chained directly without returning to the dispatcher.
-  - **`IcedCpu`** – an interpreter based on **iced‑x86**, used as fallback for complex instructions or when the JIT is disabled.
-
-- **`wie-winapi`** – emulation of Windows system calls. Contains dozens of handlers for KERNEL32, USER32, GDI32, ADVAPI32, COMCTL32, and other DLLs. API dispatch uses a dense integer‑based table (no string comparisons on the hot path).
-
-- **`wie-runtime`** – manages the execution session: loads the PE, sets up guest memory, installs hooks on fake API addresses, drives the run loop, and maintains the overall state (registers, heap, windows, message queue, etc.).
-
-- **`wie-pe`** – PE64 parsing, section loading, import table processing, and IAT patching with fake addresses.
+| Crate | Role |
+| ----- | ---- |
+| **`wie-cpu`** | CPU backends: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 interpreter (`WIE_CPU=iced`). |
+| **`wie-winapi`** | KERNEL32 / UCRT / USER32 / GDI32 / … handlers. Dispatch is a dense `WinApiId` table (no string compares on the hot path). Guest heap: 24 size classes + bump + optional shared control block. |
+| **`wie-runtime`** | Session: PE load, guest memory layout, fake-API hooks, guest accelerators (stubs / heap / I/O / MBWC), run loop, TEB last-error publish, bottles (`WIE_ROOT`). |
+| **`wie-pe`** | PE64 parse, section map, import/IAT patch with fake VAs. |
+| **`wie-cli`** | `inspect` / `run-micro` / `run` / `entry-trace` / `winapi-map`. |
 
 ## Execution Flow
 
-1. **PE Loading**  
-   `wie-pe` reads the file, builds the in‑memory image at virtual addresses, and parses the import table. Every imported function gets a **fake address** in a reserved region (e.g., `0x7000_0000_0000_xxxx`). These addresses are written into the IAT.
+1. **PE loading** — `wie-pe` maps the image and rewrites every IAT slot to a **fake API VA** in a reserved range (e.g. `0x7000_0000_0000_xxxx`).
 
-2. **Hook Installation**  
-   The entire fake‑address range is covered by a **stop bitmap** (bit = 1 means “stop and hand over to the host handler”). For frequently called functions (e.g., `GetLastError`, `EnterCriticalSection`), **guest stubs** (small pieces of machine code) are placed directly in that range, so calls execute entirely in‑guest without stopping.
+2. **Hooks + guest stubs** — A **stop bitmap** covers the fake range. Ultra-hot APIs (`GetLastError`, `SetLastError`, critical sections, …) get small **in-guest stubs** so they never host-stop. Optional accelerators rewire IAT entries to real guest machine code (`WIE_GUEST_HEAP`, `WIE_GUEST_IO`, `WIE_GUEST_MBWC`).
 
-3. **Execution Start**  
-   Control is transferred to the PE’s entry point. `JitCpu` starts decoding basic blocks from the current `RIP`. If a block is “pure” (only GPR ops, simple memory accesses, ALU, branches), it is compiled to ARM64 and executed. If the block is complex (SSE, system instructions) or cold, it is interpreted by `IcedCpu`.
+3. **Run** — Control starts at the PE entry. `JitCpu` decodes lowerable basic blocks (GPR, simple mem, jcc/jmp/call/ret, common SSE2). Hot pure blocks compile to ARM64 and are cached; complex/cold code falls back to iced.
 
-4. **System Call Interception**  
-   When execution reaches a fake address (i.e., a call to an imported function), the stop‑bit triggers. `JitCpu` or `IcedCpu` returns control to `RuntimeSession`. The session identifies which API was called and invokes the corresponding handler from `wie-winapi`. The handler reads arguments from guest registers/stack, performs emulation (often modifying state), and then calls `return_from_win64_api`, which restores `RIP` and `RSP` as if the call returned normally.
+4. **API stop** — Hitting a stop-bit fake VA returns to `RuntimeSession`, which resolves `WinApiId` and runs the handler. Handlers use Win64 register ABI and `return_from_win64_api`.
 
-5. **In‑Guest Accelerators**  
-   For the hottest APIs (e.g., `malloc`, `memcpy`, `ReadFile`, `HeapAlloc`), actual machine‑code stubs are placed in guest memory and their addresses are written into the IAT instead of the fake ones, with the corresponding stop‑bits cleared. This way, calls to these functions never leave the guest context, drastically reducing overhead. Implemented in modules `guest_stubs`, `guest_io`, `guest_heap`, and `guest_mbwc`.
+5. **Fast paths** — JIT can lower hot UCRT imports (`malloc`, `free`, `memcpy`, `strlen`, `fwrite`, `fflush`, `__acrt_iob_func`) as direct host calls. Block chaining + a shadow return stack keep control in native code across calls/rets/self-loops.
 
-6. **Block Chaining and Shadow Stack**  
-   Compiled blocks can call each other directly, bypassing the dispatcher. For `call` instructions, a shadow return stack is maintained to improve prediction and speed up `ret` handling.
-
-7. **Host System Interaction**  
-   File system emulation (via “bottles” – root directories mapped to `C:\`) and windowing (fake HWNDs, message queuing) are implemented on the host. For example, `CreateFile` opens a file under `WIE_ROOT/drive_c`, while window messages are queued and dispatched through guest WndProc callbacks.
+6. **Host resources** — Bottles map `C:\…` → `{root}/drive_c/…`. Files, fake HWNDs, and a minimal message path live on the host.
 
 ## JIT Compilation Details
 
-- **Granularity**: only basic blocks (up to 32 instructions) ending in a branch, call, or return are compiled.
-- **Hotness**: a block is compiled after 100 visits (or immediately for UCRT calls). Compiled blocks are cached in a `HashMap`.
-- **SSE2 Support**: common XMM operations (mov, xor, add/sub/mul/div scalar/packed) are compiled; everything else goes to the interpreter.
-- **Fast UCRT Imports**: calls to `malloc`, `free`, `memcpy`, `strlen`, `fwrite`, `fflush`, and `__acrt_iob_func` are compiled as direct host‑function calls, bypassing stops.
+- **Granularity**: blocks up to **64** instructions; fallthrough-only fragments need ≥ **8** insns to justify compile tax. Blocks ending in **jcc/jmp/call/ret** or string ops compile from **1** insn (tight loops must not stay on iced).
+- **Hotness**: compile after **100** visits (tests: 0; UCRT call sites: 2).
+- **Chaining**: self-loops become IR back-edges; open-addressing chain table + shadow stack for call/ret.
+- **Memory**: 4-level radix page table + multi-way TLB + sticky hot page for JIT load/store helpers.
+- **SSE2**: common XMM moves / bitwise / scalar+packed FP; pure GPR blocks **skip full XMM bank sync** on block entry/exit (CPU win).
+- **Fallback**: anything not lowerable → iced `step`.
 
-## Memory Management
+## Memory & Heap
 
-- Guest memory is a `HashMap<page_key, Page>` backed by a 4‑level radix table for fast page lookups from JIT code.
-- Heaps are emulated using segregated free‑lists (24 size classes) plus a bump allocator. The guest and host heap structures are synchronised via a shared control block in guest memory, allowing the `HeapAlloc/HeapFree` accelerators to run without host stops.
+- Guest pages: `HashMap` ownership + radix walk for JIT O(1) page base.
+- Process heap: segregated freelists (**24** size classes, up to 64 KiB) + bump for virgin space; 8-byte size header before each payload.
+- Host `GuestHeap` and optional in-guest `HeapAlloc`/`HeapFree` share a control block (bump + freelist heads). Default path is **host freelist** (`WIE_GUEST_HEAP=1` enables full guest rewire).
+- `HeapFree` of a live block → TRUE; **double-free / unknown** → FALSE + `ERROR_INVALID_HANDLE` (6). `HeapReAlloc(..., 0)` frees and returns NULL.
 
-## Profiling and Debugging
+## Environment knobs
 
-- Set `WIE_RUNTIME_PROFILE=1` to collect timing statistics (emulation, handlers, resolution) and call counts per API.
-- `WIE_API_JOURNAL=path` writes a log of every API call with register state, useful for comparing backends.
+| Variable | Effect |
+| -------- | ------ |
+| `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**) |
+| `WIE_RUNTIME_PROFILE=1` | Host stop timing / API counts |
+| `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs |
+| `WIE_ROOT` / `--root` | Bottle root for file APIs |
+| `WIE_GUEST_HEAP=1` | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code |
+| `WIE_GUEST_IO=…` | Guest I/O accelerator policy |
+| `WIE_GUEST_MBWC=1` | Guest MultiByte↔WideChar helpers |
+| `RUST_LOG` | tracing filter |
 
 ## CLI
 
@@ -106,90 +96,66 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro   1,37s user 0,03s syst
 ./target/release/wie-cli --help
 ```
 
-| Command                                      | Role                           |
-| -------------------------------------------- | ------------------------------ |
-| `inspect` / `sections` / `imports` / `image` | PE inspection                  |
-| `winapi-map`                                 | Import coverage map            |
-| `run-micro`                                  | **Primary** gate (ExitProcess) |
-| `run`                                        | Run until yield / exit         |
-| `entry-trace`                                | First N host API stops         |
+| Command | Role |
+| ------- | ---- |
+| `inspect` / `sections` / `imports` / `image` | PE inspection |
+| `winapi-map` | Import coverage map |
+| `run-micro` | **Primary** gate (must reach `ExitProcess` with code 0) |
+| `run` | Run until yield / exit |
+| `entry-trace` | First N host API stops |
+
+## Performance notes (CPU / wall)
+
+What actually burns CPU today:
+
+1. **Tight guest loops** — expected ~100% core use under JIT; iced is orders of magnitude slower and may hit slice budgets (`long_loop`).
+2. **Per-memory JIT helpers** — stack/heap loads still go through TLB helpers; reducing mem ops in guest code helps more than micro-tweaking iced.
+3. **Host API stops** — every non-stub import pays a stop; guest stubs / UCRT fast path / heap freelist exist to cut this.
+4. **Block entry/exit** — GPR sync is mandatory; XMM sync is skipped for pure GPR blocks.
+5. **Cold compile tax** — hotness threshold avoids compiling one-shot code; raise only if you measure thrashing.
+
+Further wins worth pursuing: more in-guest stubs for remaining hot KERNEL32/UCRT exports; denser stop/API lookup; optional stack-relative mem inlining in the lowerer; lower hotness for proven self-loops after first decode.
 
 ## Installation & Prerequisites
 
-To build the emulator and compile the test micro-executables on Apple Silicon Mac, you need to install the Rust toolchain and an x86_64 cross-compiler.
-
-### 1. Install System Dependencies
+Apple Silicon Mac: Rust toolchain + MinGW for micro-exes.
 
 ```bash
-# 1. Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
-
-# 2. Verify Rust
-rustc --version
-cargo --version
-
-# 3. Install cross-compiler for micro-exes
 brew install mingw-w64
-```
 
-### 2. Clone and Build WIE
-
-Clone the repository and build the CLI tool in release mode:
-
-```bash
 git clone https://github.com/Vladislav-Kalinkin/wie
 cd wie
 cargo build -p wie-cli --release
-```
 
-### 3. Compile Test Binaries and Run
-
-Build the local x86_64 PE samples using the installed MinGW compiler and run demo exes:
-
-```bash
 make -C micro-exes
 ./scripts/run-micro-suite.sh
-
-# If you want to see advanced logs
-RUST_LOG=info ./scripts/run-micro-suite.sh
 ```
 
 ## History
 
-At the early stage of building the engine, the project began as an experiment to create an alternative way to launch FuSoYa's Lunar Magic.
-
-The project had many workarounds for its launch and originally used Unicorn Engine. It was possible to achieve the entire initialization sequence, but later it was decided to delete the data associated with it and start creating its own engine based on iced-x86 and Cranelift.
-
-In one of the tests before removing Lunar Specific elements, it was possible to accelerate the launch by almost 2 seconds compared to Unicorn Engine.
+Early work targeted an alternate way to run FuSoYa's Lunar Magic and used Unicorn Engine. After full init sequences proved feasible, Unicorn-specific paths were removed in favour of iced-x86 + Cranelift. Pre-removal Lunar-specific runs were already ~2s faster than Unicorn on the same workload.
 
 ## AI-Usage
 
-This project uses code generated by artificial intelligence. It was used to write the main code, tests and implement architectural solutions. I (Author) - searched for information, monitored the purity of the code and clippy, run tests manually, checked the code and monitored the limitations of unsafe code, formed the idea of the project, changing the development angle and changing the engine was my decision.
-
-I understand that the use of the generated code entails more problems and possible bugs and I also hate it when the developer does not monitor the state of the code, does not manually check the tests and shifts all tasks to the AI agent, hoping 'Maybe lucky'.
-
-And also this section is not about boasting or a proclamation of AI power. I consider it a tool that with strict supervision, manual checks and author's decisions that can speed up the work and help the developer
+This project uses code generated by artificial intelligence for implementation, tests, and architecture drafts. The author researches, reviews, runs tests, watches clippy/`unsafe` boundaries, and steers the product direction. Generated code is not accepted without human verification.
 
 ## Contributing
 
-Contributions are welcome! To maintain high code quality, please check that your code complies with the Contributing rules (More details in the CONTRIBUTING.md file)
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Pre-PR Checklist
 
-Before opening a PR, please run the following commands locally:
-
-1. **Code Formatting:** `cargo fmt --check`
-2. **Linter Rules:** `cargo clippy --all-targets -- -D warnings`
-3. **Unit Tests:** `cargo test`
-4. **Integration Suite:** `make -C micro-exes && ./scripts/run-micro-suite.sh`
+1. **Format:** `cargo fmt --check`
+2. **Lint:** `cargo clippy --all-targets -- -D warnings`
+3. **Unit tests:** `cargo test`
+4. **Integration:** `make -C micro-exes && ./scripts/run-micro-suite.sh`
 
 ## Acknowledgments
 
-Special thanks to the awesome open-source contributors who help make **WIE** faster and more complete:
-
-- [@DevYatsu](https://github.com/DevYatsu) — For pioneering incredible performance optimizations
+- [@DevYatsu](https://github.com/DevYatsu) — performance optimizations
 
 ## License
 
-This project is licensed under the **GNU Lesser General Public License v3.0 (LGPL-3.0)**.
+**GNU Lesser General Public License v3.0 (LGPL-3.0)** — see [LICENSE.txt](LICENSE.txt).

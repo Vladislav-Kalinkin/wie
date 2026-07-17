@@ -10,9 +10,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -29,6 +29,7 @@ long_loop: $(OUT)/long_loop.exe
 cpu_math: $(OUT)/cpu_math.exe
 cpu_string: $(OUT)/cpu_string.exe
 cpu_fp: $(OUT)/cpu_fp.exe
+winapi_heap: $(OUT)/winapi_heap.exe
 
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
@@ -77,6 +78,10 @@ $(OUT)/cpu_string.exe: cpu_string/main.c | $(OUT)
 	@echo "built $@"
 
 $(OUT)/cpu_fp.exe: cpu_fp/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/winapi_heap.exe: winapi_heap/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 

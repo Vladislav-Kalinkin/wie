@@ -801,6 +801,24 @@ mod tests {
         assert_eq!(state.last_error, 456);
     }
 
+    #[test]
+    fn test_heap_free_double_free_returns_false() {
+        let mut engine = test_engine();
+        let mut state = winapi_state_default();
+        let p = state.heap.alloc(64);
+        assert_ne!(p, 0);
+
+        write_regs(&mut engine, 0x1, 0, p, 0, 0);
+        let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree");
+        assert_eq!(r.return_value, 1, "first free must succeed");
+
+        state.last_error = 0;
+        write_regs(&mut engine, 0x1, 0, p, 0, 0);
+        let r = kernel32::handle_heap_free(&mut engine, &mut state).expect("HeapFree double");
+        assert_eq!(r.return_value, 0, "double free must return FALSE");
+        assert_eq!(state.last_error, 6, "ERROR_INVALID_HANDLE");
+    }
+
     // --- User32 ---
 
     #[test]

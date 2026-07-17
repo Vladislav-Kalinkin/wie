@@ -108,11 +108,16 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
         }
     }
 
-    // Lone / short blocks ending in bulk string, near-call (UCRT), or near-ret
-    // (shadow-stack chaining) are worth compiling — beat iced + host-stop.
-    let min = if insns.last().is_some_and(|d| {
-        is_string_op(&d.instr) || matches!(d.instr.mnemonic(), Mnemonic::Call | Mnemonic::Ret)
-    }) {
+    // Short blocks with a terminator are still worth compiling:
+    // - call/ret: UCRT fast-path + shadow-stack chaining beats host-stop
+    // - jcc/jmp: tight loops (often < MIN_BLOCK_INSNS) must not stay on iced
+    // - string ops: bulk REP helper
+    // Fallthrough-only fragments keep MIN_BLOCK_INSNS to avoid compile tax.
+    let min = if term.is_some()
+        || insns
+            .last()
+            .is_some_and(|d| is_string_op(&d.instr))
+    {
         1
     } else {
         MIN_BLOCK_INSNS

@@ -212,7 +212,8 @@ impl JitCpu {
                     self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
                     let n = compiled.insn_count;
                     let func = compiled.func;
-                    return Ok(self.finish_compiled(rip, func, n));
+                    let uses_sse = compiled.uses_sse;
+                    return Ok(self.finish_compiled(rip, func, n, uses_sse));
                 }
                 Some(CacheEntry::Never) => {
                     // Fast path: known non-JIT site.
@@ -231,8 +232,9 @@ impl JitCpu {
                     } else if let Some(compiled) = self.try_compile(rip) {
                         let n = compiled.insn_count;
                         let func = compiled.func;
+                        let uses_sse = compiled.uses_sse;
                         self.cache.insert(rip, CacheEntry::Ready(compiled));
-                        return Ok(self.finish_compiled(rip, func, n));
+                        return Ok(self.finish_compiled(rip, func, n, uses_sse));
                     } else {
                         self.cache.insert(rip, CacheEntry::Never);
                     }
@@ -245,8 +247,9 @@ impl JitCpu {
                         if let Some(compiled) = self.try_compile(rip) {
                             let n = compiled.insn_count;
                             let func = compiled.func;
+                            let uses_sse = compiled.uses_sse;
                             self.cache.insert(rip, CacheEntry::Ready(compiled));
-                            return Ok(self.finish_compiled(rip, func, n));
+                            return Ok(self.finish_compiled(rip, func, n, uses_sse));
                         }
                         self.cache.insert(rip, CacheEntry::Never);
                     } else {
@@ -348,8 +351,9 @@ impl JitCpu {
         entry_rip: u64,
         func: unsafe extern "C" fn(*mut JitCtx),
         n: u32,
+        uses_sse: bool,
     ) -> (StepResult, usize) {
-        if let Some(inv) = self.run_compiled(entry_rip, func) {
+        if let Some(inv) = self.run_compiled(entry_rip, func, uses_sse) {
             (StepResult::InvalidMemory(inv), 0)
         } else {
             self.stats.jit_insns = self.stats.jit_insns.saturating_add(u64::from(n));
@@ -362,6 +366,7 @@ impl JitCpu {
         &mut self,
         entry_rip: u64,
         func: unsafe extern "C" fn(*mut JitCtx),
+        uses_sse: bool,
     ) -> Option<exec::InvalidMem> {
         let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
         let regs = self.iced.regs_mut();
@@ -369,11 +374,14 @@ impl JitCpu {
         for (i, slot) in gpr.iter_mut().enumerate() {
             *slot = regs.gpr(i);
         }
+        // Pure GPR blocks skip the 16×u128 XMM bank copy on both sides of the call.
         let mut xmm = [0_u64; 32];
-        for i in 0..16 {
-            let v = regs.xmm_at(i);
-            xmm[i * 2] = v as u64;
-            xmm[i * 2 + 1] = (v >> 64) as u64;
+        if uses_sse {
+            for i in 0..16 {
+                let v = regs.xmm_at(i);
+                xmm[i * 2] = v as u64;
+                xmm[i * 2 + 1] = (v >> 64) as u64;
+            }
         }
         let mut ctx = JitCtx {
             gpr,
@@ -412,12 +420,13 @@ impl JitCpu {
                 regs.set_gpr(i, v);
             }
         }
-        // Write back XMM (write-through during block + untouched copies from entry).
-        for i in 0..16 {
-            let lo = ctx.xmm[i * 2];
-            let hi = ctx.xmm[i * 2 + 1];
-            let v = u128::from(lo) | (u128::from(hi) << 64);
-            regs.set_xmm_at(i, v);
+        if uses_sse {
+            for i in 0..16 {
+                let lo = ctx.xmm[i * 2];
+                let hi = ctx.xmm[i * 2 + 1];
+                let v = u128::from(lo) | (u128::from(hi) << 64);
+                regs.set_xmm_at(i, v);
+            }
         }
         regs.rflags = ctx.rflags;
         regs.rip = ctx.rip;
@@ -755,7 +764,8 @@ impl CpuEngine for JitCpu {
                 self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
                 let n = compiled.insn_count;
                 let func = compiled.func;
-                let (result, retired) = self.finish_compiled(rip, func, n);
+                let uses_sse = compiled.uses_sse;
+                let (result, retired) = self.finish_compiled(rip, func, n, uses_sse);
                 match result {
                     StepResult::Continue => {
                         executed = executed.saturating_add(retired.max(1));

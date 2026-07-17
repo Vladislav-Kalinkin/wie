@@ -235,26 +235,41 @@ impl GuestHeap {
             return self.free(address);
         };
 
-        let size = if let Some(s) = self.live.remove(&address) {
-            s
-        } else if let Some(s) = Self::read_u64(engine, address.wrapping_sub(8)) {
-            s
-        } else {
-            return false;
-        };
+        if let Some(size) = self.live.remove(&address) {
+            return self.free_known_block(engine, ctrl, address, size);
+        }
 
+        // Guest-side alloc (or host lost the live entry): size header is the source of truth.
+        // Zeroed header after a prior free → double-free / unknown → false.
+        if address >= self.base
+            && address < self.end
+            && let Some(size) = Self::read_u64(engine, address.wrapping_sub(8))
+            && size != 0
+        {
+            return self.free_known_block(engine, ctrl, address, size);
+        }
+        false
+    }
+    fn free_known_block(
+        &mut self,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        ctrl: u64,
+        address: u64,
+        size: u64,
+    ) -> bool {
         if size == 0 {
             return false;
         }
         if size > LARGE_THRESHOLD {
             self.large_free.push(LargeFreeBlock { address, size });
-            return true;
+        } else {
+            let class = size_class_index(size);
+            let hva = Self::head_va(ctrl, class);
+            let old_head = Self::read_u64(engine, hva).unwrap_or(0);
+            Self::write_u64(engine, address, old_head);
+            Self::write_u64(engine, hva, address);
         }
-        let class = size_class_index(size);
-        let hva = Self::head_va(ctrl, class);
-        let old_head = Self::read_u64(engine, hva).unwrap_or(0);
-        Self::write_u64(engine, address, old_head);
-        Self::write_u64(engine, hva, address);
+        Self::write_u64(engine, address.wrapping_sub(8), 0);
         true
     }
 

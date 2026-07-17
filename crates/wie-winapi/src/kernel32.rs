@@ -975,16 +975,21 @@ pub fn handle_heap_free(
     let _flags = engine.read_rdx()?;
     let memory = engine.read_r8()?;
 
-    // Windows HeapFree returns TRUE even for some invalid frees; free if live.
-    if memory != 0 {
-        let _ = state.heap.free_coherent(engine, memory);
-    }
+    // HeapFree(NULL) → TRUE. Live block → TRUE. Double-free / unknown → FALSE +
+    // ERROR_INVALID_HANDLE (matches micro-exes/winapi_heap and MSVC heap checks).
+    let ok = memory == 0 || state.heap.free_coherent(engine, memory);
+    let return_value = if ok {
+        1
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        0
+    };
 
-    let return_address = engine.return_from_win64_api(1)?;
+    let return_address = engine.return_from_win64_api(return_value)?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 1,
+        return_value,
     })
 }
 
@@ -998,7 +1003,11 @@ pub fn handle_heap_realloc(
     let memory = engine.read_r8()?;
     let new_size = engine.read_r9()?;
 
-    let return_value = if heap_handle == 0 || memory == 0 || new_size == 0 {
+    // dwBytes == 0: free the block and return NULL (documented HeapReAlloc behaviour).
+    let return_value = if heap_handle == 0 || memory == 0 {
+        0
+    } else if new_size == 0 {
+        let _ = state.heap.free_coherent(engine, memory);
         0
     } else if let Some(same) = state.heap.try_realloc_in_place(memory, new_size) {
         same
