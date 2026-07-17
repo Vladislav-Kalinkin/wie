@@ -18,7 +18,7 @@ use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use wie_winapi::{resolve_winapi_id, WinApiId};
+use wie_winapi::{WinApiId, resolve_winapi_id};
 
 /// Must match `wie_winapi::guest_heap` size classes.
 const HEAP_SIZE_CLASS_COUNT: usize = 24;
@@ -183,7 +183,7 @@ fn write_heap_alloc_impl(
 
     // rbx = rounded size (max(size,1) then class)
     c.extend_from_slice(&[0x4c, 0x89, 0xc3]); // mov rbx, r8
-                                              // if size > LARGE_THRESHOLD → fallback (host handles large)
+    // if size > LARGE_THRESHOLD → fallback (host handles large)
     c.extend_from_slice(&[0x48, 0x81, 0xfb]);
     c.extend_from_slice(&(LARGE_THRESHOLD as u32).to_le_bytes());
     let ja_large = c.len();
@@ -234,7 +234,7 @@ fn write_heap_alloc_impl(
     c.extend_from_slice(&[0x48, 0x89, 0xe8]); // mov rax, rbp
     c.extend_from_slice(&[0x48, 0xc1, 0xe0, 0x03]); // shl rax, 3
     c.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x06, 0x08]); // mov rcx, [rsi+rax+8]
-                                                          // if head == 0 → bump
+    // if head == 0 → bump
     c.extend_from_slice(&[0x48, 0x85, 0xc9]); // test rcx, rcx
     let jz_bump = c.len();
     c.extend_from_slice(&[0x0f, 0x84, 0, 0, 0, 0]); // jz bump
@@ -255,7 +255,7 @@ fn write_heap_alloc_impl(
     c.extend_from_slice(&[0x48, 0x8b, 0x11]); // mov rdx, [rcx]
     c.extend_from_slice(&[0x48, 0x89, 0x54, 0x06, 0x08]); // mov [rsi+rax+8], rdx
     c.extend_from_slice(&[0x48, 0x89, 0xcf]); // mov rdi, rcx
-                                              // ensure header size
+    // ensure header size
     c.extend_from_slice(&[0x48, 0x89, 0x5f, 0xf8]); // mov [rdi-8], rbx
     let jmp_ret = c.len();
     c.extend_from_slice(&[0xe9, 0, 0, 0, 0]); // jmp ret_ptr
@@ -264,23 +264,23 @@ fn write_heap_alloc_impl(
     let bump_pos = c.len();
     // rax = bump = [rsi]
     c.extend_from_slice(&[0x48, 0x8b, 0x06]); // mov rax, [rsi]
-                                              // payload = align16(bump + 8)
+    // payload = align16(bump + 8)
     c.extend_from_slice(&[0x48, 0x83, 0xc0, 0x08]); // add rax, 8
     c.extend_from_slice(&[0x48, 0x83, 0xc0, 0x0f]); // add rax, 15
     c.extend_from_slice(&[0x48, 0x83, 0xe0, 0xf0]); // and rax, ~15
     c.extend_from_slice(&[0x48, 0x89, 0xc7]); // mov rdi, rax  ; payload
-                                              // end = payload + rounded
+    // end = payload + rounded
     c.extend_from_slice(&[0x48, 0x89, 0xf9]); // mov rcx, rdi
     c.extend_from_slice(&[0x48, 0x01, 0xd9]); // add rcx, rbx
-                                              // if end > heap_end → fallback (OOM)
+    // if end > heap_end → fallback (OOM)
     c.extend_from_slice(&[0x48, 0xb8]);
     c.extend_from_slice(&config.heap_end.to_le_bytes());
     c.extend_from_slice(&[0x48, 0x39, 0xc1]); // cmp rcx, heap_end
     let ja_oom = c.len();
     c.extend_from_slice(&[0x0f, 0x87, 0, 0, 0, 0]); // ja fallback
-                                                    // write bump = end
+    // write bump = end
     c.extend_from_slice(&[0x48, 0x89, 0x0e]); // mov [rsi], rcx
-                                              // write size header
+    // write size header
     c.extend_from_slice(&[0x48, 0x89, 0x5f, 0xf8]); // mov [rdi-8], rbx
 
     // Skip HEAP_ZERO_MEMORY: host path ignores zeroing too; Unicorn rep-stos is costly.
@@ -410,7 +410,7 @@ fn write_heap_free_impl(
     c.extend_from_slice(&[0x5f, 0x5e, 0x5d, 0x5b]);
     c.extend_from_slice(&[0x4c, 0x89, 0xd1]); // rcx = heap
     c.extend_from_slice(&[0x4c, 0x89, 0xda]); // rdx = flags
-                                              // r8 still original mem
+    // r8 still original mem
     c.extend_from_slice(&[0x48, 0xb8]);
     c.extend_from_slice(&config.free_fallback_va.to_le_bytes());
     c.extend_from_slice(&[0xff, 0xe0]);

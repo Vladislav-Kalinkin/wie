@@ -1,6 +1,6 @@
 //! PE64 inspection and loading helpers for WIE (generic PE64 userspace).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use goblin::pe::PE;
 use serde::Serialize;
 use std::path::Path;
@@ -597,8 +597,8 @@ pub fn build_loaded_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageS
     // Path is only for diagnostics in identity; bytes carry all header fields.
     let identity = pe_identity_from_bytes(Path::new("<memory>"), bytes)?;
 
-    let image_size = usize::try_from(identity.size_of_image)
-        .context("size_of_image does not fit usize")?;
+    let image_size =
+        usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
     let header_size =
         usize::try_from(identity.size_of_headers).context("size_of_headers does not fit usize")?;
 
@@ -806,5 +806,4 @@ mod tests {
         assert_eq!(id.image_base, 0x0000_0001_4000_0000);
         assert_eq!(id.entry_rva, 0x1000);
     }
-
 }

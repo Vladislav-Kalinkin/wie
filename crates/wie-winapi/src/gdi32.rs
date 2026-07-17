@@ -15,9 +15,7 @@ const FAKE_GDI_BITMAP_HANDLE_BASE: u64 = 0x0000_0000_6800_2000;
 const FAKE_GDI_FONT_HANDLE_BASE: u64 = 0x0000_0000_6800_3000;
 
 /// Handles `GDI32.dll!GetObjectA`.
-pub fn handle_get_object_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_object_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let object_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetObjectA")?;
@@ -46,8 +44,7 @@ pub fn handle_get_object_a(
         // padding              offset 20..23
         // LPVOID bmBits;       offset 24
 
-        write_guest_i32(engine, object_buffer_ptr, 0)
-            .context("failed to write BITMAP.bmType")?;
+        write_guest_i32(engine, object_buffer_ptr, 0).context("failed to write BITMAP.bmType")?;
 
         write_guest_i32(
             engine,
@@ -114,9 +111,7 @@ pub fn handle_get_object_a(
 }
 
 /// Handles `GDI32.dll!SelectObject`.
-pub fn handle_select_object(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_select_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _device_context_handle = engine
         .read_rcx()
         .context("failed to read RCX for SelectObject")?;
@@ -175,19 +170,15 @@ fn handle_get_text_extent_point_32(
         .checked_mul(8)
         .with_context(|| format!("{api_name} width overflow"))?;
 
-    let width = u32::try_from(width)
-        .with_context(|| format!("{api_name} width does not fit in u32"))?;
+    let width =
+        u32::try_from(width).with_context(|| format!("{api_name} width does not fit in u32"))?;
 
     if size_ptr != 0 {
         write_guest_u32(engine, size_ptr, width)
             .with_context(|| format!("failed to write SIZE.cx for {api_name}"))?;
 
-        write_guest_u32(
-            engine,
-            checked_field_address(size_ptr, 4, "SIZE.cy")?,
-            16,
-        )
-        .with_context(|| format!("failed to write SIZE.cy for {api_name}"))?;
+        write_guest_u32(engine, checked_field_address(size_ptr, 4, "SIZE.cy")?, 16)
+            .with_context(|| format!("failed to write SIZE.cy for {api_name}"))?;
     }
 
     let return_value = u64::from(size_ptr != 0);
@@ -203,9 +194,7 @@ fn handle_get_text_extent_point_32(
 }
 
 /// Handles `GDI32.dll!ExtTextOutW` (success stub).
-pub fn handle_ext_text_out_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_ext_text_out_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for ExtTextOutW")?;
@@ -242,9 +231,7 @@ pub fn handle_create_compatible_dc(
 ///
 /// Returns plausible values for a 1920×1080 32-bpp desktop so Lunar Magic's
 /// display-mode probes succeed without real GDI.
-pub fn handle_get_device_caps(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_device_caps(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for GetDeviceCaps")?;
@@ -256,29 +243,29 @@ pub fn handle_get_device_caps(
     // Common GetDeviceCaps indices from wingdi.h.
     // Identical return values are intentionally merged (clippy match_same_arms).
     let return_value = match index {
-        0 => 0x4000,                      // DRIVERVERSION
+        0 => 0x4000,                         // DRIVERVERSION
         2 | 26 | 112 | 113 | 119 | 121 => 0, // TECHNOLOGY, PDEVICESIZE, offsets, BLTALIGNMENT, COLORMGMTCAPS
-        4 => 508,                         // HORZSIZE mm (~20")
-        6 => 286,                         // VERTSIZE mm
-        8 | 110 | 118 => 1920,            // HORZRES / PHYSICALWIDTH / DESKTOPHORZRES
-        10 | 111 | 117 => 1080,           // VERTRES / PHYSICALHEIGHT / DESKTOPVERTRES
-        12 => 32,                         // BITSPIXEL
-        14 | 16 | 18 | 20 | 22 | 36 => 1, // PLANES, NUMBRUSHES/PENS/MARKERS/FONTS, CLIPCAPS
-        24 => u64::MAX,                   // NUMCOLORS (-1 for >8bpp, sign-extended int)
-        28 => 0x1ff,                      // CURVECAPS
-        30 => 0xfe,                       // LINECAPS
-        32 => 0xff,                       // POLYGONALCAPS
-        34 => 0x7007,                     // TEXTCAPS
-        38 => 0x7e99,                     // RASTERCAPS
-        40 | 42 => 36,                    // ASPECTX / ASPECTY
-        44 => 51,                         // ASPECTXY
-        88 | 90 => 96,                    // LOGPIXELSX / LOGPIXELSY
-        104 => 256,                       // SIZEPALETTE
-        106 => 20,                        // NUMRESERVED
-        108 => 24,                        // COLORRES
-        114 | 115 => 100,                 // SCALINGFACTORX / Y
-        116 => 60,                        // VREFRESH
-        120 => 3,                         // SHADEBLENDCAPS
+        4 => 508,                            // HORZSIZE mm (~20")
+        6 => 286,                            // VERTSIZE mm
+        8 | 110 | 118 => 1920,               // HORZRES / PHYSICALWIDTH / DESKTOPHORZRES
+        10 | 111 | 117 => 1080,              // VERTRES / PHYSICALHEIGHT / DESKTOPVERTRES
+        12 => 32,                            // BITSPIXEL
+        14 | 16 | 18 | 20 | 22 | 36 => 1,    // PLANES, NUMBRUSHES/PENS/MARKERS/FONTS, CLIPCAPS
+        24 => u64::MAX,                      // NUMCOLORS (-1 for >8bpp, sign-extended int)
+        28 => 0x1ff,                         // CURVECAPS
+        30 => 0xfe,                          // LINECAPS
+        32 => 0xff,                          // POLYGONALCAPS
+        34 => 0x7007,                        // TEXTCAPS
+        38 => 0x7e99,                        // RASTERCAPS
+        40 | 42 => 36,                       // ASPECTX / ASPECTY
+        44 => 51,                            // ASPECTXY
+        88 | 90 => 96,                       // LOGPIXELSX / LOGPIXELSY
+        104 => 256,                          // SIZEPALETTE
+        106 => 20,                           // NUMRESERVED
+        108 => 24,                           // COLORRES
+        114 | 115 => 100,                    // SCALINGFACTORX / Y
+        116 => 60,                           // VREFRESH
+        120 => 3,                            // SHADEBLENDCAPS
         _ => {
             tracing::debug!(index, "GetDeviceCaps unknown index; returning 0");
             0
@@ -338,9 +325,7 @@ pub fn handle_delete_dc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 }
 
 /// Handles `GDI32.dll!DeleteObject`.
-pub fn handle_delete_object(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_delete_object(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let object_handle = engine
         .read_rcx()
         .context("failed to read RCX for DeleteObject")?;
@@ -389,9 +374,10 @@ pub fn handle_create_dib_section(
         let height = read_guest_i32(engine, checked_field_address(bmi_ptr, 8, "biHeight")?)
             .context("failed to read CreateDIBSection biHeight")?
             .unsigned_abs();
-        let bit_count =
-            u32::from(read_guest_u16(engine, checked_field_address(bmi_ptr, 14, "biBitCount")?)
-                .context("failed to read CreateDIBSection biBitCount")?);
+        let bit_count = u32::from(
+            read_guest_u16(engine, checked_field_address(bmi_ptr, 14, "biBitCount")?)
+                .context("failed to read CreateDIBSection biBitCount")?,
+        );
         (width.max(1), height.max(1), bit_count.max(1))
     } else {
         (16, 16, 32)
@@ -618,8 +604,16 @@ pub fn handle_get_text_metrics_a(
         // tmDefaultChar 46, tmBreakChar 47, tmItalic 48, tmUnderlined 49,
         // tmStruckOut 50, tmPitchAndFamily 51, tmCharSet 52
         write_guest_i32(engine, metrics_ptr, 16)?; // tmHeight
-        write_guest_i32(engine, checked_field_address(metrics_ptr, 4, "tmAscent")?, 13)?;
-        write_guest_i32(engine, checked_field_address(metrics_ptr, 8, "tmDescent")?, 3)?;
+        write_guest_i32(
+            engine,
+            checked_field_address(metrics_ptr, 4, "tmAscent")?,
+            13,
+        )?;
+        write_guest_i32(
+            engine,
+            checked_field_address(metrics_ptr, 8, "tmDescent")?,
+            3,
+        )?;
         write_guest_i32(
             engine,
             checked_field_address(metrics_ptr, 12, "tmInternalLeading")?,
@@ -640,8 +634,16 @@ pub fn handle_get_text_metrics_a(
             checked_field_address(metrics_ptr, 24, "tmMaxCharWidth")?,
             16,
         )?;
-        write_guest_i32(engine, checked_field_address(metrics_ptr, 28, "tmWeight")?, 400)?;
-        write_guest_i32(engine, checked_field_address(metrics_ptr, 32, "tmOverhang")?, 0)?;
+        write_guest_i32(
+            engine,
+            checked_field_address(metrics_ptr, 28, "tmWeight")?,
+            400,
+        )?;
+        write_guest_i32(
+            engine,
+            checked_field_address(metrics_ptr, 32, "tmOverhang")?,
+            0,
+        )?;
         write_guest_i32(
             engine,
             checked_field_address(metrics_ptr, 36, "tmDigitizedAspectX")?,
@@ -653,24 +655,33 @@ pub fn handle_get_text_metrics_a(
             96,
         )?;
         // BYTE fields at end
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 44, "tmFirstChar")?, &[0x20])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 45, "tmLastChar")?, &[0xff])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 46, "tmDefaultChar")?, &[0x3f])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 47, "tmBreakChar")?, &[0x20])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 48, "tmItalic")?, &[0])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 49, "tmUnderlined")?, &[0])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 50, "tmStruckOut")?, &[0])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 51, "tmPitchAndFamily")?, &[0x31])?;
-        engine
-            .mem_write(checked_field_address(metrics_ptr, 52, "tmCharSet")?, &[0])?; // ANSI_CHARSET
+        engine.mem_write(
+            checked_field_address(metrics_ptr, 44, "tmFirstChar")?,
+            &[0x20],
+        )?;
+        engine.mem_write(
+            checked_field_address(metrics_ptr, 45, "tmLastChar")?,
+            &[0xff],
+        )?;
+        engine.mem_write(
+            checked_field_address(metrics_ptr, 46, "tmDefaultChar")?,
+            &[0x3f],
+        )?;
+        engine.mem_write(
+            checked_field_address(metrics_ptr, 47, "tmBreakChar")?,
+            &[0x20],
+        )?;
+        engine.mem_write(checked_field_address(metrics_ptr, 48, "tmItalic")?, &[0])?;
+        engine.mem_write(
+            checked_field_address(metrics_ptr, 49, "tmUnderlined")?,
+            &[0],
+        )?;
+        engine.mem_write(checked_field_address(metrics_ptr, 50, "tmStruckOut")?, &[0])?;
+        engine.mem_write(
+            checked_field_address(metrics_ptr, 51, "tmPitchAndFamily")?,
+            &[0x31],
+        )?;
+        engine.mem_write(checked_field_address(metrics_ptr, 52, "tmCharSet")?, &[0])?; // ANSI_CHARSET
     }
 
     let return_value = u64::from(success);
@@ -685,9 +696,7 @@ pub fn handle_get_text_metrics_a(
 }
 
 /// Handles `GDI32.dll!SetTextColor` (returns previous color).
-pub fn handle_set_text_color(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_text_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for SetTextColor")?;
@@ -707,9 +716,7 @@ pub fn handle_set_text_color(
 }
 
 /// Handles `GDI32.dll!SetBkColor`.
-pub fn handle_set_bk_color(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_bk_color(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for SetBkColor")?;
@@ -731,9 +738,7 @@ pub fn handle_set_bk_color(
 }
 
 /// Handles `GDI32.dll!SetBkMode` (TRANSPARENT=1, OPAQUE=2).
-pub fn handle_set_bk_mode(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_bk_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for SetBkMode")?;
@@ -753,24 +758,20 @@ pub fn handle_set_bk_mode(
 }
 
 /// Handles `GDI32.dll!TextOutA` (reads params; no actual rendering).
-pub fn handle_text_out_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_text_out_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc = engine
         .read_rcx()
         .context("failed to read RCX for TextOutA")?;
     let _x = engine
         .read_rdx()
         .context("failed to read RDX for TextOutA")?;
-    let _y = engine
-        .read_r8()
-        .context("failed to read R8 for TextOutA")?;
-    let _lp_string = engine
-        .read_r9()
-        .context("failed to read R9 for TextOutA")?;
+    let _y = engine.read_r8().context("failed to read R8 for TextOutA")?;
+    let _lp_string = engine.read_r9().context("failed to read R9 for TextOutA")?;
 
     // cchString is the 5th parameter on the stack.
-    let cch_string = engine.read_rsp().ok()
+    let cch_string = engine
+        .read_rsp()
+        .ok()
         .and_then(|rsp| read_guest_u32(engine, rsp.wrapping_add(0x28)).ok())
         .unwrap_or(0);
 
@@ -786,18 +787,10 @@ pub fn handle_text_out_a(
 
 /// Handles `GDI32.dll!BitBlt` (reads params; no actual blit).
 pub fn handle_bit_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _hdc_dst = engine
-        .read_rcx()
-        .context("failed to read RCX for BitBlt")?;
-    let _x = engine
-        .read_rdx()
-        .context("failed to read RDX for BitBlt")?;
-    let _y = engine
-        .read_r8()
-        .context("failed to read R8 for BitBlt")?;
-    let _cx = engine
-        .read_r9()
-        .context("failed to read R9 for BitBlt")?;
+    let _hdc_dst = engine.read_rcx().context("failed to read RCX for BitBlt")?;
+    let _x = engine.read_rdx().context("failed to read RDX for BitBlt")?;
+    let _y = engine.read_r8().context("failed to read R8 for BitBlt")?;
+    let _cx = engine.read_r9().context("failed to read R9 for BitBlt")?;
 
     let return_address = engine
         .return_from_win64_api(1)
@@ -810,9 +803,7 @@ pub fn handle_bit_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandl
 }
 
 /// Handles `GDI32.dll!StretchBlt` (reads params; no actual stretch).
-pub fn handle_stretch_blt(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_stretch_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _hdc_dst = engine
         .read_rcx()
         .context("failed to read RCX for StretchBlt")?;
@@ -838,18 +829,10 @@ pub fn handle_stretch_blt(
 
 /// Handles `GDI32.dll!PatBlt` (reads params; no actual pattern).
 pub fn handle_pat_blt(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for PatBlt")?;
-    let _x = engine
-        .read_rdx()
-        .context("failed to read RDX for PatBlt")?;
-    let _y = engine
-        .read_r8()
-        .context("failed to read R8 for PatBlt")?;
-    let _cx = engine
-        .read_r9()
-        .context("failed to read R9 for PatBlt")?;
+    let _hdc = engine.read_rcx().context("failed to read RCX for PatBlt")?;
+    let _x = engine.read_rdx().context("failed to read RDX for PatBlt")?;
+    let _y = engine.read_r8().context("failed to read R8 for PatBlt")?;
+    let _cx = engine.read_r9().context("failed to read R9 for PatBlt")?;
 
     let return_address = engine
         .return_from_win64_api(1)

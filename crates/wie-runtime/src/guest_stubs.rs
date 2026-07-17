@@ -63,7 +63,10 @@ impl GuestStubKind {
                 buf[2..10].copy_from_slice(&va.to_le_bytes());
                 buf
             }
-            Self::FlsGetValue { table_va, max_slots } => {
+            Self::FlsGetValue {
+                table_va,
+                max_slots,
+            } => {
                 // cmp rcx, imm32 ; jae .zero ; mov rax, table ; mov rax, [rax+rcx*8] ; ret
                 // .zero: xor eax,eax ; ret
                 let mut buf = Vec::with_capacity(32);
@@ -83,7 +86,10 @@ impl GuestStubKind {
                 buf[jae_imm] = rel as i8 as u8;
                 buf
             }
-            Self::FlsSetValue { table_va, max_slots } => {
+            Self::FlsSetValue {
+                table_va,
+                max_slots,
+            } => {
                 // cmp rcx, max ; jae .fail
                 // mov rax, table ; mov [rax+rcx*8], rdx ; mov eax, 1 ; ret
                 // .fail: xor eax,eax ; ret
@@ -121,10 +127,7 @@ impl GuestStubKind {
     /// Whether the body must be planted outside the IAT slot (jmp trampoline at entry).
     #[must_use]
     pub(crate) fn needs_out_of_line_helper(self) -> bool {
-        matches!(
-            self,
-            Self::FlsGetValue { .. } | Self::FlsSetValue { .. }
-        )
+        matches!(self, Self::FlsGetValue { .. } | Self::FlsSetValue { .. })
     }
 }
 
@@ -193,9 +196,7 @@ pub(crate) fn classify_guest_stub(
         return None;
     }
 
-    if !library.eq_ignore_ascii_case("KERNEL32.dll")
-        && !library.eq_ignore_ascii_case("ntdll.dll")
-    {
+    if !library.eq_ignore_ascii_case("KERNEL32.dll") && !library.eq_ignore_ascii_case("ntdll.dll") {
         // Keep USER32/GDI out of guest stubs for now (window state matters).
         return None;
     }
@@ -328,10 +329,7 @@ pub(crate) fn plant_guest_stubs(
             jmp[2..10].copy_from_slice(&helper_cursor.to_le_bytes());
             jmp[10] = 0xff;
             jmp[11] = 0xe0;
-            if offset
-                .checked_add(12)
-                .is_none_or(|end| end > fake_api_size)
-            {
+            if offset.checked_add(12).is_none_or(|end| end > fake_api_size) {
                 continue;
             }
             engine

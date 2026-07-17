@@ -155,13 +155,7 @@ fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
         };
         // SAFETY: `chunk` is a valid contiguous slice; write does not retain the pointer.
         #[expect(unsafe_code)]
-        let n = unsafe {
-            libc::write(
-                fd,
-                chunk.as_ptr().cast::<libc::c_void>(),
-                chunk.len(),
-            )
-        };
+        let n = unsafe { libc::write(fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::Interrupted {

@@ -31,9 +31,15 @@ pub const IDIRECT3D9_METHODS: &[(u64, &str)] = &[
     (0x0000_7000_0000_9080, "IDirect3D9::GetAdapterDisplayMode"),
     (0x0000_7000_0000_9090, "IDirect3D9::CheckDeviceType"),
     (0x0000_7000_0000_90a0, "IDirect3D9::CheckDeviceFormat"),
-    (0x0000_7000_0000_90b0, "IDirect3D9::CheckDeviceMultiSampleType"),
+    (
+        0x0000_7000_0000_90b0,
+        "IDirect3D9::CheckDeviceMultiSampleType",
+    ),
     (0x0000_7000_0000_90c0, "IDirect3D9::CheckDepthStencilMatch"),
-    (0x0000_7000_0000_90d0, "IDirect3D9::CheckDeviceFormatConversion"),
+    (
+        0x0000_7000_0000_90d0,
+        "IDirect3D9::CheckDeviceFormatConversion",
+    ),
     (0x0000_7000_0000_90e0, "IDirect3D9::GetDeviceCaps"),
     (0x0000_7000_0000_90f0, "IDirect3D9::GetAdapterMonitor"),
     (0x0000_7000_0000_9100, "IDirect3D9::CreateDevice"),
@@ -73,7 +79,6 @@ const IDIRECT3DDEVICE9_OBJECT_OFFSET: u64 = 0x3c0;
 const D3DCREATE_SOFTWARE_VERTEXPROCESSING: u32 = 0x0000_0020;
 const D3DCREATE_HARDWARE_VERTEXPROCESSING: u32 = 0x0000_0040;
 const D3DCREATE_MIXED_VERTEXPROCESSING: u32 = 0x0000_0080;
-
 
 /// Fake target VA for `IDirect3DDevice9` vtable slot `slot`.
 pub fn idirect3ddevice9_method_va(slot: usize) -> Result<u64> {
@@ -220,9 +225,7 @@ fn write_caps_u32(
 }
 
 /// Handles `IDirect3D9::GetDeviceCaps`.
-pub fn handle_get_device_caps(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_get_device_caps(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _this_pointer = engine
         .read_rcx()
         .context("failed to read RCX for IDirect3D9::GetDeviceCaps")?;
@@ -568,13 +571,12 @@ pub fn handle_create_device(
             focus_window,
         )?;
 
-        let vtable_address =
-            allocate_direct3d_block(
-                engine,
-                state,
-                IDIRECT3DDEVICE9_ALLOCATION_SIZE,
-                "IDirect3DDevice9",
-            );
+        let vtable_address = allocate_direct3d_block(
+            engine,
+            state,
+            IDIRECT3DDEVICE9_ALLOCATION_SIZE,
+            "IDirect3DDevice9",
+        );
 
         if vtable_address == 0 {
             write_guest_u64(engine, returned_device_address, 0)

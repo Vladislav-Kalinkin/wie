@@ -150,9 +150,7 @@ pub fn handle_reg_delete_value_a(
 }
 
 /// Handles `ADVAPI32.dll!RegCloseKey`.
-pub fn handle_reg_close_key(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_reg_close_key(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _key = engine
         .read_rcx()
         .context("failed to read RCX for RegCloseKey")?;
@@ -241,10 +239,7 @@ fn open_or_create_registry_key(
     Ok((handle, REG_CREATED_NEW_KEY))
 }
 
-fn return_status(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    status: u64,
-) -> Result<WinApiHandlerResult> {
+fn return_status(engine: &mut dyn wie_cpu::CpuEngine, status: u64) -> Result<WinApiHandlerResult> {
     let return_address = engine
         .return_from_win64_api(status)
         .context("failed to return registry status")?;
@@ -255,10 +250,7 @@ fn return_status(
     })
 }
 
-fn read_optional_ansi_string(
-    engine: &mut dyn wie_cpu::CpuEngine,
-    address: u64,
-) -> Result<String> {
+fn read_optional_ansi_string(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<String> {
     if address == 0 {
         Ok(String::new())
     } else {

@@ -207,7 +207,10 @@ mod tests {
             resolve_get_proc_address("direct3dcreate9"),
             Some(0x0000_7000_0000_8140)
         );
-        assert_eq!(resolve_get_proc_address("GetUserDefaultUILanguage"), Some(0));
+        assert_eq!(
+            resolve_get_proc_address("GetUserDefaultUILanguage"),
+            Some(0)
+        );
         assert_eq!(resolve_get_proc_address("DefinitelyNotAnExport"), None);
     }
 }

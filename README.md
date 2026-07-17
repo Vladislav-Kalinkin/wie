@@ -3,7 +3,7 @@
 [![Project status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)](https://github.com/Vladislav-Kalinkin/wie)
 [![License](https://img.shields.io/github/license/Vladislav-Kalinkin/wie?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97+-blue?style=flat-square)](https://www.rust-lang.org/)
-[![GitHub Actions](https://img.shields.io/badge/CI-not%20configured-lightgrey?style=flat-square)](<>)
+[![CI](https://github.com/ваш-username/ваш-репозиторий/actions/workflows/ci.yml/badge.svg)](https://github.com/Vladislav-Kalinkin/wie/actions/workflows/rust.yml)
 [![GitHub stars](https://img.shields.io/github/stars/Vladislav-Kalinkin/wie?style=social)](https://github.com/Vladislav-Kalinkin/wie)
 
 > [!WARNING]
@@ -11,7 +11,7 @@
 
 > At the moment, WIE cannot run user executable files and is still a research and experimental project
 
-> The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%). 
+> The engine is currently in a raw state. It can execute the bundled probe EXEs, but CPU consumption is extremely high (exceeding 90%).
 
 **Idea** - Create an emulator to run custom 64-bit windows applications on MacOS Apple Silicon
 
@@ -29,6 +29,7 @@ api[0] handled fake=0x0000700000000050 ret=0x0000000000000000 resume=0x000000014
 api[1] handled fake=0x00007000000001f0 ret=- resume=- api-ms-win-crt-runtime-l1-1-0.dll!exit
 ./target/release/wie-cli run micro-exes/out/crt_hello.exe  0.02s user 0.03s system 81% cpu 0.059 total
 ```
+
 ```
 time WIE_RUNTIME_PROFILE=1  ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
 run_micro: path=micro-exes/out/long_loop.exe
@@ -46,7 +47,6 @@ top exports by count:
 run_micro: ok exit=0
 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro   1,37s user 0,03s system 99% cpu 1,420 total
 ```
-
 
 ## Core Components
 
@@ -173,7 +173,22 @@ And also this section is not about boasting or a proclamation of AI power. I con
 
 ## Contributing
 
-If you find problems, vulnerabilities or optimization solutions that I have not noticed, I will be glad if you let me know.
+Contributions are welcome! To maintain high code quality, please ensure your changes pass all local checks before submitting a Pull Request. Our CI pipeline automatically enforces these rules.
+
+### Pre-PR Checklist
+
+Before opening a PR, please run the following commands locally:
+
+1. **Code Formatting:** `cargo fmt --check`
+2. **Linter Rules:** `cargo clippy --all-targets -- -D warnings`
+3. **Unit Tests:** `cargo test`
+4. **Integration Suite:** `make -C micro-exes && ./scripts/run-micro-suite.sh`
+
+## Acknowledgments
+
+Special thanks to the awesome open-source contributors who help make **WIE** faster and more complete:
+
+- [@DevYatsu](https://github.com/DevYatsu) — For pioneering incredible performance optimizations
 
 ## License
 

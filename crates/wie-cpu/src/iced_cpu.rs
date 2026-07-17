@@ -4,8 +4,8 @@ use crate::exec::{self, HookWindow, StepResult};
 // Re-export for JIT host-stop checks.
 use crate::mem::GuestMemory;
 use crate::regs::RegFile;
-use crate::{CpuEngine, CpuError, RunUntilHook};
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
+use crate::{CpuEngine, CpuError, RunUntilHook};
 
 /// Power-of-two RIP ring capacity (mask indexing avoids `%` side-effect lints).
 const RIP_TRACE_CAP: usize = 32;

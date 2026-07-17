@@ -84,7 +84,9 @@ pub fn handle_choose_color_a(
     if choose_color_ptr != 0 {
         // Write default RGB color (black) into rgbResult field.
         let rgb_field = choose_color_ptr.wrapping_add(0x10);
-        drop(crate::guest_memory::write_u32(engine, rgb_field, 0x00_00_00));
+        drop(crate::guest_memory::write_u32(
+            engine, rgb_field, 0x00_00_00,
+        ));
     }
 
     let return_address = engine
@@ -210,11 +212,21 @@ fn write_selected_path(
         usize::try_from(request.max_file).context("OPENFILENAME.nMaxFile does not fit usize")?;
 
     if request.unicode {
-        write_utf16_c_string(engine, request.file_buffer_ptr, max_file_chars, request.path)
-            .context("failed to write Unicode lpstrFile")?;
+        write_utf16_c_string(
+            engine,
+            request.file_buffer_ptr,
+            max_file_chars,
+            request.path,
+        )
+        .context("failed to write Unicode lpstrFile")?;
     } else {
-        write_ansi_c_string(engine, request.file_buffer_ptr, max_file_chars, request.path)
-            .context("failed to write ANSI lpstrFile")?;
+        write_ansi_c_string(
+            engine,
+            request.file_buffer_ptr,
+            max_file_chars,
+            request.path,
+        )
+        .context("failed to write ANSI lpstrFile")?;
     }
 
     let (file_name, file_offset, extension_offset) = split_path_components(request.path);
@@ -234,7 +246,11 @@ fn write_selected_path(
 
     write_guest_u16(
         engine,
-        checked_field_address(request.ofn_ptr, OFN_NFILE_OFFSET, "OPENFILENAME.nFileOffset")?,
+        checked_field_address(
+            request.ofn_ptr,
+            OFN_NFILE_OFFSET,
+            "OPENFILENAME.nFileOffset",
+        )?,
         file_offset,
     )?;
 
@@ -269,8 +285,8 @@ fn split_path_components(path: &str) -> (&str, u16, u16) {
     });
 
     let file_offset = u16::try_from(file_start).unwrap_or(u16::MAX);
-    let extension_offset = u16::try_from(file_start.saturating_add(extension_start_in_file))
-        .unwrap_or(u16::MAX);
+    let extension_offset =
+        u16::try_from(file_start.saturating_add(extension_start_in_file)).unwrap_or(u16::MAX);
 
     (file_name, file_offset, extension_offset)
 }

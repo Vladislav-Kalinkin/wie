@@ -837,7 +837,11 @@ impl RuntimeSession {
             }
 
             let export_key = if self.profile_enabled {
-                Some(format!("{}!{}", resolved.library.as_ref(), resolved.name.as_ref()))
+                Some(format!(
+                    "{}!{}",
+                    resolved.library.as_ref(),
+                    resolved.name.as_ref()
+                ))
             } else {
                 None
             };
@@ -1003,7 +1007,14 @@ impl RuntimeSession {
                     let j_retaddr = handler_result.return_address;
                     self.publish_last_error_to_guest();
                     // WIE_API_JOURNAL=path — one line per host return for dual-backend diff.
-                    journal_api_return(index, j_lib.as_ref(), j_name.as_ref(), &mut self.engine, j_ret, j_retaddr);
+                    journal_api_return(
+                        index,
+                        j_lib.as_ref(),
+                        j_name.as_ref(),
+                        &mut self.engine,
+                        j_ret,
+                        j_retaddr,
+                    );
                 }
 
                 Err(error) => {
@@ -1070,7 +1081,11 @@ impl RuntimeSession {
                         }
 
                         None => {
-                            let api = format!("{}!{}: {error}", resolved.library.as_ref(), resolved.name.as_ref(),);
+                            let api = format!(
+                                "{}!{}: {error}",
+                                resolved.library.as_ref(),
+                                resolved.name.as_ref(),
+                            );
 
                             events.push(EntryTraceEvent {
                                 index,

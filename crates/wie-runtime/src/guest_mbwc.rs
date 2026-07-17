@@ -11,7 +11,7 @@ use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use wie_winapi::{resolve_winapi_id, WinApiId};
+use wie_winapi::{WinApiId, resolve_winapi_id};
 
 #[derive(Debug, Clone)]
 pub struct GuestMbwcConfig {

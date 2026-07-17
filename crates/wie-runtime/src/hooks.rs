@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wie_winapi::{resolve_winapi_id, WinApiId, WinApiTraits};
+use wie_winapi::{WinApiId, WinApiTraits, resolve_winapi_id};
 
 /// Runtime fake API dispatch entry.
 #[derive(Debug, Clone)]

@@ -34,7 +34,11 @@ pub(crate) fn run_micro(
     for event in &summary.run.events {
         println!(
             "  [{:>4}] {}!{} handled={} ret={:?}",
-            event.index, event.library.as_ref(), event.name.as_ref(), event.handled, event.return_value
+            event.index,
+            event.library.as_ref(),
+            event.name.as_ref(),
+            event.handled,
+            event.return_value
         );
     }
 

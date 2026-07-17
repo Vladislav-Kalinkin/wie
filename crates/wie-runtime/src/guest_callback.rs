@@ -71,11 +71,7 @@ pub(crate) fn create_window_return_value(lresult: u64, create_window_hwnd: Optio
         // Truncate to 32-bit signed LRESULT for WM_CREATE convention.
         let low = u32::try_from(lresult & 0xffff_ffff).unwrap_or(0);
         let create_status = i32::from_ne_bytes(low.to_ne_bytes());
-        if create_status == -1 {
-            0
-        } else {
-            hwnd
-        }
+        if create_status == -1 { 0 } else { hwnd }
     } else {
         lresult
     }

@@ -18,9 +18,11 @@ pub(crate) struct FakeApiRewire<'a> {
 impl FakeApiRewire<'_> {
     /// Find `library!name` in the IAT table, plant `mov rax,imm64; jmp rax`, clear stop bits.
     pub(crate) fn rewire(&mut self, library: &str, name: &str, target_va: u64) -> Result<()> {
-        let Some(entry) = self.entries.iter().find(|e| {
-            e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name)
-        }) else {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name))
+        else {
             tracing::debug!(library, name, "guest rewire: export not in IAT, skip");
             return Ok(());
         };

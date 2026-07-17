@@ -3,9 +3,7 @@ use anyhow::{Context, Result};
 use crate::WinApiHandlerResult;
 
 /// Handles dynamic `UXTHEME.dll!SetWindowTheme`.
-pub fn handle_set_window_theme(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_set_window_theme(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _window_handle = engine
         .read_rcx()
         .context("failed to read RCX for SetWindowTheme")?;

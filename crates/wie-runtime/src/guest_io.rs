@@ -38,7 +38,7 @@ use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use wie_winapi::{resolve_winapi_id, WinApiId};
+use wie_winapi::{WinApiId, resolve_winapi_id};
 
 /// Maximum simultaneously accelerated open files.
 pub const GUEST_IO_MAX_SLOTS: usize = 128;
@@ -297,7 +297,7 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     c.extend_from_slice(&[0x48, 0x89, 0xd8]); // mov rax, rbx
     debug_assert!(slot_size <= 127);
     c.extend_from_slice(&[0x48, 0x6b, 0xc0, slot_size as u8]); // imul rax, imm8
-                                                               // rbp = table + rax
+    // rbp = table + rax
     c.extend_from_slice(&[0x48, 0xbd]); // mov rbp, imm64
     c.extend_from_slice(&table.to_le_bytes());
     c.extend_from_slice(&[0x48, 0x01, 0xc5]); // add rbp, rax
@@ -317,10 +317,10 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     c.extend_from_slice(&[0x48, 0x8b, 0x75, 0x08]); // mov rsi, [rbp+8]
     c.extend_from_slice(&[0x48, 0x8b, 0x45, 0x18]); // mov rax, [rbp+24] cursor
     c.extend_from_slice(&[0x48, 0x01, 0xc6]); // add rsi, rax
-                                              // rcx = size - cursor = avail
+    // rcx = size - cursor = avail
     c.extend_from_slice(&[0x48, 0x8b, 0x4d, 0x10]); // mov rcx, [rbp+16]
     c.extend_from_slice(&[0x48, 0x29, 0xc1]); // sub rcx, rax
-                                              // if avail==0 or negative (JB): zero read
+    // if avail==0 or negative (JB): zero read
     let jb_zero = c.len();
     c.extend_from_slice(&[0x72, 0x00]); // jb zero_read (unsigned below)
 
@@ -329,7 +329,7 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     c.extend_from_slice(&[0x48, 0x39, 0xc8]); // cmp rax, rcx
     c.extend_from_slice(&[0x76, 0x03]); // jbe 3
     c.extend_from_slice(&[0x48, 0x89, 0xc8]); // mov rax, rcx
-                                              // rax = n; if n==0 → zero
+    // rax = n; if n==0 → zero
     c.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax,rax
     let jz_zero = c.len();
     c.extend_from_slice(&[0x74, 0x00]);
@@ -354,9 +354,9 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     c.extend_from_slice(&[0x4d, 0x85, 0xc9]); // test r9, r9
     c.extend_from_slice(&[0x74, 0x03]); // jz skip
     c.extend_from_slice(&[0x41, 0x89, 0x01]); // mov [r9], eax
-                                              // return TRUE
+    // return TRUE
     c.extend_from_slice(&[0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
-                                                                      // epilogue
+    // epilogue
     let epilogue_pos = c.len();
     c.extend_from_slice(&[0x5f, 0x5e, 0x5d, 0x5b, 0xc3]); // pop rdi,rsi,rbp,rbx; ret
 
@@ -366,25 +366,25 @@ fn build_readfile_bytes(table: u64, fallback: u64, max_slots: u64, slot_size: u6
     c.extend_from_slice(&[0x74, 0x07]); // skip 7-byte mov dword
     c.extend_from_slice(&[0x41, 0xc7, 0x01, 0x00, 0x00, 0x00, 0x00]); // mov dword [r9], 0
     c.extend_from_slice(&[0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00]); // mov rax, 1
-                                                                      // jmp epilogue
+    // jmp epilogue
     let jmp_epi1 = c.len();
     c.extend_from_slice(&[0xeb, 0x00]);
 
     // next:
     let next_pos = c.len();
     c.extend_from_slice(&[0x48, 0xff, 0xc3]); // inc rbx
-                                              // jmp loop
+    // jmp loop
     let jmp_loop = c.len();
     c.extend_from_slice(&[0xe9, 0, 0, 0, 0]);
 
     // fallback_path:
     let fallback_pos = c.len();
     c.extend_from_slice(&[0x5f, 0x5e, 0x5d, 0x5b]); // pop
-                                                    // restore args: rcx=handle was r10, rdx=buffer was r11
+    // restore args: rcx=handle was r10, rdx=buffer was r11
     c.extend_from_slice(&[0x4c, 0x89, 0xd1]); // mov rcx, r10
     c.extend_from_slice(&[0x4c, 0x89, 0xda]); // mov rdx, r11
-                                              // r8, r9 unchanged
-                                              // mov rax, fallback; jmp rax
+    // r8, r9 unchanged
+    // mov rax, fallback; jmp rax
     c.extend_from_slice(&[0x48, 0xb8]);
     c.extend_from_slice(&fallback.to_le_bytes());
     c.extend_from_slice(&[0xff, 0xe0]);
@@ -481,7 +481,7 @@ fn write_setfilepointer_impl(
     c.extend_from_slice(&[0x41, 0x83, 0xfb, 0x02]); // cmp r11d, 2
     let jne_bad = c.len();
     c.extend_from_slice(&[0x75, 0x00]); // bad method → fallback
-                                        // END: size + distance
+    // END: size + distance
     c.extend_from_slice(&[0x48, 0x8b, 0x45, 0x10]); // mov rax, [size]
     c.extend_from_slice(&[0x48, 0x01, 0xf0]);
 
@@ -490,17 +490,17 @@ fn write_setfilepointer_impl(
     c.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax, rax
     let js_fb = c.len();
     c.extend_from_slice(&[0x78, 0x00]); // js fallback
-                                        // store cursor
+    // store cursor
     c.extend_from_slice(&[0x48, 0x89, 0x45, 0x18]); // mov [rbp+24], rax
-                                                    // if r8 != 0: *r8 = high 32 bits of cursor
+    // if r8 != 0: *r8 = high 32 bits of cursor
     c.extend_from_slice(&[0x4d, 0x85, 0xc0]); // test r8,r8
     c.extend_from_slice(&[0x74, 0x0a]); // skip 10 bytes
     c.extend_from_slice(&[0x48, 0x89, 0xc1]); // mov rcx, rax
     c.extend_from_slice(&[0x48, 0xc1, 0xe9, 0x20]); // shr rcx, 32
     c.extend_from_slice(&[0x41, 0x89, 0x08]); // mov [r8], ecx
-                                              // return low 32 bits in eax (zero-extend)
+    // return low 32 bits in eax (zero-extend)
     c.extend_from_slice(&[0x89, 0xc0]); // mov eax, eax
-                                        // epilogue — restore RSI, RBP, RBX
+    // epilogue — restore RSI, RBP, RBX
     let epi = c.len();
     c.extend_from_slice(&[0x5e, 0x5d, 0x5b, 0xc3]); // pop rsi,rbp,rbx; ret
 
@@ -512,7 +512,7 @@ fn write_setfilepointer_impl(
     let fb = c.len();
     c.extend_from_slice(&[0x5e, 0x5d, 0x5b]); // pop rsi,rbp,rbx
     c.extend_from_slice(&[0x4c, 0x89, 0xd1]); // mov rcx, r10
-                                              // rdx still distance; r8 pHigh; r9 method — still valid
+    // rdx still distance; r8 pHigh; r9 method — still valid
     c.extend_from_slice(&[0x48, 0xb8]);
     c.extend_from_slice(&fallback.to_le_bytes());
     c.extend_from_slice(&[0xff, 0xe0]);

@@ -179,9 +179,8 @@ impl GuestMemory {
                 "mem_map address {address:#x} not page-aligned"
             )));
         }
-        let size_u64 = u64::try_from(size).map_err(|_| {
-            CpuError::Message(format!("mem_map size {size} does not fit u64"))
-        })?;
+        let size_u64 = u64::try_from(size)
+            .map_err(|_| CpuError::Message(format!("mem_map size {size} does not fit u64")))?;
         if !size_u64.is_multiple_of(PAGE_SIZE) {
             return Err(CpuError::Message(format!(
                 "mem_map size {size:#x} not page-aligned"
@@ -198,9 +197,10 @@ impl GuestMemory {
                 perms,
             });
             let ptr = {
-                let page = self.pages.get_mut(&key).ok_or_else(|| {
-                    CpuError::Message("mem_map internal missing page".into())
-                })?;
+                let page = self
+                    .pages
+                    .get_mut(&key)
+                    .ok_or_else(|| CpuError::Message("mem_map internal missing page".into()))?;
                 page.perms = perms;
                 page.data.as_mut_ptr()
             };
@@ -219,12 +219,11 @@ impl GuestMemory {
         let mut va = address;
         while offset < bytes.len() {
             let pkey = page_key(va);
-            let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
-                CpuError::Message("page offset does not fit usize".into())
-            })?;
-            let page = self.page_data_mut(pkey).ok_or_else(|| {
-                CpuError::Message(format!("mem_write unmapped {va:#x}"))
-            })?;
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1))
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
+            let page = self
+                .page_data_mut(pkey)
+                .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
             let room = (PAGE_SIZE as usize).saturating_sub(page_off);
             let remaining = bytes.len().saturating_sub(offset);
             let chunk = room.min(remaining);
@@ -248,12 +247,11 @@ impl GuestMemory {
         let mut va = address;
         while offset < bytes.len() {
             let pkey = page_key(va);
-            let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
-                CpuError::Message("page offset does not fit usize".into())
-            })?;
-            let page = self.page_data_ref(pkey).ok_or_else(|| {
-                CpuError::Message(format!("mem_read unmapped {va:#x}"))
-            })?;
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1))
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
+            let page = self
+                .page_data_ref(pkey)
+                .ok_or_else(|| CpuError::Message(format!("mem_read unmapped {va:#x}")))?;
             let room = (PAGE_SIZE as usize).saturating_sub(page_off);
             let remaining = bytes.len().saturating_sub(offset);
             let chunk = room.min(remaining);
@@ -324,11 +322,7 @@ impl GuestMemory {
         // SAFETY: non-null L3.
         let l3 = unsafe { &*l3p };
         let p = l3.entries[i3];
-        if p.is_null() {
-            None
-        } else {
-            Some(p)
-        }
+        if p.is_null() { None } else { Some(p) }
     }
 
     /// Read up to `max_len` bytes for instruction fetch; fails if first page unmapped.

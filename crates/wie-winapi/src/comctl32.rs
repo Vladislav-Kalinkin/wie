@@ -8,9 +8,7 @@ const FAKE_IMAGE_LIST_HANDLE: u64 = 0x0000_0000_6900_0001;
 const CLR_NONE: u32 = 0xffff_ffff;
 
 /// Handles dynamic `COMCTL32.dll!DllGetVersion`.
-pub fn handle_dll_get_version(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_dll_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let version_info_ptr = engine
         .read_rcx()
         .context("failed to read RCX for DllGetVersion")?;
