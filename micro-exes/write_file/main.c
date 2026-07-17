@@ -15,30 +15,24 @@
 #include <windows.h>
 
 void entry(void) {
-    HANDLE h;
-    DWORD written = 0;
-    const char data[] = "WIE_N2";
+  HANDLE h;
+  DWORD written = 0;
+  const char data[] = "WIE_N2";
 
-    h = CreateFileA(
-        "C:\\App\\n2_out.txt",
-        GENERIC_WRITE,
-        0,
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        ExitProcess(1);
-    }
+  h = CreateFileA("C:\\App\\n2_out.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                  FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) {
+    ExitProcess(1);
+  }
 
-    if (!WriteFile(h, data, 6, &written, NULL) || written != 6) {
-        CloseHandle(h);
-        ExitProcess(2);
-    }
+  if (!WriteFile(h, data, 6, &written, NULL) || written != 6) {
+    CloseHandle(h);
+    ExitProcess(2);
+  }
 
-    if (!CloseHandle(h)) {
-        ExitProcess(3);
-    }
+  if (!CloseHandle(h)) {
+    ExitProcess(3);
+  }
 
-    ExitProcess(0);
+  ExitProcess(0);
 }

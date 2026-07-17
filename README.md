@@ -173,7 +173,7 @@ And also this section is not about boasting or a proclamation of AI power. I con
 
 ## Contributing
 
-Contributions are welcome! To maintain high code quality, please ensure your changes pass all local checks before submitting a Pull Request. Our CI pipeline automatically enforces these rules.
+Contributions are welcome! To maintain high code quality, please check that your code complies with the Contributing rules (More details in the CONTRIBUTING.md file)
 
 ### Pre-PR Checklist
 
