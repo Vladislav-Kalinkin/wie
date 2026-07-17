@@ -3,7 +3,7 @@
 [![Project status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)](https://github.com/Vladislav-Kalinkin/wie)
 [![License](https://img.shields.io/github/license/Vladislav-Kalinkin/wie?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97+-blue?style=flat-square)](https://www.rust-lang.org/)
-[![CI](https://github.com/ваш-username/ваш-репозиторий/actions/workflows/ci.yml/badge.svg)](https://github.com/Vladislav-Kalinkin/wie/actions/workflows/rust.yml)
+[![CI](https://github.com/Vladislav-Kalinkin/wie/actions/workflows/ci.yml/badge.svg)](https://github.com/Vladislav-Kalinkin/wie/actions/workflows/rust.yml)
 [![GitHub stars](https://img.shields.io/github/stars/Vladislav-Kalinkin/wie?style=social)](https://github.com/Vladislav-Kalinkin/wie)
 
 > [!WARNING]
