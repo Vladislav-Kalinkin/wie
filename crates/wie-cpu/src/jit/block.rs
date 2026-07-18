@@ -680,6 +680,364 @@ fn mem_size_ok(instr: &Instruction) -> bool {
     }
 }
 
+/// Pre-compile plan: every memop in the block is `base+disp` on one stack
+/// register, base is not mutated, so a **single** entry guard can cover the
+/// whole block (Phase 4.1b super-fast path).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BlockStackPinPlan {
+    /// GPR index of the stack base (4 = RSP, 5 = RBP).
+    pub base_idx: usize,
+    /// Minimum signed displacement of any access in the block.
+    pub min_disp: i64,
+    /// Exclusive end offset: `max(disp_i + size_i)` over all accesses.
+    pub max_end: i64,
+    /// Any access needs data read rights on the pin.
+    pub needs_r: bool,
+    /// Any access needs data write rights on the pin.
+    pub needs_w: bool,
+}
+
+/// Analyse body (+ optional term insn) for block-wide stack-pin eligibility.
+///
+/// Returns `None` when any memop is not simple stack-relative, bases differ,
+/// the base register is written, stack ops modify RSP, or there is no memory.
+#[must_use]
+pub(super) fn analyze_block_stack_pin(
+    body: &[DecodedInsn],
+    term_insn: Option<&DecodedInsn>,
+) -> Option<BlockStackPinPlan> {
+    let mut base_reg: Option<Register> = None;
+    let mut min_disp = i64::MAX;
+    let mut max_end = i64::MIN;
+    let mut needs_r = false;
+    let mut needs_w = false;
+    let mut saw_mem = false;
+
+    let mut consider = |instr: &Instruction| -> Option<()> {
+        if insn_modifies_stack_ptr(instr) {
+            return None;
+        }
+        // Reject if this insn writes RSP/RBP before we know which base we need —
+        // checked again once base is known.
+        if let Some(b) = base_reg
+            && insn_writes_full_gpr(instr, b)
+        {
+            return None;
+        }
+        for op in 0..instr.op_count() {
+            if instr.op_kind(op) != OpKind::Memory {
+                continue;
+            }
+            // LEA is not a memory access (handled as non-mem in lowerable set);
+            // still skip if we ever see it tagged as Memory.
+            if instr.mnemonic() == Mnemonic::Lea {
+                continue;
+            }
+            let b = instr.memory_base();
+            if !is_stack_base_reg(b) || instr.memory_index() != Register::None {
+                return None;
+            }
+            // RIP-relative is not a stack pin.
+            if b == Register::RIP || b == Register::EIP {
+                return None;
+            }
+            match base_reg {
+                None => base_reg = Some(b),
+                Some(prev) if prev != b => return None,
+                Some(_) => {}
+            }
+            if insn_writes_full_gpr(instr, b) {
+                return None;
+            }
+            let disp = mem_disp_i64(instr);
+            let size = u64::from(mem_width_bytes(instr).ok()?);
+            let size_i = i64::try_from(size).ok()?;
+            let end = disp.checked_add(size_i)?;
+            min_disp = min_disp.min(disp);
+            max_end = max_end.max(end);
+            let (r, w) = mem_op_rw(instr, op);
+            needs_r |= r;
+            needs_w |= w;
+            saw_mem = true;
+        }
+        Some(())
+    };
+
+    for d in body {
+        consider(&d.instr)?;
+    }
+    if let Some(t) = term_insn {
+        // Call/ret touch the stack — not eligible.
+        if matches!(
+            t.instr.mnemonic(),
+            Mnemonic::Call | Mnemonic::Ret | Mnemonic::Retf
+        ) {
+            return None;
+        }
+        consider(&t.instr)?;
+    }
+
+    if !saw_mem || min_disp == i64::MAX || max_end == i64::MIN {
+        return None;
+    }
+    // Empty / inverted span (should not happen).
+    if max_end <= min_disp {
+        return None;
+    }
+    let base_reg = base_reg?;
+    let base_idx = stack_base_gpr_index(base_reg)?;
+    Some(BlockStackPinPlan {
+        base_idx,
+        min_disp,
+        max_end,
+        needs_r,
+        needs_w,
+    })
+}
+
+#[inline]
+fn is_stack_base_reg(r: Register) -> bool {
+    matches!(
+        r,
+        Register::RSP | Register::ESP | Register::RBP | Register::EBP
+    )
+}
+
+#[inline]
+fn stack_base_gpr_index(r: Register) -> Option<usize> {
+    match r {
+        Register::RSP | Register::ESP => Some(4),
+        Register::RBP | Register::EBP => Some(5),
+        _ => None,
+    }
+}
+
+/// iced stores displacements as the bit-pattern of a signed offset.
+#[inline]
+fn mem_disp_i64(instr: &Instruction) -> i64 {
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        instr.memory_displacement64() as i64
+    }
+}
+
+fn insn_modifies_stack_ptr(instr: &Instruction) -> bool {
+    matches!(
+        instr.mnemonic(),
+        Mnemonic::Push
+            | Mnemonic::Pop
+            | Mnemonic::Pushfq
+            | Mnemonic::Popfq
+            | Mnemonic::Pushf
+            | Mnemonic::Popf
+            | Mnemonic::Call
+            | Mnemonic::Ret
+            | Mnemonic::Retf
+            | Mnemonic::Enter
+            | Mnemonic::Leave
+    )
+}
+
+/// Whether `instr` writes the full 64-bit `reg` (or a GPR that aliases it).
+fn insn_writes_full_gpr(instr: &Instruction, reg: Register) -> bool {
+    if insn_modifies_stack_ptr(instr)
+        && matches!(
+            reg,
+            Register::RSP | Register::ESP | Register::RBP | Register::EBP
+        )
+    {
+        // PUSH/POP/CALL/RET always update RSP; LEAVE updates RBP+RSP.
+        if matches!(instr.mnemonic(), Mnemonic::Leave) {
+            return matches!(
+                reg,
+                Register::RSP | Register::ESP | Register::RBP | Register::EBP
+            );
+        }
+        return matches!(reg, Register::RSP | Register::ESP);
+    }
+    // Read-only memops / compares never write GPRs as op0.
+    if matches!(
+        instr.mnemonic(),
+        Mnemonic::Cmp
+            | Mnemonic::Test
+            | Mnemonic::Bt
+            | Mnemonic::Bts
+            | Mnemonic::Btr
+            | Mnemonic::Btc
+    ) {
+        // BTS/BTR/BTC write the mem/reg destination — handle below.
+        if matches!(
+            instr.mnemonic(),
+            Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Bt
+        ) {
+            return false;
+        }
+    }
+    if instr.op_count() == 0 {
+        return false;
+    }
+    if instr.op0_kind() != OpKind::Register {
+        return false;
+    }
+    let dst = instr.op_register(0);
+    gpr_aliases(dst, reg)
+}
+
+fn gpr_aliases(a: Register, b: Register) -> bool {
+    if a == b {
+        return true;
+    }
+    // Same full register family (RAX/EAX/AX/AL, …).
+    full_gpr(a) == full_gpr(b)
+}
+
+fn full_gpr(r: Register) -> Option<Register> {
+    // Full 64-bit home for partial GPRs (RAX family, …).
+    if matches!(
+        r,
+        Register::RAX | Register::EAX | Register::AX | Register::AL | Register::AH
+    ) {
+        return Some(Register::RAX);
+    }
+    if matches!(
+        r,
+        Register::RCX | Register::ECX | Register::CX | Register::CL | Register::CH
+    ) {
+        return Some(Register::RCX);
+    }
+    if matches!(
+        r,
+        Register::RDX | Register::EDX | Register::DX | Register::DL | Register::DH
+    ) {
+        return Some(Register::RDX);
+    }
+    if matches!(
+        r,
+        Register::RBX | Register::EBX | Register::BX | Register::BL | Register::BH
+    ) {
+        return Some(Register::RBX);
+    }
+    if matches!(
+        r,
+        Register::RSP | Register::ESP | Register::SP | Register::SPL
+    ) {
+        return Some(Register::RSP);
+    }
+    if matches!(
+        r,
+        Register::RBP | Register::EBP | Register::BP | Register::BPL
+    ) {
+        return Some(Register::RBP);
+    }
+    if matches!(
+        r,
+        Register::RSI | Register::ESI | Register::SI | Register::SIL
+    ) {
+        return Some(Register::RSI);
+    }
+    if matches!(
+        r,
+        Register::RDI | Register::EDI | Register::DI | Register::DIL
+    ) {
+        return Some(Register::RDI);
+    }
+    if matches!(
+        r,
+        Register::R8 | Register::R8D | Register::R8W | Register::R8L
+    ) {
+        return Some(Register::R8);
+    }
+    if matches!(
+        r,
+        Register::R9 | Register::R9D | Register::R9W | Register::R9L
+    ) {
+        return Some(Register::R9);
+    }
+    if matches!(
+        r,
+        Register::R10 | Register::R10D | Register::R10W | Register::R10L
+    ) {
+        return Some(Register::R10);
+    }
+    if matches!(
+        r,
+        Register::R11 | Register::R11D | Register::R11W | Register::R11L
+    ) {
+        return Some(Register::R11);
+    }
+    if matches!(
+        r,
+        Register::R12 | Register::R12D | Register::R12W | Register::R12L
+    ) {
+        return Some(Register::R12);
+    }
+    if matches!(
+        r,
+        Register::R13 | Register::R13D | Register::R13W | Register::R13L
+    ) {
+        return Some(Register::R13);
+    }
+    if matches!(
+        r,
+        Register::R14 | Register::R14D | Register::R14W | Register::R14L
+    ) {
+        return Some(Register::R14);
+    }
+    if matches!(
+        r,
+        Register::R15 | Register::R15D | Register::R15W | Register::R15L
+    ) {
+        return Some(Register::R15);
+    }
+    Option::None
+}
+
+/// Read/write intent for a memory operand at index `op`.
+fn mem_op_rw(instr: &Instruction, op: u32) -> (bool, bool) {
+    let m = instr.mnemonic();
+    // Pure stores: MOV/MOVZX/… with dest mem — still only write for MOV.
+    if op == 0 {
+        match m {
+            Mnemonic::Mov
+            | Mnemonic::Movd
+            | Mnemonic::Movq
+            | Mnemonic::Movaps
+            | Mnemonic::Movapd
+            | Mnemonic::Movups
+            | Mnemonic::Movupd
+            | Mnemonic::Movdqa
+            | Mnemonic::Movdqu
+            | Mnemonic::Movss
+            | Mnemonic::Movsd
+            | Mnemonic::Movsx
+            | Mnemonic::Movsxd
+            | Mnemonic::Movzx
+            | Mnemonic::Sete
+            | Mnemonic::Setne
+            | Mnemonic::Seta
+            | Mnemonic::Setae
+            | Mnemonic::Setb
+            | Mnemonic::Setbe
+            | Mnemonic::Setg
+            | Mnemonic::Setge
+            | Mnemonic::Setl
+            | Mnemonic::Setle
+            | Mnemonic::Seto
+            | Mnemonic::Setno
+            | Mnemonic::Sets
+            | Mnemonic::Setns
+            | Mnemonic::Setp
+            | Mnemonic::Setnp => (false, true),
+            Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Bt => (true, false),
+            // RMW ALU / shifts / etc.
+            _ => (true, true),
+        }
+    } else {
+        // Source memory operand — load.
+        (true, false)
+    }
+}
+
 /// Byte width of a memory operand (1/2/4/8/16).
 pub(super) fn mem_width_bytes(instr: &Instruction) -> Result<u32, String> {
     // Prefer iced's size table (covers Packed128_*, Float64, UInt128, …).

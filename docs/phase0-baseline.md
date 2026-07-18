@@ -26,7 +26,7 @@ Counters:
 
 | Guest | CPU | wall_ms | cpu% | emu_ms | host_stops | jit_insns | iced | compiles | cache_hits | load | store |
 | ----- | --- | ------: | ---: | -----: | ---------: | --------: | ---: | -------: | ---------: | ---: | ----: |
-| `long_loop` | **jit** | **1378–1646** | **~100%** | **1362–1622** | 1 | 11 | 174 | 3 | 0 | 1 | 0 |
+| `long_loop` | **jit** | **~285–320** (block-wide stack super; was ~540 hoist, ~1400 sticky-only) | **~100%** | **~280–310** | 1 | 11 | 174 | 3 | 0 | 0 | 0 |
 | `long_loop` | iced | **~70045** (fail) | ~100% | ~70030 | 0 | 0 | 800M | 0 | 0 | 0 | 0 |
 | `cpu_math` | jit | 17 | 95% | 0.01 | 1 | 0 | 3 | 2 | 0 | 0 | 0 |
 | `cpu_math` | iced | 22 | 84% | 1.87 | 1 | 0 | 3 | 0 | 0 | 0 | 0 |

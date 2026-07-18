@@ -36,9 +36,9 @@ use fast_api::{
     wie_ucrt_malloc, wie_ucrt_memcpy, wie_ucrt_strlen,
 };
 use lower::{
-    CHAIN_SLOTS, CompiledBlock, JitCtx, TLB_EMPTY, TLB_WAYS, chain_table_clear, chain_table_insert,
-    compile_block, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_load, wie_jit_store,
-    wie_jit_string,
+    CHAIN_SLOTS, CompiledBlock, JitCtx, MemPin, PIN_SLOTS, TLB_EMPTY, TLB_WAYS, chain_table_clear,
+    chain_table_insert, compile_block, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup,
+    wie_jit_load, wie_jit_store, wie_jit_string,
 };
 use std::collections::HashMap;
 use trampolines::match_micro_stub;
@@ -55,6 +55,55 @@ fn pure_loop_hotness() -> u32 {
     if cfg!(test) { 0 } else { 16 }
 }
 
+/// JIT memory lower mode (`WIE_JIT_MEM`).
+///
+/// - unset / `sticky` — sticky-TLB IR + **stack pin** (4.1b) + helper fallback
+/// - `slow` — helper-only loads/stores (oracle / bisect; no host ptr in IR)
+/// - `pin` — sticky + stack pin + heap region pin IR (Phase 4.1 full)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JitMemMode {
+    Slow,
+    Sticky,
+    Pin,
+}
+
+fn jit_mem_mode() -> JitMemMode {
+    use std::sync::OnceLock;
+    static MODE: OnceLock<JitMemMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("WIE_JIT_MEM") {
+        Ok(v) if v.eq_ignore_ascii_case("slow") || v == "0" || v.eq_ignore_ascii_case("off") => {
+            JitMemMode::Slow
+        }
+        Ok(v) if v.eq_ignore_ascii_case("pin") => JitMemMode::Pin,
+        Ok(v) if v.eq_ignore_ascii_case("sticky") || v.eq_ignore_ascii_case("fast") => {
+            JitMemMode::Sticky
+        }
+        _ => JitMemMode::Sticky,
+    })
+}
+
+/// Whether Cranelift may emit inline sticky-TLB load/store (not helper-only).
+pub(super) fn jit_mem_inline_enabled() -> bool {
+    !matches!(jit_mem_mode(), JitMemMode::Slow)
+}
+
+/// Whether Cranelift may emit region-pin IR in addition to sticky (`WIE_JIT_MEM=pin`).
+pub(super) fn jit_mem_pin_enabled() -> bool {
+    matches!(jit_mem_mode(), JitMemMode::Pin)
+}
+
+/// Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
+fn jit_chain_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("WIE_JIT_CHAIN"),
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        )
+    })
+}
+
 /// Hybrid CPU: Cranelift for hot pure-GPR blocks, iced for everything else.
 pub struct JitCpu {
     iced: IcedCpu,
@@ -66,18 +115,28 @@ pub struct JitCpu {
     /// rebuilding a full HashMap on every compile).
     chain_ids: HashMap<u64, cranelift_module::FuncId>,
     stats: JitStats,
-    /// Persistent multi-way page TLB across chained blocks (invalidate on mem_write/hooks).
+    /// Persistent multi-way page TLB across chained blocks (invalidate on protect/free).
     tlb_page: [u64; TLB_WAYS],
     tlb_ptr: [*mut u8; TLB_WAYS],
+    tlb_prot: [u8; TLB_WAYS],
+    tlb_gen: [u64; TLB_WAYS],
     tlb_rr: u64,
     /// Sticky last-hit page for inline IR mem path.
     tlb_hot_page: u64,
     tlb_hot_ptr: *mut u8,
+    tlb_hot_prot: u64,
+    tlb_hot_gen: u64,
+    /// Region-direct pins (rebuilt each `run_compiled` from layout + PageMap).
+    pins: [MemPin; PIN_SLOTS],
     /// Fake-API VA → fast UCRT kind (compile-time lookup).
     fast_api: HashMap<u64, FastApiKind>,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
     chain_va: Box<[u64; CHAIN_SLOTS]>,
     chain_fn: Box<[u64; CHAIN_SLOTS]>,
+    /// Phase 4.2 monomorphic edge IC (data plane; cleared with chain table).
+    edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
+    edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
+    edge_ic_rr: u64,
     /// Shadow return-stack depth across block entries (persisted in `run_compiled`).
     shadow_sp: u64,
     shadow_ret: [u64; lower::SHADOW_DEPTH],
@@ -185,12 +244,20 @@ impl JitCpu {
             },
             tlb_page: [TLB_EMPTY; TLB_WAYS],
             tlb_ptr: [std::ptr::null_mut(); TLB_WAYS],
+            tlb_prot: [0; TLB_WAYS],
+            tlb_gen: [0; TLB_WAYS],
             tlb_rr: 0,
             tlb_hot_page: TLB_EMPTY,
             tlb_hot_ptr: std::ptr::null_mut(),
+            tlb_hot_prot: 0,
+            tlb_hot_gen: 0,
+            pins: [MemPin::EMPTY; PIN_SLOTS],
             fast_api: HashMap::new(),
             chain_va: Box::new([0; CHAIN_SLOTS]),
             chain_fn: Box::new([0; CHAIN_SLOTS]),
+            edge_ic_va: [0; lower::EDGE_IC_SLOTS],
+            edge_ic_fn: [0; lower::EDGE_IC_SLOTS],
+            edge_ic_rr: 0,
             shadow_sp: 0,
             shadow_ret: [0; lower::SHADOW_DEPTH],
         }
@@ -216,7 +283,9 @@ impl JitCpu {
 
     /// Insert a Ready block and keep `chain_ids` consistent.
     fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
-        if let Some(fid) = compiled.func_id {
+        if jit_chain_enabled()
+            && let Some(fid) = compiled.func_id
+        {
             self.chain_ids.insert(rip, fid);
         }
         self.cache.insert(rip, CacheEntry::Ready(compiled));
@@ -257,10 +326,12 @@ impl JitCpu {
         }
         // Rebuild late-bound chain from remaining Ready entries.
         chain_table_clear(self.chain_va.as_mut(), self.chain_fn.as_mut());
-        for (va, entry) in &self.cache {
-            if let CacheEntry::Ready(c) = entry {
-                let fn_ptr = c.func as usize as u64;
-                chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), *va, fn_ptr);
+        if jit_chain_enabled() {
+            for (va, entry) in &self.cache {
+                if let CacheEntry::Ready(c) = entry {
+                    let fn_ptr = c.func as usize as u64;
+                    chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), *va, fn_ptr);
+                }
             }
         }
         // Code bytes changed under a previously compiled region — drop shadow.
@@ -383,8 +454,10 @@ impl JitCpu {
                         guest_end,
                     };
                     self.stats.compiles = self.stats.compiles.saturating_add(1);
-                    let fn_ptr = compiled.func as usize as u64;
-                    chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), rip, fn_ptr);
+                    if jit_chain_enabled() {
+                        let fn_ptr = compiled.func as usize as u64;
+                        chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), rip, fn_ptr);
+                    }
                     tracing::debug!(
                         start = format_args!("{rip:#x}"),
                         insns = compiled.insn_count,
@@ -403,6 +476,8 @@ impl JitCpu {
                 };
                 // Split borrows: `chain_ids` (Ready FuncIds) + `engine` mutably.
                 // Avoids rebuilding a HashMap over the full cache each compile.
+                let chain_on = jit_chain_enabled();
+                let empty_chain = HashMap::new();
                 let JitCpu {
                     engine,
                     chain_ids,
@@ -412,15 +487,18 @@ impl JitCpu {
                     ..
                 } = self;
                 let eng = engine.as_mut()?;
+                let chain_map = if chain_on { &*chain_ids } else { &empty_chain };
                 match compile_block(
-                    eng, rip, &insns, end_rip, term, call_fast, chain_ids, bytes_len,
+                    eng, rip, &insns, end_rip, term, call_fast, chain_map, bytes_len,
                 ) {
                     Ok(compiled) => {
                         stats.compiles = stats.compiles.saturating_add(1);
                         // Publish into late-bound chain table so older blocks can
                         // `call_indirect` here without recompilation.
-                        let fn_ptr = compiled.func as usize as u64;
-                        chain_table_insert(chain_va.as_mut(), chain_fn.as_mut(), rip, fn_ptr);
+                        if chain_on {
+                            let fn_ptr = compiled.func as usize as u64;
+                            chain_table_insert(chain_va.as_mut(), chain_fn.as_mut(), rip, fn_ptr);
+                        }
                         tracing::debug!(
                             start = format_args!("{rip:#x}"),
                             end = format_args!("{end_rip:#x}"),
@@ -463,6 +541,16 @@ impl JitCpu {
 
     /// Returns `Some(InvalidMem)` when a host mem helper faulted.
     fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
+        // Refresh pins from live layout + PageMap (gen + conservative R/W).
+        // Safe even when IR pin path is off: helpers still use pin_resolve.
+        {
+            let infos = self.iced.guest_mem_mut().jit_region_pins();
+            self.pins = [
+                MemPin::from_info(infos[0]),
+                MemPin::from_info(infos[1]),
+            ];
+        }
+        let mem_gen = self.iced.guest_mem_mut().generation();
         let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
         let regs = self.iced.regs_mut();
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
@@ -504,6 +592,15 @@ impl JitCpu {
             gpr_dirty_bits: 0,
             load_calls: 0,
             store_calls: 0,
+            tlb_hot_prot: self.tlb_hot_prot,
+            mem_gen,
+            tlb_prot: self.tlb_prot,
+            tlb_gen: self.tlb_gen,
+            tlb_hot_gen: self.tlb_hot_gen,
+            pins: self.pins,
+            edge_ic_va: self.edge_ic_va,
+            edge_ic_fn: self.edge_ic_fn,
+            edge_ic_rr: self.edge_ic_rr,
         };
         // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
         unsafe {
@@ -514,9 +611,16 @@ impl JitCpu {
         // Persist multi-way TLB + sticky hot page + shadow stack across chained blocks.
         self.tlb_page = ctx.tlb_page;
         self.tlb_ptr = ctx.tlb_ptr;
+        self.tlb_prot = ctx.tlb_prot;
+        self.tlb_gen = ctx.tlb_gen;
         self.tlb_rr = ctx.tlb_rr;
         self.tlb_hot_page = ctx.tlb_hot_page;
         self.tlb_hot_ptr = ctx.tlb_hot_ptr;
+        self.tlb_hot_prot = ctx.tlb_hot_prot;
+        self.tlb_hot_gen = ctx.tlb_hot_gen;
+        self.edge_ic_va = ctx.edge_ic_va;
+        self.edge_ic_fn = ctx.edge_ic_fn;
+        self.edge_ic_rr = ctx.edge_ic_rr;
         self.shadow_sp = ctx.shadow_sp;
         self.shadow_ret = ctx.shadow_ret;
         // Prefer cumulative trampoline dirty bits (partial writeback when a
@@ -571,13 +675,23 @@ impl JitCpu {
     fn invalidate_tlb(&mut self) {
         self.tlb_page = [TLB_EMPTY; TLB_WAYS];
         self.tlb_ptr = [std::ptr::null_mut(); TLB_WAYS];
+        self.tlb_prot = [0; TLB_WAYS];
+        self.tlb_gen = [0; TLB_WAYS];
         self.tlb_rr = 0;
         self.tlb_hot_page = TLB_EMPTY;
         self.tlb_hot_ptr = std::ptr::null_mut();
+        self.tlb_hot_prot = 0;
+        self.tlb_hot_gen = 0;
+        // Pins are rebuilt on next run_compiled; clear host bases so a stale
+        // mid-flight ctx (if any) cannot soft-translate after protect/free.
+        self.pins = [MemPin::EMPTY; PIN_SLOTS];
     }
 
     fn invalidate_chain_and_shadow(&mut self) {
         chain_table_clear(self.chain_va.as_mut(), self.chain_fn.as_mut());
+        self.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
+        self.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
+        self.edge_ic_rr = 0;
         self.shadow_sp = 0;
         self.shadow_ret = [0; lower::SHADOW_DEPTH];
     }

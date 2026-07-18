@@ -312,9 +312,11 @@ impl GuestMemory {
         self.backend.name()
     }
 
-    /// Monotonic generation for TLB / pin invalidation.
+    /// Monotonic generation for TLB / pin invalidation (Phase 4).
+    ///
+    /// Bumped on map / protect / commit / decommit / release. JIT TLB and future
+    /// region pins store this value at install time and miss when it diverges.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -340,6 +342,85 @@ impl GuestMemory {
     #[must_use]
     pub(crate) fn find_region(&self, va: u64) -> Option<&GuestRegion> {
         self.regions.find(va)
+    }
+
+    /// Build a Phase 4.1 region pin for JIT: soft-translated host base + bounds +
+    /// **conservative** software R/W (intersection over every committed page).
+    ///
+    /// Returns `None` when:
+    /// - the region has no `host_base` (HashMap-only / not arena-backed),
+    /// - any page in the range is free/reserved or missing from the page map,
+    /// - no usable R/W rights remain after intersection.
+    ///
+    /// Pins are **not** an oracle: protect mixed ranges simply disable W (or the
+    /// whole pin). Slow path [`Self::read`]/[`Self::write`] remains authoritative.
+    #[must_use]
+    pub(crate) fn region_pin(&self, region: &GuestRegion) -> Option<RegionPinInfo> {
+        let host_u = region.host_base?;
+        if host_u == 0 {
+            return None;
+        }
+        let guest_base = region.base;
+        let guest_end = region.end();
+        if guest_end <= guest_base {
+            return None;
+        }
+        // SAFETY: host_base was stored from a live arena mapping; pin is
+        // non-owning and invalidated via generation / invalidate_tlb on unmap.
+        #[allow(clippy::as_conversions)] // u64 host address → non-owning data pointer
+        let host_base = host_u as *mut u8;
+
+        let first_page = guest_base >> backend::PAGE_SHIFT;
+        let last_page = guest_end.saturating_sub(1) >> backend::PAGE_SHIFT;
+        let mut page = first_page;
+        let mut allow_r = true;
+        let mut allow_w = true;
+        let mut saw = false;
+        while page <= last_page {
+            let run = self.pages.lookup(page)?;
+            if run.state != PageState::Committed {
+                return None;
+            }
+            // Gap inside the region (lookup jumped past a free hole).
+            if page < run.start_page || page >= run.end_page {
+                return None;
+            }
+            allow_r &= protect::allows_read(run.protect);
+            allow_w &= protect::allows_write(run.protect);
+            saw = true;
+            let next = run.end_page;
+            if next <= page {
+                return None;
+            }
+            page = next;
+        }
+        if !saw || (!allow_r && !allow_w) {
+            return None;
+        }
+        Some(RegionPinInfo {
+            guest_base,
+            guest_end,
+            host_base,
+            allow_r,
+            allow_w,
+            generation: self.generation,
+        })
+    }
+
+    /// Pin slots for JIT: stack then primary heap (registration order).
+    ///
+    /// Empty slots are `None`. Callers copy into `JitCtx` at `run_compiled`.
+    #[must_use]
+    pub(crate) fn jit_region_pins(&self) -> [Option<RegionPinInfo>; 2] {
+        let stack = self
+            .regions
+            .find_by_kind(RegionKind::Stack)
+            .and_then(|r| self.region_pin(r));
+        let heap = self
+            .regions
+            .find_by_kind(RegionKind::Heap)
+            .and_then(|r| self.region_pin(r));
+        [stack, heap]
     }
 
     /// Map `[address, address+size)` with Unicorn-style `perms` (r/w/x).
@@ -1078,6 +1159,69 @@ impl GuestMemory {
         self.backend.read(address, bytes)
     }
 
+    /// Soft-translate a **contiguous** guest range to a host pointer for bulk copy.
+    ///
+    /// Phase 4.3: used by REP MOVS/STOS after SPC. Never returns guest VAs.
+    ///
+    /// Returns `None` when:
+    /// - `len == 0` or the range wraps,
+    /// - SPC denies the access for the whole span,
+    /// - multi-page range is not entirely inside one mmap arena,
+    /// - single-page host resolve fails (uncommitted / NOACCESS).
+    ///
+    /// On success, the returned pointer is valid for `len` bytes for the lifetime
+    /// of this `GuestMemory` borrow (and until the covering arena is released).
+    #[must_use]
+    pub(crate) fn host_span(
+        &self,
+        address: u64,
+        len: usize,
+        write: bool,
+    ) -> Option<*mut u8> {
+        if len == 0 {
+            return None;
+        }
+        let len_u = u64::try_from(len).ok()?;
+        let end = address.checked_add(len_u)?;
+        let kind = if write {
+            protect::AccessKind::Write
+        } else {
+            protect::AccessKind::Read
+        };
+        self.pages.check_access(address, len, kind).ok()?;
+
+        let page_off = usize::try_from(address & (backend::PAGE_SIZE - 1)).ok()?;
+        // Single-page: any backend (hash page or arena page).
+        if page_off.saturating_add(len) <= backend::PAGE_SIZE_USIZE {
+            let entry = self.page_tlb_entry_walk(address >> backend::PAGE_SHIFT)?;
+            if write && !entry.allow_w {
+                return None;
+            }
+            if !write && !entry.allow_r {
+                return None;
+            }
+            // SAFETY: host is a mapped page base; in-page offset + len checked.
+            #[expect(unsafe_code)]
+            return Some(unsafe { entry.host.add(page_off) });
+        }
+
+        // Multi-page: require one contiguous mmap arena covering [address, end).
+        let guest_base = self.backend.arena_guest_base_for_va(address)?;
+        let guest_base_last = self.backend.arena_guest_base_for_va(end.saturating_sub(1))?;
+        if guest_base != guest_base_last {
+            return None;
+        }
+        let host_base_u = self.backend.arena_host_base_for_va(address)?;
+        if host_base_u == 0 {
+            return None;
+        }
+        let off = address.checked_sub(guest_base)?;
+        let off_usize = usize::try_from(off).ok()?;
+        // SAFETY: SPC passed; start and last byte share one arena; soft translate.
+        #[expect(unsafe_code, clippy::as_conversions)] // host base address → data pointer
+        Some(unsafe { (host_base_u as *mut u8).add(off_usize) })
+    }
+
     /// Instruction fetch into a small stack buffer after SPC (execute permission).
     pub(crate) fn fetch_into(
         &self,
@@ -1114,32 +1258,104 @@ impl GuestMemory {
     ///
     /// Returns `None` if the page is not committed (JIT must not install a TLB
     /// entry for free/reserved pages). `PAGE_NOACCESS` also yields `None`.
+    ///
+    /// Prefer [`Self::page_tlb_entry`] for JIT installs — it also returns R/W
+    /// capability bits so the fast path can enforce SPC without a helper call.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
-        let run = self.pages.lookup(page_key)?;
-        if run.state != PageState::Committed {
-            return None;
-        }
-        // Allow TLB install if any access is possible; store/load still go
-        // through SPC on the slow path. Phase 3.2+ may tag entries with protect.
-        if !protect::allows_read(run.protect)
-            && !protect::allows_write(run.protect)
-            && !protect::allows_execute(run.protect)
-        {
-            return None;
-        }
-        self.backend.page_data_ptr(page_key)
+        self.page_tlb_entry(page_key).map(|e| e.host)
     }
 
     /// Fast page-table walk (HashMap radix or arena formula).
+    ///
+    /// Committed-only gate (same as [`Self::page_tlb_entry`] host resolution).
+    /// Callers that install a TLB must still honour protect via [`PageTlbEntry`].
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
+        self.page_tlb_entry_walk(page_key).map(|e| e.host)
+    }
+
+    /// Resolve a committed page for JIT TLB install: host pointer + R/W flags + gen.
+    #[must_use]
+    pub(crate) fn page_tlb_entry(&mut self, page_key: u64) -> Option<PageTlbEntry> {
+        let meta = self.page_protect_meta(page_key)?;
+        let host = self.backend.page_data_ptr(page_key)?;
+        Some(PageTlbEntry {
+            host,
+            allow_r: meta.allow_r,
+            allow_w: meta.allow_w,
+            generation: self.generation,
+        })
+    }
+
+    /// Read-only walk variant of [`Self::page_tlb_entry`] (no HashMap demand-fill).
+    #[must_use]
+    pub(crate) fn page_tlb_entry_walk(&self, page_key: u64) -> Option<PageTlbEntry> {
+        let meta = self.page_protect_meta(page_key)?;
+        let host = self.backend.page_data_ptr_walk(page_key)?;
+        Some(PageTlbEntry {
+            host,
+            allow_r: meta.allow_r,
+            allow_w: meta.allow_w,
+            generation: self.generation,
+        })
+    }
+
+    fn page_protect_meta(&self, page_key: u64) -> Option<PageProtectMeta> {
         let run = self.pages.lookup(page_key)?;
         if run.state != PageState::Committed {
             return None;
         }
-        self.backend.page_data_ptr_walk(page_key)
+        let allow_r = protect::allows_read(run.protect);
+        let allow_w = protect::allows_write(run.protect);
+        let allow_x = protect::allows_execute(run.protect);
+        // NOACCESS / no usable rights → no TLB entry.
+        if !allow_r && !allow_w && !allow_x {
+            return None;
+        }
+        Some(PageProtectMeta { allow_r, allow_w })
     }
+}
+
+/// JIT TLB install result: host page base + software permission snapshot.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageTlbEntry {
+    /// Non-owning host pointer to the guest page base.
+    pub host: *mut u8,
+    /// Software read permission at install time.
+    pub allow_r: bool,
+    /// Software write permission at install time.
+    pub allow_w: bool,
+    /// [`GuestMemory::generation`] at install time.
+    pub generation: u64,
+}
+
+/// Soft-translated region pin for Phase 4.1 JIT (stack / heap arenas).
+///
+/// `allow_*` is the **intersection** of software rights over the whole range —
+/// never more permissive than the slow path for any byte in the pin.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RegionPinInfo {
+    /// Inclusive guest base VA.
+    pub guest_base: u64,
+    /// Exclusive guest end VA.
+    pub guest_end: u64,
+    /// Host base for soft translate (`host + (va - guest_base)`).
+    pub host_base: *mut u8,
+    /// Every page in range allows data read.
+    pub allow_r: bool,
+    /// Every page in range allows data write.
+    pub allow_w: bool,
+    /// [`GuestMemory::generation`] at pin build time.
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PageProtectMeta {
+    allow_r: bool,
+    allow_w: bool,
 }
 
 #[cfg(test)]
@@ -1232,6 +1448,150 @@ mod tests {
         // Host storage still present; failure is SPC, not unmapped.
         let err = mem.write(0x20_0000, &[1]).expect_err("write denied");
         assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn page_tlb_entry_tags_ro_and_bumps_gen_on_protect() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        mem.map(0x50_0000, 0x1000, crate::perm::ALL).expect("map RWX");
+        let k = page_key(0x50_0000);
+        let e0 = mem.page_tlb_entry(k).expect("tlb entry");
+        assert!(e0.allow_r && e0.allow_w);
+        let g0 = e0.generation;
+        assert!(g0 >= 1);
+
+        let old = mem
+            .virtual_protect(0x50_0000, 0x1000, protect::PAGE_READONLY)
+            .expect("protect RO");
+        assert_eq!(old, protect::PAGE_EXECUTE_READWRITE);
+        assert!(mem.generation() > g0);
+
+        let e1 = mem.page_tlb_entry(k).expect("tlb after protect");
+        assert!(e1.allow_r);
+        assert!(!e1.allow_w);
+        assert_eq!(e1.generation, mem.generation());
+        assert!(mem.write(0x50_0000, &[0xcc]).is_err());
+    }
+
+    #[test]
+    fn page_tlb_entry_none_for_noaccess() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        mem.map(0x51_0000, 0x1000, 0).expect("map NA");
+        // perms 0 → PAGE_NOACCESS after map_with_type
+        assert!(mem.page_tlb_entry(page_key(0x51_0000)).is_none());
+    }
+
+    #[test]
+    fn region_pin_requires_host_base_and_intersects_protect() {
+        // Mmap backend fills host_base; uniform RW → full pin.
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        mem.map(0x2000_0000, 0x1_0000, crate::perm::ALL).expect("map stack");
+        mem.register_region(GuestRegion::new(
+            "stack",
+            RegionKind::Stack,
+            0x2000_0000,
+            0x1_0000,
+            crate::perm::ALL,
+        ));
+        let r = mem.find_region(0x2000_0800).expect("region").clone();
+        let pin = mem.region_pin(&r).expect("pin");
+        assert_eq!(pin.guest_base, 0x2000_0000);
+        assert_eq!(pin.guest_end, 0x2001_0000);
+        assert!(!pin.host_base.is_null());
+        assert!(pin.allow_r && pin.allow_w);
+
+        // Mixed protect: one RO page → allow_w false (conservative).
+        mem.virtual_protect(0x2000_1000, 0x1000, protect::PAGE_READONLY)
+            .expect("protect one page RO");
+        let pin2 = mem.region_pin(&r).expect("pin after protect");
+        assert!(pin2.allow_r);
+        assert!(!pin2.allow_w);
+        assert!(pin2.generation > pin.generation);
+    }
+
+    #[test]
+    fn region_pin_disabled_without_host_base() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        mem.map(0x2000_0000, 0x1000, crate::perm::ALL).expect("map");
+        mem.register_region(GuestRegion::new(
+            "stack",
+            RegionKind::Stack,
+            0x2000_0000,
+            0x1000,
+            crate::perm::ALL,
+        ));
+        let r = mem.find_region(0x2000_0000).expect("region").clone();
+        assert!(r.host_base.is_none());
+        assert!(mem.region_pin(&r).is_none());
+    }
+
+    #[test]
+    fn host_span_single_page_hash() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        mem.map(0x40_0000, 0x2000, crate::perm::ALL).expect("map");
+        let p = mem
+            .host_span(0x40_0100, 64, true)
+            .expect("single-page host span");
+        assert!(!p.is_null());
+        // SAFETY: span is live for this test.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(p, 0x5a, 64);
+        }
+        let mut buf = [0_u8; 64];
+        mem.read(0x40_0100, &mut buf).expect("read back");
+        assert!(buf.iter().all(|&b| b == 0x5a));
+    }
+
+    #[test]
+    fn host_span_multi_page_mmap() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        mem.map(0x50_0000, 0x3000, crate::perm::ALL).expect("map");
+        let len = 0x2000_usize;
+        let p = mem
+            .host_span(0x50_0800, len, true)
+            .expect("arena multi-page span");
+        assert!(!p.is_null());
+        // SAFETY: span is live for this test.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(p, 0xa5, len);
+        }
+        let mut buf = vec![0_u8; len];
+        mem.read(0x50_0800, &mut buf).expect("read");
+        assert!(buf.iter().all(|&b| b == 0xa5));
+    }
+
+    #[test]
+    fn host_span_ro_write_denied() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        mem.map(0x60_0000, 0x1000, crate::perm::ALL).expect("map");
+        mem.virtual_protect(0x60_0000, 0x1000, protect::PAGE_READONLY)
+            .expect("ro");
+        assert!(mem.host_span(0x60_0000, 32, true).is_none());
+        assert!(mem.host_span(0x60_0000, 32, false).is_some());
+    }
+
+    #[test]
+    fn region_pin_disabled_when_gap_in_range() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        // Two committed islands with a free hole between them.
+        mem.map(0x3000_0000, 0x1000, crate::perm::ALL).expect("map a");
+        mem.map(0x3000_2000, 0x1000, crate::perm::ALL).expect("map b");
+        // Register a region that claims the hole too (host_base from first arena).
+        mem.register_region(GuestRegion::new(
+            "span",
+            RegionKind::Other,
+            0x3000_0000,
+            0x3000,
+            crate::perm::ALL,
+        ));
+        // host_base may be set from first map only covering part of region —
+        // pin must still reject the free middle page.
+        let r = mem.find_region(0x3000_0000).expect("region").clone();
+        if r.host_base.is_some() {
+            assert!(mem.region_pin(&r).is_none(), "gap must disable pin");
+        }
     }
 
     #[test]

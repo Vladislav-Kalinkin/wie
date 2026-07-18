@@ -103,6 +103,12 @@ impl RegionTable {
         self.regions.iter().find(|r| r.contains(va))
     }
 
+    /// First registered region of the given kind (registration order).
+    #[must_use]
+    pub fn find_by_kind(&self, kind: RegionKind) -> Option<&GuestRegion> {
+        self.regions.iter().find(|r| r.kind == kind)
+    }
+
     /// Lookup by exact name.
     #[must_use]
     pub fn by_name(&self, name: &str) -> Option<&GuestRegion> {

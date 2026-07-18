@@ -1385,6 +1385,59 @@ pub(crate) fn run_string_op(
 /// Max elements processed in one bulk REP string step (faults still leave partial state).
 const REP_BULK_MAX: u64 = 1 << 20;
 
+/// Minimum byte length for host-span `memcpy`/`memset` (Phase 4.3).
+///
+/// Smaller REPs stay on the existing page-chunked `GuestMemory::{read,write}` path.
+const REP_HOST_BULK_MIN_BYTES: usize = 16;
+
+/// Whether REP MOVS/STOS may use soft-translated host `memcpy`/`memset`.
+///
+/// Kill-switch: `WIE_STRING_BULK=0|off|slow` forces the page-chunked path only.
+fn string_host_bulk_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("WIE_STRING_BULK"),
+            Ok(v)
+                if v == "0"
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("slow")
+                    || v.eq_ignore_ascii_case("false")
+        )
+    })
+}
+
+/// Host-span fill for REP STOS (pattern width 1/2/4/8).
+///
+/// # Safety
+/// `host` must point to `len` writable host bytes from [`GuestMemory::host_span`].
+#[expect(unsafe_code)]
+unsafe fn host_fill_pattern(host: *mut u8, len: usize, val: u64, size: usize) {
+    if size == 0 || len == 0 {
+        return;
+    }
+    if size == 1 {
+        // SAFETY: caller guarantees `host`/`len` from soft-translated span.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::write_bytes(host, u8::try_from(val & 0xff).unwrap_or(0), len);
+        }
+        return;
+    }
+    let bytes = val.to_le_bytes();
+    let pat = &bytes[..size.min(8)];
+    let mut i = 0_usize;
+    while i.saturating_add(size) <= len {
+        // SAFETY: `i + size <= len`; host span is live for this call.
+        #[expect(unsafe_code)]
+        unsafe {
+            std::ptr::copy_nonoverlapping(pat.as_ptr(), host.add(i), size);
+        }
+        i = i.saturating_add(size);
+    }
+}
+
 fn exec_stos(
     mem: &mut GuestMemory,
     regs: &mut RegFile,
@@ -1410,6 +1463,34 @@ fn string_stos(
     if rep {
         let mut count = regs.rcx().min(REP_BULK_MAX);
         let mut rdi = regs.rdi();
+        let size_u = u64::try_from(size).unwrap_or(1);
+        // Phase 4.3: soft-translated host span → memset-like fill (DF=0 or DF=1).
+        if count > 1 && string_host_bulk_enabled() {
+            let byte_len_u = count.saturating_mul(size_u);
+            let byte_len = usize::try_from(byte_len_u).unwrap_or(0);
+            if byte_len >= REP_HOST_BULK_MIN_BYTES {
+                // DF=0: [rdi, rdi+len). DF=1: last store at rdi-(count-1)*size.
+                let span_base = if step > 0 {
+                    Some(rdi)
+                } else {
+                    let last_off = (count - 1).saturating_mul(size_u);
+                    rdi.checked_sub(last_off)
+                };
+                if let Some(base) = span_base
+                    && let Some(host) = mem.host_span(base, byte_len, true)
+                {
+                    // SAFETY: host_span checked SPC + contiguous host mapping.
+                    #[expect(unsafe_code)]
+                    unsafe {
+                        host_fill_pattern(host, byte_len, val, size);
+                    }
+                    let delta = if step > 0 { byte_len_u } else { byte_len_u.wrapping_neg() };
+                    regs.set_rdi(rdi.wrapping_add(delta));
+                    regs.set_rcx(regs.rcx().saturating_sub(count));
+                    return Ok(true);
+                }
+            }
+        }
         // Forward DF: page-chunked mem.write with a repeated pattern.
         if step > 0 && count > 1 {
             let mut buf = vec![0_u8; 4096];
@@ -1418,8 +1499,7 @@ fn string_stos(
             while done_elems < count {
                 let remain_elems = count - done_elems;
                 let remain_bytes =
-                    usize::try_from(remain_elems.saturating_mul(u64::try_from(size).unwrap_or(1)))
-                        .unwrap_or(0);
+                    usize::try_from(remain_elems.saturating_mul(size_u)).unwrap_or(0);
                 let chunk = remain_bytes.min(buf.len());
                 let aligned = chunk - (chunk % size.max(1));
                 if aligned == 0 {
@@ -1433,7 +1513,7 @@ fn string_stos(
                     return Ok(false);
                 }
                 let elems = u64::try_from(aligned / size).unwrap_or(0);
-                rdi = rdi.wrapping_add(elems.saturating_mul(u64::try_from(size).unwrap_or(1)));
+                rdi = rdi.wrapping_add(elems.saturating_mul(size_u));
                 done_elems = done_elems.saturating_add(elems);
             }
             regs.set_rdi(rdi);
@@ -1491,8 +1571,49 @@ fn string_movs(
         let mut rsi = regs.rsi();
         let mut rdi = regs.rdi();
         let size_u = u64::try_from(size).unwrap_or(1);
-        let byte_len = count.saturating_mul(size_u);
-        let overlap = ranges_overlap(rsi, rdi, byte_len);
+        let byte_len_u = count.saturating_mul(size_u);
+        let byte_len = usize::try_from(byte_len_u).unwrap_or(0);
+        // Lowest address of each span (DF=1 starts at the high end).
+        let last_off = (count.saturating_sub(1)).saturating_mul(size_u);
+        let (src_lo, dst_lo) = if step > 0 {
+            (rsi, rdi)
+        } else {
+            (
+                rsi.wrapping_sub(last_off),
+                rdi.wrapping_sub(last_off),
+            )
+        };
+        let overlap = ranges_overlap(src_lo, dst_lo, byte_len_u);
+        // Phase 4.3: non-overlapping guest ranges + soft-translated host spans
+        // → `copy_nonoverlapping`. Guest-overlapping REP MOVS stays on the
+        // element loop (x86 directional copy ≠ host `memmove`).
+        if count > 1
+            && !overlap
+            && byte_len >= REP_HOST_BULK_MIN_BYTES
+            && string_host_bulk_enabled()
+        {
+            let src = mem.host_span(src_lo, byte_len, false);
+            let dst = mem.host_span(dst_lo, byte_len, true);
+            if let (Some(src_p), Some(dst_p)) = (src, dst)
+                && !host_ranges_overlap(src_p, dst_p, byte_len)
+            {
+                // SAFETY: both spans passed SPC; same len; no overlap; live.
+                #[expect(unsafe_code)]
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_p, dst_p, byte_len);
+                }
+                let delta = if step > 0 {
+                    byte_len_u
+                } else {
+                    byte_len_u.wrapping_neg()
+                };
+                regs.set_rsi(rsi.wrapping_add(delta));
+                regs.set_rdi(rdi.wrapping_add(delta));
+                regs.set_rcx(regs.rcx().saturating_sub(count));
+                return Ok(true);
+            }
+        }
+        // Page-chunked path only for forward DF + non-overlap (existing).
         if step > 0 && count > 1 && !overlap {
             let mut buf = vec![0_u8; 4096];
             let mut done_elems = 0_u64;
@@ -1553,6 +1674,19 @@ fn string_movs(
     regs.set_rsi(rsi.wrapping_add(step as u64));
     regs.set_rdi(rdi.wrapping_add(step as u64));
     Ok(false)
+}
+
+/// Whether two host ranges of `len` bytes overlap.
+fn host_ranges_overlap(a: *mut u8, b: *mut u8, len: usize) -> bool {
+    if len == 0 || a.is_null() || b.is_null() {
+        return false;
+    }
+    // `addr()` is the provenance-preserving integer address (usize).
+    let a_u = a.addr();
+    let b_u = b.addr();
+    let end_a = a_u.saturating_add(len.saturating_sub(1));
+    let end_b = b_u.saturating_add(len.saturating_sub(1));
+    a_u <= end_b && b_u <= end_a
 }
 
 fn ranges_overlap(a: u64, b: u64, len: u64) -> bool {

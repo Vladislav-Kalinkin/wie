@@ -120,25 +120,53 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ## Phase 4 – JIT Optimisations
 
-### 4.1 Region‑Direct Load/Store Path
+### 4.0 Foundation (SPC TLB + generation + kill-switches) ✅
 
-- In JIT helpers, if the accessed address belongs to a hot mmap region (stack, heap), compute `host_ptr` without a full TLB/radix walk.
-- Keep the existing multi‑way TLB as a fallback for other addresses.
+- Tag sticky / multi-way TLB with software R/W bits and `GuestMemory::generation`.
+- Inline sticky IR checks gen + permission bits before trusted host load/store.
+- Kill-switches: `WIE_JIT_MEM=slow|sticky|pin`, `WIE_JIT_CHAIN=0`.
+- Docs: [`docs/phase4-foundation.md`](docs/phase4-foundation.md).
 
-**DoD:** Faster `wie_jit_load/store` on memory‑intensive blocks; micro‑benchmarks show improvement.
+**DoD:** Micro-suite green; RO/protect unit tests; no silent write via TLB after protect. ✅
 
-### 4.2 Stack‑Relative Inlining (optional but high‑value)
+**Status (2026-07-18):** Done (PR0).
 
-- When the stack region is pinned for the block’s lifetime, lower `RSP`/`RBP`‑relative memory accesses to direct host pointer arithmetic in Cranelift IR, avoiding helper calls entirely.
+### 4.1 Region‑Direct Load/Store Path ✅
 
-**DoD:** Pure GPR blocks with stack traffic run measurably faster; no correctness regressions on edge cases.
+- `MemPin` slots (stack + primary heap) filled each `run_compiled` from `RegionTable.host_base` + PageMap **intersection** R/W + `mem_gen`.
+- Helper `pin_resolve` on TLB miss (always); Cranelift pin IR only under `WIE_JIT_MEM=pin` (sticky still preferred).
+- Docs: [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md).
 
-### 4.3 Accelerated String Operations (REP MOVS/STOS/SCAS/CMPS)
+**DoD:** Micro-suite green with `WIE_JIT_MEM=pin` on hybrid/mmap; RO/mixed protect cannot silent-write via pin; hash backend degrades to empty pins. ✅
 
-- Replace the current per‑page helper loop with bulk `memcpy`/`memmove`/`memset` from `libc` (optimised for Apple Silicon) for contiguous ranges.
-- Use NEON‑aware implementations for comparisons and scans.
+**Status (2026-07-18):** Done (PR1). Default remains sticky; full heap pin IR opt-in.
 
-**DoD:** `cpu_string` and any guest using large `memcpy` see significant speed‑up; correctness for overlapping ranges is preserved.
+### 4.1b Stack pin + block-wide super-fast path ✅
+
+- Stack `MemPin` hoisted once on block entry; normal path: CFG pin → sticky → helper.
+- **Block-wide guard:** pre-compile scan of all load/store displacements; one prologue check that `[base+min_disp, base+max_end)` ⊆ pin; then dual path:
+  - **Super:** `host = bias + guest_va` — bare host load/store, **no** per-access bounds IR
+  - **Normal:** hoisted pin / sticky probes (guard miss / mixed protect)
+- Eligible only when every memop is same stack base + const disp, base not mutated, no push/pop/call/ret.
+- **Perf (`long_loop` 100M volatile stack ops, release):** ~1.4s sticky-only → ~0.54s hoist → **~0.28–0.32s** block-wide super.
+
+**DoD:** Micro-suite green; pure stack loops use super path; guard fail stays correct. ✅
+
+### 4.2 Chaining / I-cache policy (data plane) ✅
+
+- **No executable patching** of Cranelift output; chaining stays FuncRef + chain table + monomorphic **edge IC** (`edge_ic_va`/`edge_ic_fn`).
+- Docs: [`docs/phase4-jit-coherency.md`](docs/phase4-jit-coherency.md).
+
+**DoD:** Documented I$/D$ policy; edge IC improves late-bound hits; `WIE_JIT_CHAIN=0` still works. ✅
+
+### 4.3 Accelerated String Operations (REP MOVS/STOS) ✅
+
+- Soft-translated host spans via `GuestMemory::host_span` → host `copy_nonoverlapping` / pattern fill after SPC.
+- Guest-overlapping MOVS and DF=1 stay on element loop (x86 forward ≠ `memmove`).
+- Kill-switch: `WIE_STRING_BULK=0`. Docs: [`docs/phase4-string-bulk.md`](docs/phase4-string-bulk.md).
+- SCAS/CMPS remain element loop (ROI later).
+
+**DoD:** `cpu_string` green; host-span unit tests; no guest-VA into libc. ✅
 
 ---
 

@@ -11,8 +11,8 @@ env:
 
 jobs:
   check:
-    name: Code Quality & Tests
-    runs-on: ubuntu-latest
+    name: Code Quality & Tests (Apple Silicon)
+    runs-on: macos-latest
 
     steps:
       - name: Checkout repository
@@ -29,11 +29,8 @@ jobs:
       - name: Run Clippy (Linter)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Install MinGW
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Run test suite (Apple Silicon JIT Matrix)
+        run: |
+          WIE_MEM=hybrid WIE_JIT_MEM=sticky cargo test --workspace
 
-      - name: Build test executables
-        run: make -C micro-exes
-
-      - name: Run tests
-        run: cargo test
+          WIE_MEM=hybrid WIE_JIT_MEM=pin WIE_JIT_CHAIN=1 WIE_STRING_BULK=1 cargo test --workspace

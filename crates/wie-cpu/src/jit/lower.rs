@@ -9,7 +9,10 @@
 )]
 
 use super::JitEngine;
-use super::block::{BlockTerm, DecodedInsn, is_string_op, mem_width_bytes, string_op_size};
+use super::block::{
+    analyze_block_stack_pin, BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op,
+    mem_width_bytes, string_op_size,
+};
 use super::fast_api::{self, FastApiKind};
 use crate::exec::{self, StringOpKind};
 use crate::mem::{GuestMemory, PAGE_SIZE};
@@ -26,10 +29,77 @@ pub(super) const TLB_WAYS: usize = 32;
 /// Empty TLB slot marker (`page_key == TLB_EMPTY`).
 pub(super) const TLB_EMPTY: u64 = u64::MAX;
 
+/// TLB / sticky software permission: bit0 = read, bit1 = write.
+pub(super) const TLB_PROT_R: u64 = 1;
+pub(super) const TLB_PROT_W: u64 = 2;
+
 /// Open-addressing slots for guest-VA → host block fn (block chaining).
 pub(super) const CHAIN_SLOTS: usize = 512;
 /// Shadow return-stack depth (power of two; modular index).
 pub(super) const SHADOW_DEPTH: usize = 32;
+/// Region-direct pin slots (stack + primary heap). Phase 4.1.
+pub(super) const PIN_SLOTS: usize = 2;
+/// Bytes per [`MemPin`] (`repr(C)`: 5×u64).
+pub(super) const PIN_STRIDE: i32 = 40;
+/// Monomorphic edge inline-cache slots (Phase 4.2 data-plane chaining).
+pub(super) const EDGE_IC_SLOTS: usize = 4;
+
+/// Soft-translated region pin (stack / heap) for Phase 4.1 JIT.
+///
+/// Empty pin: `host_base == 0`. Filled at each `run_compiled` from
+/// [`crate::mem::GuestMemory::jit_region_pins`]; gen must match `mem_gen`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct MemPin {
+    /// Inclusive guest base VA.
+    pub guest_base: u64,
+    /// Exclusive guest end VA.
+    pub guest_end: u64,
+    /// Host soft-translate base (integer form of `*mut u8`).
+    pub host_base: u64,
+    /// Memory generation at pin install.
+    pub mem_gen: u64,
+    /// Software R/W bits (`TLB_PROT_R` / `TLB_PROT_W`), intersection over range.
+    pub allow: u64,
+}
+
+impl MemPin {
+    /// Disabled / empty pin.
+    pub(super) const EMPTY: Self = Self {
+        guest_base: 0,
+        guest_end: 0,
+        host_base: 0,
+        mem_gen: 0,
+        allow: 0,
+    };
+
+    /// Build from a [`crate::mem::RegionPinInfo`] (or empty if `None`).
+    pub(super) fn from_info(info: Option<crate::mem::RegionPinInfo>) -> Self {
+        let Some(p) = info else {
+            return Self::EMPTY;
+        };
+        if p.host_base.is_null() || p.guest_end <= p.guest_base {
+            return Self::EMPTY;
+        }
+        let mut allow = 0_u64;
+        if p.allow_r {
+            allow |= TLB_PROT_R;
+        }
+        if p.allow_w {
+            allow |= TLB_PROT_W;
+        }
+        if allow == 0 {
+            return Self::EMPTY;
+        }
+        Self {
+            guest_base: p.guest_base,
+            guest_end: p.guest_end,
+            host_base: p.host_base as u64,
+            mem_gen: p.generation,
+            allow,
+        }
+    }
+}
 
 /// Guest register file snapshot for a compiled block (C ABI).
 ///
@@ -76,6 +146,27 @@ pub(super) struct JitCtx {
     pub load_calls: u64,
     /// Phase 0: host store helper invocations during this `run_compiled`.
     pub store_calls: u64,
+    /// Software R/W bits for sticky page (`TLB_PROT_R` / `TLB_PROT_W`).
+    pub tlb_hot_prot: u64,
+    /// [`GuestMemory::generation`] snapshot for this `run_compiled` (pin/TLB gen check).
+    pub mem_gen: u64,
+    /// Per-way software R/W bits (parallel to `tlb_page` / `tlb_ptr`).
+    pub tlb_prot: [u8; TLB_WAYS],
+    /// Per-way memory generation at install (parallel to `tlb_page`).
+    pub tlb_gen: [u64; TLB_WAYS],
+    /// Generation recorded for the sticky hot page.
+    pub tlb_hot_gen: u64,
+    /// Region-direct pins (stack / heap); empty when `host_base == 0`.
+    pub pins: [MemPin; PIN_SLOTS],
+    /// Phase 4.2 monomorphic edge IC: guest target VA (0 = empty).
+    ///
+    /// Data-plane only — never patches finalized host code. Speeds late-bound
+    /// chain hits when a block repeatedly transfers to the same successor.
+    pub edge_ic_va: [u64; EDGE_IC_SLOTS],
+    /// Parallel host fn pointers for [`Self::edge_ic_va`].
+    pub edge_ic_fn: [u64; EDGE_IC_SLOTS],
+    /// Round-robin victim for edge-IC install after a full chain-table hit.
+    pub edge_ic_rr: u64,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
@@ -88,6 +179,13 @@ const OFF_XMM: i32 = std::mem::offset_of!(JitCtx, xmm) as i32;
 const OFF_SHADOW_RET: i32 = OFF_SHADOW_SP + 8;
 const OFF_TLB_HOT_PAGE: i32 = std::mem::offset_of!(JitCtx, tlb_hot_page) as i32;
 const OFF_TLB_HOT_PTR: i32 = std::mem::offset_of!(JitCtx, tlb_hot_ptr) as i32;
+const OFF_TLB_HOT_PROT: i32 = std::mem::offset_of!(JitCtx, tlb_hot_prot) as i32;
+const OFF_MEM_GEN: i32 = std::mem::offset_of!(JitCtx, mem_gen) as i32;
+const OFF_TLB_HOT_GEN: i32 = std::mem::offset_of!(JitCtx, tlb_hot_gen) as i32;
+const OFF_PINS: i32 = std::mem::offset_of!(JitCtx, pins) as i32;
+const OFF_EDGE_IC_VA: i32 = std::mem::offset_of!(JitCtx, edge_ic_va) as i32;
+const OFF_EDGE_IC_FN: i32 = std::mem::offset_of!(JitCtx, edge_ic_fn) as i32;
+const OFF_EDGE_IC_RR: i32 = std::mem::offset_of!(JitCtx, edge_ic_rr) as i32;
 
 // Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
 const _: () = {
@@ -99,8 +197,17 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, shadow_ret) as i32 == OFF_SHADOW_RET);
     assert!(std::mem::offset_of!(JitCtx, tlb_hot_page) as i32 == OFF_TLB_HOT_PAGE);
     assert!(std::mem::offset_of!(JitCtx, tlb_hot_ptr) as i32 == OFF_TLB_HOT_PTR);
+    assert!(std::mem::offset_of!(JitCtx, tlb_hot_prot) as i32 == OFF_TLB_HOT_PROT);
+    assert!(std::mem::offset_of!(JitCtx, mem_gen) as i32 == OFF_MEM_GEN);
+    assert!(std::mem::offset_of!(JitCtx, tlb_hot_gen) as i32 == OFF_TLB_HOT_GEN);
+    assert!(std::mem::offset_of!(JitCtx, pins) as i32 == OFF_PINS);
+    assert!(std::mem::offset_of!(JitCtx, edge_ic_va) as i32 == OFF_EDGE_IC_VA);
+    assert!(std::mem::offset_of!(JitCtx, edge_ic_fn) as i32 == OFF_EDGE_IC_FN);
+    assert!(std::mem::offset_of!(JitCtx, edge_ic_rr) as i32 == OFF_EDGE_IC_RR);
+    assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(SHADOW_DEPTH.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());
+    assert!(EDGE_IC_SLOTS > 0);
 };
 
 /// Finalized block ready to run.
@@ -165,47 +272,147 @@ fn set_fault(ctx: &mut JitCtx, insn_ip: u64, addr: u64, size: u64, access: u64) 
 }
 
 /// Promote a mapped page into the sticky hot TLB (inline IR path) and multi-way cache.
-fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8) {
+fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, generation: u64) {
     ctx.tlb_hot_page = page_key;
     ctx.tlb_hot_ptr = page_base;
+    ctx.tlb_hot_prot = u64::from(prot);
+    ctx.tlb_hot_gen = generation;
+}
+
+#[inline]
+fn tlb_prot_allows(prot: u8, write: bool) -> bool {
+    if write {
+        (u64::from(prot) & TLB_PROT_W) != 0
+    } else {
+        (u64::from(prot) & TLB_PROT_R) != 0
+    }
+}
+
+fn pack_tlb_prot(allow_r: bool, allow_w: bool) -> u8 {
+    let mut p = 0_u8;
+    if allow_r {
+        p |= u8::try_from(TLB_PROT_R).unwrap_or(1);
+    }
+    if allow_w {
+        p |= u8::try_from(TLB_PROT_W).unwrap_or(2);
+    }
+    p
+}
+
+/// Soft-translate via region pin when gen / bounds / R|W match (Phase 4.1).
+///
+/// On hit, also warms sticky + multi-way TLB so subsequent sticky IR can fire.
+fn pin_resolve(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<*mut u8> {
+    let size_u = u64::try_from(size).unwrap_or(0);
+    if size_u == 0 {
+        return None;
+    }
+    let end = addr.checked_add(size_u)?;
+    let cur_gen = ctx.mem_gen;
+    for pin in &ctx.pins {
+        if pin.host_base == 0 || pin.mem_gen != cur_gen {
+            continue;
+        }
+        if addr < pin.guest_base || end > pin.guest_end {
+            continue;
+        }
+        let prot = u8::try_from(pin.allow).unwrap_or(0);
+        if !tlb_prot_allows(prot, write) {
+            continue;
+        }
+        let off = usize::try_from(addr.wrapping_sub(pin.guest_base)).unwrap_or(usize::MAX);
+        if off == usize::MAX {
+            continue;
+        }
+        // SAFETY: host_base is arena soft-translate base; bounds checked above.
+        let host = unsafe { (pin.host_base as *mut u8).add(off) };
+        // Warm sticky / multi-way for the containing page (conservative pin prot).
+        let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
+        let page_key = addr >> 12;
+        // SAFETY: host points into the pin span; subtract in-page offset for page base.
+        let page_base = unsafe { host.sub(page_off) };
+        let slot = usize::try_from(ctx.tlb_rr % u64::try_from(TLB_WAYS).unwrap_or(4)).unwrap_or(0);
+        ctx.tlb_page[slot] = page_key;
+        ctx.tlb_ptr[slot] = page_base;
+        ctx.tlb_prot[slot] = prot;
+        ctx.tlb_gen[slot] = pin.mem_gen;
+        ctx.tlb_rr = ctx.tlb_rr.wrapping_add(1);
+        tlb_set_hot(ctx, page_key, page_base, prot, pin.mem_gen);
+        return Some(host);
+    }
+    None
 }
 
 /// Resolve host page pointer via multi-way TLB (single-page accesses only).
-unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize) -> Option<*mut u8> {
+///
+/// Enforces software R/W bits and memory generation on every hit. Misses that
+/// lack the required permission return `None` so the slow path can set a fault
+/// via [`GuestMemory::read`] / [`GuestMemory::write`] (SPC oracle).
+unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<*mut u8> {
     let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
     let page_cap = usize::try_from(PAGE_SIZE).unwrap_or(0x1000);
     if page_off.saturating_add(size) > page_cap {
         return None; // cross-page → slow path
     }
     let page_key = addr >> 12; // PAGE_SIZE = 0x1000
+    let cur_gen = ctx.mem_gen;
     // Sticky hit first (matches inline IR fast path).
-    if ctx.tlb_hot_page == page_key && !ctx.tlb_hot_ptr.is_null() {
-        // SAFETY: hot ptr is a mapped page base; access stays in-page.
+    if ctx.tlb_hot_page == page_key
+        && !ctx.tlb_hot_ptr.is_null()
+        && ctx.tlb_hot_gen == cur_gen
+        && tlb_prot_allows(u8::try_from(ctx.tlb_hot_prot).unwrap_or(0), write)
+    {
+        // SAFETY: hot ptr is a mapped page base; access stays in-page; SPC bits match.
         return Some(unsafe { ctx.tlb_hot_ptr.add(page_off) });
     }
     for i in 0..TLB_WAYS {
-        if ctx.tlb_page[i] == page_key && !ctx.tlb_ptr[i].is_null() {
-            tlb_set_hot(ctx, page_key, ctx.tlb_ptr[i]);
+        if ctx.tlb_page[i] == page_key
+            && !ctx.tlb_ptr[i].is_null()
+            && ctx.tlb_gen[i] == cur_gen
+            && tlb_prot_allows(ctx.tlb_prot[i], write)
+        {
+            tlb_set_hot(
+                ctx,
+                page_key,
+                ctx.tlb_ptr[i],
+                ctx.tlb_prot[i],
+                ctx.tlb_gen[i],
+            );
             // SAFETY: page mapped; access stays within the page.
             return Some(unsafe { ctx.tlb_ptr[i].add(page_off) });
         }
     }
-    // Miss: walk dense page table first (no HashMap), else install via map path.
+    // Region-direct pin (stack/heap arenas) before radix/page walk.
+    if let Some(p) = pin_resolve(ctx, addr, size, write) {
+        return Some(p);
+    }
+    // Miss: resolve via GuestMemory (committed + protect meta + host ptr).
     // SAFETY: `mem` set by `run_compiled` to the live guest map.
     let mem = unsafe { &mut *ctx.mem };
-    let ptr = mem
-        .page_data_ptr_walk(page_key)
-        .or_else(|| mem.page_data_ptr(page_key))?;
+    let entry = mem
+        .page_tlb_entry_walk(page_key)
+        .or_else(|| mem.page_tlb_entry(page_key))?;
+    // Install even if this access is denied so a later opposite access can hit;
+    // but only return a pointer when the *current* access is allowed.
+    let prot = pack_tlb_prot(entry.allow_r, entry.allow_w);
     let slot = usize::try_from(ctx.tlb_rr % u64::try_from(TLB_WAYS).unwrap_or(4)).unwrap_or(0);
     ctx.tlb_page[slot] = page_key;
-    ctx.tlb_ptr[slot] = ptr;
+    ctx.tlb_ptr[slot] = entry.host;
+    ctx.tlb_prot[slot] = prot;
+    ctx.tlb_gen[slot] = entry.generation;
     ctx.tlb_rr = ctx.tlb_rr.wrapping_add(1);
-    tlb_set_hot(ctx, page_key, ptr);
-    // SAFETY: page mapped; access stays within the page.
-    Some(unsafe { ptr.add(page_off) })
+    tlb_set_hot(ctx, page_key, entry.host, prot, entry.generation);
+    if !tlb_prot_allows(prot, write) {
+        return None;
+    }
+    // SAFETY: page mapped; access stays within the page; permission checked.
+    Some(unsafe { entry.host.add(page_off) })
 }
 
 /// Lookup host block pointer for `va` (0 = miss). Used for late-bound chaining.
+///
+/// Checks monomorphic edge IC first (Phase 4.2), then the open-addressing chain
+/// table. On a table hit, installs into an edge-IC slot for the next transfer.
 ///
 /// `extern "C" fn(ctx, va) -> fn_ptr`
 pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) -> u64 {
@@ -213,7 +420,16 @@ pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) 
         return 0;
     }
     // SAFETY: `run_compiled` sets chain_* to live tables for the block duration.
-    let ctx = unsafe { &*ctx };
+    let ctx = unsafe { &mut *ctx };
+    // Edge IC (data plane): monomorphic last-hit successors.
+    for i in 0..EDGE_IC_SLOTS {
+        if ctx.edge_ic_va[i] == va {
+            let f = ctx.edge_ic_fn[i];
+            if f != 0 {
+                return f;
+            }
+        }
+    }
     if ctx.chain_va.is_null() || ctx.chain_fn.is_null() {
         return 0;
     }
@@ -225,7 +441,16 @@ pub(super) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) 
     for _ in 0..16 {
         let k = keys[i];
         if k == va {
-            return fns[i];
+            let f = fns[i];
+            if f != 0 {
+                // Install monomorphic edge IC (RR victim).
+                let slot = usize::try_from(ctx.edge_ic_rr % u64::try_from(EDGE_IC_SLOTS).unwrap_or(4))
+                    .unwrap_or(0);
+                ctx.edge_ic_va[slot] = va;
+                ctx.edge_ic_fn[slot] = f;
+                ctx.edge_ic_rr = ctx.edge_ic_rr.wrapping_add(1);
+            }
+            return f;
         }
         if k == 0 {
             return 0;
@@ -253,9 +478,9 @@ pub(super) unsafe extern "C" fn wie_jit_load(
         set_fault(ctx, insn_ip, addr, size, 0);
         return 0;
     }
-    // Fast path: single-page TLB.
+    // Fast path: single-page TLB with SPC R bit + generation.
     // SAFETY: TLB pointer is a live page from guest map for this block.
-    if let Some(p) = unsafe { tlb_page_ptr(ctx, addr, size_usize) } {
+    if let Some(p) = unsafe { tlb_page_ptr(ctx, addr, size_usize, false) } {
         let mut buf = [0_u8; 8];
         // SAFETY: `p` points into a mapped page with `size_usize` bytes in range.
         unsafe {
@@ -269,7 +494,7 @@ pub(super) unsafe extern "C" fn wie_jit_load(
             _ => 0,
         };
     }
-    // Slow path: multi-page or miss.
+    // Slow path: multi-page, miss, or SPC deny on TLB.
     // SAFETY: `mem` set by `run_compiled`.
     let mem = unsafe { &mut *ctx.mem };
     let mut buf = [0_u8; 8];
@@ -306,8 +531,8 @@ pub(super) unsafe extern "C" fn wie_jit_store(
         return;
     }
     let bytes = value.to_le_bytes();
-    // SAFETY: TLB pointer is a live page from guest map for this block.
-    if let Some(p) = unsafe { tlb_page_ptr(ctx, addr, size_usize) } {
+    // SAFETY: TLB pointer is a live page from guest map; W bit checked.
+    if let Some(p) = unsafe { tlb_page_ptr(ctx, addr, size_usize, true) } {
         // SAFETY: `p` points into a mapped page with `size_usize` bytes in range.
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, size_usize);
@@ -586,355 +811,298 @@ pub(super) fn compile_block(
         // Carry flags across self-loop iterations via a block param when needed.
         let pass_flags = needs_flags || self_loop;
 
-        // Loop header: SSA params for GPRs (+ optional rflags). Entry loads once
-        // and jumps here; self-loop back-edges re-enter with updated Values.
-        let loop_header = if self_loop {
-            let h = bcx.create_block();
-            for &is_live in live_eff.iter().take(16) {
-                if is_live {
-                    bcx.append_block_param(h, types::I64);
-                }
-            }
-            if pass_flags {
-                bcx.append_block_param(h, types::I64);
-            }
-            // Entry: load from JitCtx → jump header with params (one-time cost).
-            let mut entry_args: Vec<BlockArg> = Vec::with_capacity(17);
-            for i in 0..16 {
-                if live_eff[i] {
-                    let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
-                    let p = bcx.ins().iadd_imm(ctx_ptr, off);
-                    let v = bcx.ins().load(types::I64, flags, p, 0);
-                    gpr_vals[i] = v;
-                    gpr_loaded[i] = true;
-                    entry_args.push(BlockArg::Value(v));
-                }
-            }
-            if pass_flags {
-                let v = bcx.ins().load(types::I64, flags, rflags_ptr, 0);
-                entry_args.push(BlockArg::Value(v));
-            }
-            bcx.ins().jump(h, &entry_args);
-            bcx.switch_to_block(h);
-            // Rebind SSA from header params (dominates body + back-edges).
-            let params = bcx.block_params(h);
-            let mut pi = 0_usize;
-            for i in 0..16 {
-                if live_eff[i] {
-                    gpr_vals[i] = params[pi];
-                    gpr_loaded[i] = true;
-                    pi = pi.saturating_add(1);
-                }
-            }
-            h
+        // Hoist pin descriptors on the **entry** block (once per run_compiled).
+        let (stack_pin, heap_pin) = if super::jit_mem_inline_enabled() {
+            let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
+            let heap = if super::jit_mem_pin_enabled() {
+                Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 1))
+            } else {
+                None
+            };
+            (stack, heap)
         } else {
-            for i in 0..16 {
-                if live_eff[i] {
-                    let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
-                    let p = bcx.ins().iadd_imm(ctx_ptr, off);
-                    gpr_vals[i] = bcx.ins().load(types::I64, flags, p, 0);
-                    gpr_loaded[i] = true;
-                }
-            }
-            entry
+            (None, None)
         };
 
-        // XMM SSA: [lo0, hi0, lo1, hi1, …]; write-through on stores.
-        let mut xmm_vals = [bcx.ins().iconst(types::I64, 0); 32];
-        let mut xmm_loaded = [false; 16];
-        for (i, &is_live) in live_xmm.iter().enumerate() {
-            if is_live {
-                load_xmm_pair(&mut bcx, ctx_ptr, flags, i, &mut xmm_vals, &mut xmm_loaded);
-            }
+        // Pre-compile scan: displacement range for block-wide stack pin guard.
+        let stack_plan = if super::jit_mem_inline_enabled() {
+            analyze_block_stack_pin(body, term_insn)
+        } else {
+            None
+        };
+        // Base register must be live for the guard even if not otherwise used.
+        if let Some(p) = stack_plan {
+            live_eff[p.base_idx] = true;
         }
 
-        let mut rflags_val = if self_loop && pass_flags {
-            let params = bcx.block_params(loop_header);
-            params[params.len() - 1]
-        } else if needs_flags {
+        // Entry: load GPRs / flags once (shared by super and normal paths).
+        let mut entry_gpr = [bcx.ins().iconst(types::I64, 0); 16];
+        let mut entry_loaded = [false; 16];
+        for i in 0..16 {
+            if live_eff[i] {
+                let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+                let p = bcx.ins().iadd_imm(ctx_ptr, off);
+                entry_gpr[i] = bcx.ins().load(types::I64, flags, p, 0);
+                entry_loaded[i] = true;
+            }
+        }
+        let entry_rflags = if pass_flags {
             bcx.ins().load(types::I64, flags, rflags_ptr, 0)
         } else {
             bcx.ins().iconst(types::I64, 0)
         };
 
-        let mut mem_env = MemEnv {
-            ctx_ptr,
-            load_ref,
-            store_ref,
-            string_ref,
-            f32_ref,
-            f64_ref,
-            flags,
-            exit,
-            ucrt_refs,
-        };
+        // Dual path when the block is stack-pin-shaped: super (bare host mem) vs
+        // normal (sticky/pin probes). One block-wide guard on entry.
+        let dual_super = stack_plan.is_some()
+            && stack_pin.is_some()
+            && !has_string
+            && call_fast.is_none();
 
-        // Lazy flags: last ALU result deferred until a flag-reader (jcc/cmov/adc/…).
-        let mut pending = PendingFlags::None;
+        let mut headers_to_seal: Vec<Block> = Vec::new();
+        // Tracks gpr_loaded for the exit store mask (union of paths; full when dual).
+        let mut exit_gpr_loaded = entry_loaded;
 
-        // Dynamic exit RIP when the block ends with a string op (REP stay).
-        let mut string_exit_rip: Option<Value> = None;
-
-        for d in body {
-            ensure_gprs_loaded(
-                &mut bcx,
-                ctx_ptr,
-                &mut gpr_vals,
-                &mut gpr_loaded,
-                &d.instr,
-                flags,
-            );
-            ensure_xmm_loaded(
-                &mut bcx,
-                ctx_ptr,
-                flags,
-                &d.instr,
-                &mut xmm_vals,
-                &mut xmm_loaded,
-            );
-            if is_string_op(&d.instr) {
-                flush_pending(&mut bcx, &mut rflags_val, &mut pending);
-                string_exit_rip = Some(lower_string(
-                    &mut bcx,
-                    &d.instr,
-                    &mut gpr_vals,
-                    &mut rflags_val,
-                    &mut gpr_loaded,
-                    &mut mem_env,
-                )?);
-            } else {
-                lower_insn(
-                    &mut bcx,
-                    &d.instr,
-                    &mut gpr_vals,
-                    &mut gpr_dirty,
-                    &mut rflags_val,
-                    &mut pending,
-                    &mut mem_env,
-                    &mut xmm_vals,
-                )?;
-            }
-        }
-
-        // Lazy flags: materialize only when a consumer needs them or before
-        // architectural writeback (pending must not be dropped on block exit).
-        if matches!(term, Some(BlockTerm::Jcc { .. }))
-            || needs_flags
-            || !matches!(pending, PendingFlags::None)
+        if dual_super
+            && let (Some(plan), Some(spin)) = (stack_plan, stack_pin)
         {
-            flush_pending(&mut bcx, &mut rflags_val, &mut pending);
-        }
+            let base = entry_gpr[plan.base_idx];
+            let guard = emit_block_wide_stack_guard(&mut bcx, &spin, base, &plan);
+            let bias = bcx.ins().isub(spin.host_base, spin.guest_base);
 
-        // --- Terminator / exit ---
-        // Chain paths call the next compiled block (same host ABI), then return
-        // to the dispatcher. Self-loops use IR jump (no host stack growth).
-        if let Some(t) = term {
-            if let Some(ti) = term_insn {
-                ensure_gprs_loaded(
-                    &mut bcx,
-                    ctx_ptr,
-                    &mut gpr_vals,
-                    &mut gpr_loaded,
-                    &ti.instr,
-                    flags,
-                );
-            }
-            // Call/ret always touch RSP (normal call path; fast call does not push).
-            if matches!(t, BlockTerm::Call { .. } | BlockTerm::Ret)
-                && call_fast.is_none()
-                && !gpr_loaded[4]
-            {
-                let p = bcx.ins().iadd_imm(ctx_ptr, 4 * 8);
-                gpr_vals[4] = bcx.ins().load(types::I64, flags, p, 0);
-                gpr_loaded[4] = true;
-            }
-            let term_ip = term_insn.map_or(0, |ti| ti.instr.ip());
+            let super_blk = bcx.create_block();
+            let normal_blk = bcx.create_block();
+            bcx.ins().brif(guard, super_blk, &[], normal_blk, &[]);
 
-            // Fast UCRT: call host import, continue at return_ip (no host-stop).
-            if let (Some(kind), BlockTerm::Call { return_ip, .. }) = (call_fast, t) {
-                for idx in [1_usize, 2, 8, 9] {
-                    if !gpr_loaded[idx] {
-                        let p = bcx
-                            .ins()
-                            .iadd_imm(ctx_ptr, i64::try_from(idx * 8).unwrap_or(0));
-                        gpr_vals[idx] = bcx.ins().load(types::I64, flags, p, 0);
-                        gpr_loaded[idx] = true;
+            for (is_super, start_blk) in [(true, super_blk), (false, normal_blk)] {
+                bcx.switch_to_block(start_blk);
+                bcx.seal_block(start_blk);
+
+                let mut path_gpr = entry_gpr;
+                let mut path_loaded = entry_loaded;
+                let mut path_dirty = [false; 16];
+                let mut path_rflags = entry_rflags;
+
+                let loop_header = if self_loop {
+                    let h = bcx.create_block();
+                    for &is_live in live_eff.iter().take(16) {
+                        if is_live {
+                            bcx.append_block_param(h, types::I64);
+                        }
+                    }
+                    if pass_flags {
+                        bcx.append_block_param(h, types::I64);
+                    }
+                    let mut args: Vec<BlockArg> = Vec::with_capacity(17);
+                    for i in 0..16 {
+                        if live_eff[i] {
+                            args.push(BlockArg::Value(path_gpr[i]));
+                        }
+                    }
+                    if pass_flags {
+                        args.push(BlockArg::Value(path_rflags));
+                    }
+                    bcx.ins().jump(h, &args);
+                    bcx.switch_to_block(h);
+                    let params = bcx.block_params(h);
+                    let mut pi = 0_usize;
+                    for i in 0..16 {
+                        if live_eff[i] {
+                            path_gpr[i] = params[pi];
+                            path_loaded[i] = true;
+                            pi = pi.saturating_add(1);
+                        }
+                    }
+                    if pass_flags {
+                        path_rflags = params[params.len() - 1];
+                    }
+                    headers_to_seal.push(h);
+                    h
+                } else {
+                    start_blk
+                };
+
+                let mut xmm_vals = [bcx.ins().iconst(types::I64, 0); 32];
+                let mut xmm_loaded = [false; 16];
+                for (i, &is_live) in live_xmm.iter().enumerate() {
+                    if is_live {
+                        load_xmm_pair(
+                            &mut bcx,
+                            ctx_ptr,
+                            flags,
+                            i,
+                            &mut xmm_vals,
+                            &mut xmm_loaded,
+                        );
                     }
                 }
-                if !gpr_loaded[0] {
-                    let p = bcx.ins().iadd_imm(ctx_ptr, 0);
-                    gpr_vals[0] = bcx.ins().load(types::I64, flags, p, 0);
-                    gpr_loaded[0] = true;
-                }
-                lower_fast_ucrt(
-                    &mut bcx,
-                    kind,
-                    &mut gpr_vals,
-                    &mut gpr_dirty,
-                    rflags_val,
-                    &mut mem_env,
-                )?;
-                let exit_rip = iconst_u64(&mut bcx, return_ip);
-                emit_chain_or_exit(
-                    &mut bcx,
+
+                let mut mem_env = MemEnv {
                     ctx_ptr,
+                    load_ref,
+                    store_ref,
+                    string_ref,
+                    f32_ref,
+                    f64_ref,
                     flags,
-                    &gpr_vals,
-                    &gpr_loaded,
-                    Some(&gpr_dirty),
-                    rflags_val,
-                    rflags_ptr,
-                    true,
                     exit,
-                    exit_rip,
-                    chain_refs.get(&return_ip).copied(),
-                    lookup_ref,
-                    block_sig_ref,
-                );
-            } else if self_loop {
-                let _ = lower_self_loop_term(
+                    ucrt_refs,
+                    // Super path: no per-access probes. Normal: hoisted pins.
+                    stack_pin: if is_super { None } else { Some(spin) },
+                    heap_pin: if is_super { None } else { heap_pin },
+                    super_stack: if is_super {
+                        Some(SuperStack { bias })
+                    } else {
+                        None
+                    },
+                };
+
+                emit_body_and_term(
                     &mut bcx,
-                    t,
+                    body,
+                    term,
+                    term_insn,
+                    call_fast,
                     start_rip,
+                    end_rip,
+                    self_loop,
                     loop_header,
                     &live_eff,
                     pass_flags,
+                    needs_flags,
                     ctx_ptr,
                     flags,
-                    &mut gpr_vals,
-                    &gpr_loaded,
-                    &gpr_dirty,
-                    rflags_val,
                     rflags_ptr,
-                    needs_flags,
                     exit,
                     &chain_refs,
                     lookup_ref,
                     block_sig_ref,
-                )?;
-            } else {
-                // Near call: push guest return + shadow stack for ret prediction.
-                if let BlockTerm::Call { return_ip, .. } = t {
-                    shadow_push(&mut bcx, ctx_ptr, flags, return_ip);
-                }
-                let exit_rip = lower_term(
-                    &mut bcx,
-                    t,
-                    &mut gpr_vals,
-                    &mut gpr_dirty,
-                    rflags_val,
+                    &mut path_gpr,
+                    &mut path_loaded,
+                    &mut path_dirty,
+                    &mut path_rflags,
+                    &mut xmm_vals,
+                    &mut xmm_loaded,
                     &mut mem_env,
-                    term_ip,
                 )?;
-                // Near ret: validate shadow prediction (mismatch → clear stack).
-                let exit_rip = if matches!(t, BlockTerm::Ret) {
-                    shadow_pop_check(&mut bcx, ctx_ptr, flags, exit_rip)
-                } else {
-                    exit_rip
-                };
-                match t {
-                    BlockTerm::Jcc {
-                        mnemonic,
-                        taken,
-                        not_taken,
-                    } => {
-                        let t_ref = chain_refs.get(&taken).copied();
-                        let n_ref = chain_refs.get(&not_taken).copied();
-                        let _ = lower_jcc_chain(
-                            &mut bcx,
-                            mnemonic,
-                            taken,
-                            not_taken,
-                            t_ref,
-                            n_ref,
-                            ctx_ptr,
-                            flags,
-                            &gpr_vals,
-                            &gpr_loaded,
-                            Some(&gpr_dirty),
-                            rflags_val,
-                            rflags_ptr,
-                            needs_flags,
-                            exit,
-                            lookup_ref,
-                            block_sig_ref,
-                        )?;
-                    }
-                    BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
-                        emit_chain_or_exit(
-                            &mut bcx,
-                            ctx_ptr,
-                            flags,
-                            &gpr_vals,
-                            &gpr_loaded,
-                            Some(&gpr_dirty),
-                            rflags_val,
-                            rflags_ptr,
-                            needs_flags,
-                            exit,
-                            exit_rip,
-                            chain_refs.get(&target).copied(),
-                            lookup_ref,
-                            block_sig_ref,
-                        );
-                    }
-                    BlockTerm::Ret => {
-                        // Dynamic target: always late-bound lookup (shadow aids prediction only).
-                        emit_chain_or_exit(
-                            &mut bcx,
-                            ctx_ptr,
-                            flags,
-                            &gpr_vals,
-                            &gpr_loaded,
-                            Some(&gpr_dirty),
-                            rflags_val,
-                            rflags_ptr,
-                            needs_flags,
-                            exit,
-                            exit_rip,
-                            None,
-                            lookup_ref,
-                            block_sig_ref,
-                        );
-                    }
+                for i in 0..16 {
+                    exit_gpr_loaded[i] |= path_loaded[i];
                 }
             }
-        } else if let Some(sr) = string_exit_rip {
-            // REP stay/exit RIP is dynamic — try late-bound chain.
-            emit_chain_or_exit(
-                &mut bcx,
-                ctx_ptr,
-                flags,
-                &gpr_vals,
-                &gpr_loaded,
-                Some(&gpr_dirty),
-                rflags_val,
-                rflags_ptr,
-                needs_flags,
-                exit,
-                sr,
-                None,
-                lookup_ref,
-                block_sig_ref,
-            );
         } else {
-            let exit_rip = iconst_u64(&mut bcx, end_rip);
-            emit_chain_or_exit(
+            // Single path (no block-wide super, or ineligible shape).
+            let loop_header = if self_loop {
+                let h = bcx.create_block();
+                for &is_live in live_eff.iter().take(16) {
+                    if is_live {
+                        bcx.append_block_param(h, types::I64);
+                    }
+                }
+                if pass_flags {
+                    bcx.append_block_param(h, types::I64);
+                }
+                let mut entry_args: Vec<BlockArg> = Vec::with_capacity(17);
+                for i in 0..16 {
+                    if live_eff[i] {
+                        entry_args.push(BlockArg::Value(entry_gpr[i]));
+                        gpr_vals[i] = entry_gpr[i];
+                        gpr_loaded[i] = true;
+                    }
+                }
+                if pass_flags {
+                    entry_args.push(BlockArg::Value(entry_rflags));
+                }
+                bcx.ins().jump(h, &entry_args);
+                bcx.switch_to_block(h);
+                let params = bcx.block_params(h);
+                let mut pi = 0_usize;
+                for i in 0..16 {
+                    if live_eff[i] {
+                        gpr_vals[i] = params[pi];
+                        gpr_loaded[i] = true;
+                        pi = pi.saturating_add(1);
+                    }
+                }
+                headers_to_seal.push(h);
+                h
+            } else {
+                for i in 0..16 {
+                    if entry_loaded[i] {
+                        gpr_vals[i] = entry_gpr[i];
+                        gpr_loaded[i] = true;
+                    }
+                }
+                entry
+            };
+
+            let mut xmm_vals = [bcx.ins().iconst(types::I64, 0); 32];
+            let mut xmm_loaded = [false; 16];
+            for (i, &is_live) in live_xmm.iter().enumerate() {
+                if is_live {
+                    load_xmm_pair(
+                        &mut bcx,
+                        ctx_ptr,
+                        flags,
+                        i,
+                        &mut xmm_vals,
+                        &mut xmm_loaded,
+                    );
+                }
+            }
+
+            let mut rflags_val = if self_loop && pass_flags {
+                let params = bcx.block_params(loop_header);
+                params[params.len() - 1]
+            } else if needs_flags {
+                entry_rflags
+            } else {
+                bcx.ins().iconst(types::I64, 0)
+            };
+
+            let mut mem_env = MemEnv {
+                ctx_ptr,
+                load_ref,
+                store_ref,
+                string_ref,
+                f32_ref,
+                f64_ref,
+                flags,
+                exit,
+                ucrt_refs,
+                stack_pin,
+                heap_pin,
+                super_stack: None,
+            };
+
+            emit_body_and_term(
                 &mut bcx,
+                body,
+                term,
+                term_insn,
+                call_fast,
+                start_rip,
+                end_rip,
+                self_loop,
+                loop_header,
+                &live_eff,
+                pass_flags,
+                needs_flags,
                 ctx_ptr,
                 flags,
-                &gpr_vals,
-                &gpr_loaded,
-                Some(&gpr_dirty),
-                rflags_val,
                 rflags_ptr,
-                needs_flags,
                 exit,
-                exit_rip,
-                chain_refs.get(&end_rip).copied(),
+                &chain_refs,
                 lookup_ref,
                 block_sig_ref,
-            );
+                &mut gpr_vals,
+                &mut gpr_loaded,
+                &mut gpr_dirty,
+                &mut rflags_val,
+                &mut xmm_vals,
+                &mut xmm_loaded,
+                &mut mem_env,
+            )?;
+            exit_gpr_loaded = gpr_loaded;
         }
 
         bcx.switch_to_block(exit);
@@ -947,7 +1115,8 @@ pub(super) fn compile_block(
         };
         for i in 0..16 {
             // Fault/exit path: store loaded regs (may include partial helper progress).
-            if gpr_loaded[i] {
+            // Dual super/normal: write all architectural GPRs (both paths may dirty).
+            if exit_gpr_loaded[i] || dual_super || self_loop {
                 let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
                 let p = bcx.ins().iadd_imm(ctx_ptr, off);
                 bcx.ins().store(flags, exit_gpr[i], p, 0);
@@ -957,8 +1126,8 @@ pub(super) fn compile_block(
             bcx.ins().store(flags, exit_rflags, rflags_ptr, 0);
         }
         bcx.ins().return_(&[]);
-        if self_loop {
-            bcx.seal_block(loop_header);
+        for h in headers_to_seal {
+            bcx.seal_block(h);
         }
         bcx.seal_all_blocks();
         bcx.finalize();
@@ -1141,6 +1310,38 @@ fn emit_chain_or_exit(
         bcx.ins().return_(&[]);
         return;
     }
+    // Phase 4.2: monomorphic edge IC (data plane) before full chain-table helper.
+    // On hit: call_indirect without `wie_jit_chain_lookup`. Miss → helper (which
+    // also consults IC + table and may install a new IC entry).
+    let mut ic_ok = bcx.ins().iconst(types::I8, 0);
+    let zero = iconst_u64(bcx, 0);
+    let mut ic_fn = zero;
+    for slot in 0..EDGE_IC_SLOTS {
+        let off_va = i64::from(OFF_EDGE_IC_VA) + i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
+        let off_fn = i64::from(OFF_EDGE_IC_FN) + i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
+        let va_p = bcx.ins().iadd_imm(ctx_ptr, off_va);
+        let fn_p = bcx.ins().iadd_imm(ctx_ptr, off_fn);
+        let slot_va = bcx.ins().load(types::I64, flags, va_p, 0);
+        let slot_fn = bcx.ins().load(types::I64, flags, fn_p, 0);
+        let va_ok = bcx.ins().icmp(IntCC::Equal, slot_va, exit_rip);
+        let fn_nz = bcx.ins().icmp_imm(IntCC::NotEqual, slot_fn, 0);
+        let hit_i = bcx.ins().band(va_ok, fn_nz);
+        let first = bcx.ins().icmp_imm(IntCC::Equal, ic_ok, 0);
+        let take = bcx.ins().band(hit_i, first);
+        ic_fn = bcx.ins().select(take, slot_fn, ic_fn);
+        ic_ok = bcx.ins().bor(ic_ok, hit_i);
+    }
+    let ic_hit_blk = bcx.create_block();
+    let ic_miss_blk = bcx.create_block();
+    bcx.ins().brif(ic_ok, ic_hit_blk, &[], ic_miss_blk, &[]);
+
+    bcx.switch_to_block(ic_hit_blk);
+    bcx.seal_block(ic_hit_blk);
+    bcx.ins().call_indirect(block_sig_ref, ic_fn, &[ctx_ptr]);
+    bcx.ins().return_(&[]);
+
+    bcx.switch_to_block(ic_miss_blk);
+    bcx.seal_block(ic_miss_blk);
     // Late-bound: open-addressing chain table (successors compiled after us).
     let call = bcx.ins().call(lookup_ref, &[ctx_ptr, exit_rip]);
     let fn_ptr = bcx.inst_results(call)[0];
@@ -1421,6 +1622,30 @@ fn check_fault_after_ucrt(
     bcx.seal_block(cont);
 }
 
+/// Pin fields loaded once per block (loop-invariant for the `run_compiled` lifetime).
+///
+/// Phase 4.1b perf: reloading `MemPin` from `JitCtx` on every guest load/store
+/// doubled `long_loop` wall time. Hoist once; per-access only does bounds math.
+#[derive(Clone, Copy)]
+struct HoistedPin {
+    guest_base: Value,
+    guest_end: Value,
+    host_base: Value,
+    allow: Value,
+    /// `host_base != 0 && pin_gen == mem_gen` (stable for the block).
+    live: Value,
+}
+
+/// Block-wide stack pin super-fast path: one entry guard, then bare host memops.
+///
+/// `host = bias + guest_va` with `bias = host_base - guest_base`. Valid only after
+/// the block-wide range guard has passed for the (invariant) stack base register.
+#[derive(Clone, Copy)]
+struct SuperStack {
+    /// `host_base.wrapping_sub(guest_base)`.
+    bias: Value,
+}
+
 struct MemEnv {
     ctx_ptr: Value,
     load_ref: Option<cranelift::codegen::ir::FuncRef>,
@@ -1431,6 +1656,12 @@ struct MemEnv {
     flags: MemFlagsData,
     exit: Block,
     ucrt_refs: [Option<FuncRef>; 7],
+    /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
+    stack_pin: Option<HoistedPin>,
+    /// Primary heap pin (slot 1), only when `WIE_JIT_MEM=pin`.
+    heap_pin: Option<HoistedPin>,
+    /// When set, load/store use `bias + addr` with **no** per-access bounds checks.
+    super_stack: Option<SuperStack>,
 }
 
 fn jump_exit(bcx: &mut FunctionBuilder<'_>, exit: Block, gpr: &[Value; 16], rflags: Value) {
@@ -2911,7 +3142,7 @@ fn read_op_mem(
     }
 }
 
-/// Probe sticky hot TLB: same page_key and access entirely within the page.
+/// Probe sticky hot TLB: same page_key, in-page, matching gen, and R or W bit.
 ///
 /// Returns `(ok_i1, host_ptr)` where `host_ptr` is only valid when `ok` is true.
 fn sticky_tlb_probe(
@@ -2919,6 +3150,7 @@ fn sticky_tlb_probe(
     mem: &MemEnv,
     addr: Value,
     size: u32,
+    write: bool,
 ) -> (Value, Value) {
     let page_mask = iconst_u64(bcx, PAGE_SIZE - 1);
     let page_off = bcx.ins().band(addr, page_mask);
@@ -2932,15 +3164,393 @@ fn sticky_tlb_probe(
 
     let hot_key_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PAGE));
     let hot_ptr_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PTR));
+    let hot_prot_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PROT));
+    let hot_gen_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_GEN));
+    let mem_gen_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_MEM_GEN));
     let hot_key = bcx.ins().load(types::I64, mem.flags, hot_key_p, 0);
     let hot_base = bcx.ins().load(types::I64, mem.flags, hot_ptr_p, 0);
+    let hot_prot = bcx.ins().load(types::I64, mem.flags, hot_prot_p, 0);
+    let hot_gen = bcx.ins().load(types::I64, mem.flags, hot_gen_p, 0);
+    let mem_gen = bcx.ins().load(types::I64, mem.flags, mem_gen_p, 0);
     let key_ok = bcx.ins().icmp(IntCC::Equal, hot_key, page_key);
     let base_nz = bcx.ins().icmp_imm(IntCC::NotEqual, hot_base, 0);
+    let gen_ok = bcx.ins().icmp(IntCC::Equal, hot_gen, mem_gen);
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
+    let need_v = iconst_u64(bcx, need);
+    let prot_bits = bcx.ins().band(hot_prot, need_v);
+    let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, prot_bits, 0);
     let ok1 = bcx.ins().band(key_ok, base_nz);
-    // band of icmp results: convert to i64 first if needed — Cranelift icmp → i8/b1.
-    // Use select/bitwise carefully: both are b1 (boolean) in Cranelift.
-    let ok = bcx.ins().band(ok1, in_page);
+    let ok2 = bcx.ins().band(ok1, gen_ok);
+    let ok3 = bcx.ins().band(ok2, prot_ok);
+    let ok = bcx.ins().band(ok3, in_page);
     let host = bcx.ins().iadd(hot_base, page_off);
+    (ok, host)
+}
+
+/// Body + terminator for one compiled path (super-fast or normal probes).
+fn emit_body_and_term(
+    bcx: &mut FunctionBuilder<'_>,
+    body: &[DecodedInsn],
+    term: Option<BlockTerm>,
+    term_insn: Option<&DecodedInsn>,
+    call_fast: Option<FastApiKind>,
+    start_rip: u64,
+    end_rip: u64,
+    self_loop: bool,
+    loop_header: Block,
+    live_eff: &[bool; 16],
+    pass_flags: bool,
+    needs_flags: bool,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    rflags_ptr: Value,
+    exit: Block,
+    chain_refs: &HashMap<u64, FuncRef>,
+    lookup_ref: FuncRef,
+    block_sig_ref: SigRef,
+    gpr_vals: &mut [Value; 16],
+    gpr_loaded: &mut [bool; 16],
+    gpr_dirty: &mut [bool; 16],
+    rflags_val: &mut Value,
+    xmm_vals: &mut [Value; 32],
+    xmm_loaded: &mut [bool; 16],
+    mem_env: &mut MemEnv,
+) -> Result<(), String> {
+    let mut pending = PendingFlags::None;
+    let mut string_exit_rip: Option<Value> = None;
+
+    for d in body {
+        ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &d.instr, flags);
+        ensure_xmm_loaded(bcx, ctx_ptr, flags, &d.instr, xmm_vals, xmm_loaded);
+        if is_string_op(&d.instr) {
+            flush_pending(bcx, rflags_val, &mut pending);
+            string_exit_rip = Some(lower_string(
+                bcx,
+                &d.instr,
+                gpr_vals,
+                rflags_val,
+                gpr_loaded,
+                mem_env,
+            )?);
+        } else {
+            lower_insn(
+                bcx,
+                &d.instr,
+                gpr_vals,
+                gpr_dirty,
+                rflags_val,
+                &mut pending,
+                mem_env,
+                xmm_vals,
+            )?;
+        }
+    }
+
+    if matches!(term, Some(BlockTerm::Jcc { .. }))
+        || needs_flags
+        || !matches!(pending, PendingFlags::None)
+    {
+        flush_pending(bcx, rflags_val, &mut pending);
+    }
+
+    if let Some(t) = term {
+        if let Some(ti) = term_insn {
+            ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &ti.instr, flags);
+        }
+        if matches!(t, BlockTerm::Call { .. } | BlockTerm::Ret)
+            && call_fast.is_none()
+            && !gpr_loaded[4]
+        {
+            let p = bcx.ins().iadd_imm(ctx_ptr, 4 * 8);
+            gpr_vals[4] = bcx.ins().load(types::I64, flags, p, 0);
+            gpr_loaded[4] = true;
+        }
+        let term_ip = term_insn.map_or(0, |ti| ti.instr.ip());
+
+        if let (Some(kind), BlockTerm::Call { return_ip, .. }) = (call_fast, t) {
+            for idx in [1_usize, 2, 8, 9] {
+                if !gpr_loaded[idx] {
+                    let p = bcx
+                        .ins()
+                        .iadd_imm(ctx_ptr, i64::try_from(idx * 8).unwrap_or(0));
+                    gpr_vals[idx] = bcx.ins().load(types::I64, flags, p, 0);
+                    gpr_loaded[idx] = true;
+                }
+            }
+            if !gpr_loaded[0] {
+                let p = bcx.ins().iadd_imm(ctx_ptr, 0);
+                gpr_vals[0] = bcx.ins().load(types::I64, flags, p, 0);
+                gpr_loaded[0] = true;
+            }
+            lower_fast_ucrt(bcx, kind, gpr_vals, gpr_dirty, *rflags_val, mem_env)?;
+            let exit_rip = iconst_u64(bcx, return_ip);
+            emit_chain_or_exit(
+                bcx,
+                ctx_ptr,
+                flags,
+                gpr_vals,
+                gpr_loaded,
+                Some(gpr_dirty),
+                *rflags_val,
+                rflags_ptr,
+                true,
+                exit,
+                exit_rip,
+                chain_refs.get(&return_ip).copied(),
+                lookup_ref,
+                block_sig_ref,
+            );
+        } else if self_loop {
+            let _ = lower_self_loop_term(
+                bcx,
+                t,
+                start_rip,
+                loop_header,
+                live_eff,
+                pass_flags,
+                ctx_ptr,
+                flags,
+                gpr_vals,
+                gpr_loaded,
+                gpr_dirty,
+                *rflags_val,
+                rflags_ptr,
+                needs_flags,
+                exit,
+                chain_refs,
+                lookup_ref,
+                block_sig_ref,
+            )?;
+        } else {
+            if let BlockTerm::Call { return_ip, .. } = t {
+                shadow_push(bcx, ctx_ptr, flags, return_ip);
+            }
+            let exit_rip = lower_term(
+                bcx,
+                t,
+                gpr_vals,
+                gpr_dirty,
+                *rflags_val,
+                mem_env,
+                term_ip,
+            )?;
+            let exit_rip = if matches!(t, BlockTerm::Ret) {
+                shadow_pop_check(bcx, ctx_ptr, flags, exit_rip)
+            } else {
+                exit_rip
+            };
+            match t {
+                BlockTerm::Jcc {
+                    mnemonic,
+                    taken,
+                    not_taken,
+                } => {
+                    let t_ref = chain_refs.get(&taken).copied();
+                    let n_ref = chain_refs.get(&not_taken).copied();
+                    let _ = lower_jcc_chain(
+                        bcx,
+                        mnemonic,
+                        taken,
+                        not_taken,
+                        t_ref,
+                        n_ref,
+                        ctx_ptr,
+                        flags,
+                        gpr_vals,
+                        gpr_loaded,
+                        Some(gpr_dirty),
+                        *rflags_val,
+                        rflags_ptr,
+                        needs_flags,
+                        exit,
+                        lookup_ref,
+                        block_sig_ref,
+                    )?;
+                }
+                BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
+                    emit_chain_or_exit(
+                        bcx,
+                        ctx_ptr,
+                        flags,
+                        gpr_vals,
+                        gpr_loaded,
+                        Some(gpr_dirty),
+                        *rflags_val,
+                        rflags_ptr,
+                        needs_flags,
+                        exit,
+                        exit_rip,
+                        chain_refs.get(&target).copied(),
+                        lookup_ref,
+                        block_sig_ref,
+                    );
+                }
+                BlockTerm::Ret => {
+                    emit_chain_or_exit(
+                        bcx,
+                        ctx_ptr,
+                        flags,
+                        gpr_vals,
+                        gpr_loaded,
+                        Some(gpr_dirty),
+                        *rflags_val,
+                        rflags_ptr,
+                        needs_flags,
+                        exit,
+                        exit_rip,
+                        None,
+                        lookup_ref,
+                        block_sig_ref,
+                    );
+                }
+            }
+        }
+    } else if let Some(sr) = string_exit_rip {
+        emit_chain_or_exit(
+            bcx,
+            ctx_ptr,
+            flags,
+            gpr_vals,
+            gpr_loaded,
+            Some(gpr_dirty),
+            *rflags_val,
+            rflags_ptr,
+            needs_flags,
+            exit,
+            sr,
+            None,
+            lookup_ref,
+            block_sig_ref,
+        );
+    } else {
+        let exit_rip = iconst_u64(bcx, end_rip);
+        emit_chain_or_exit(
+            bcx,
+            ctx_ptr,
+            flags,
+            gpr_vals,
+            gpr_loaded,
+            Some(gpr_dirty),
+            *rflags_val,
+            rflags_ptr,
+            needs_flags,
+            exit,
+            exit_rip,
+            chain_refs.get(&end_rip).copied(),
+            lookup_ref,
+            block_sig_ref,
+        );
+    }
+    Ok(())
+}
+
+/// Single prologue guard: `[base+min_disp, base+max_end)` ⊆ pin and rights match.
+fn emit_block_wide_stack_guard(
+    bcx: &mut FunctionBuilder<'_>,
+    pin: &HoistedPin,
+    base: Value,
+    plan: &BlockStackPinPlan,
+) -> Value {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    let min_d = iconst_u64(bcx, plan.min_disp as u64);
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    let max_e = iconst_u64(bcx, plan.max_end as u64);
+    let lo = bcx.ins().iadd(base, min_d);
+    let hi = bcx.ins().iadd(base, max_e);
+    // Span must not wrap the address space.
+    let no_wrap = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, hi, lo);
+    let lo_ok = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, lo, pin.guest_base);
+    let hi_ok = bcx
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, hi, pin.guest_end);
+
+    let mut need = 0_u64;
+    if plan.needs_r {
+        need |= TLB_PROT_R;
+    }
+    if plan.needs_w {
+        need |= TLB_PROT_W;
+    }
+    let need_v = iconst_u64(bcx, need);
+    let prot_bits = bcx.ins().band(pin.allow, need_v);
+    let prot_ok = if need == 0 {
+        bcx.ins().iconst(types::I8, 1)
+    } else {
+        bcx.ins().icmp(IntCC::Equal, prot_bits, need_v)
+    };
+
+    let ok1 = bcx.ins().band(pin.live, no_wrap);
+    let ok2 = bcx.ins().band(ok1, lo_ok);
+    let ok3 = bcx.ins().band(ok2, hi_ok);
+    bcx.ins().band(ok3, prot_ok)
+}
+
+/// Load one pin slot into SSA once (block entry). Fields are invariant until
+/// the next `run_compiled` (protect/free bumps gen and refills pins).
+fn hoist_pin_slot(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    slot: usize,
+) -> HoistedPin {
+    let base_off = i64::from(OFF_PINS) + i64::from(PIN_STRIDE) * i64::try_from(slot).unwrap_or(0);
+    let gb_p = bcx.ins().iadd_imm(ctx_ptr, base_off);
+    let ge_p = bcx.ins().iadd_imm(ctx_ptr, base_off + 8);
+    let hb_p = bcx.ins().iadd_imm(ctx_ptr, base_off + 16);
+    let gen_p = bcx.ins().iadd_imm(ctx_ptr, base_off + 24);
+    let allow_p = bcx.ins().iadd_imm(ctx_ptr, base_off + 32);
+    let mem_gen_p = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_MEM_GEN));
+
+    let guest_base = bcx.ins().load(types::I64, flags, gb_p, 0);
+    let guest_end = bcx.ins().load(types::I64, flags, ge_p, 0);
+    let host_base = bcx.ins().load(types::I64, flags, hb_p, 0);
+    let pin_gen = bcx.ins().load(types::I64, flags, gen_p, 0);
+    let allow = bcx.ins().load(types::I64, flags, allow_p, 0);
+    let mem_gen = bcx.ins().load(types::I64, flags, mem_gen_p, 0);
+
+    let base_nz = bcx.ins().icmp_imm(IntCC::NotEqual, host_base, 0);
+    let gen_ok = bcx.ins().icmp(IntCC::Equal, pin_gen, mem_gen);
+    let live = bcx.ins().band(base_nz, gen_ok);
+    HoistedPin {
+        guest_base,
+        guest_end,
+        host_base,
+        allow,
+        live,
+    }
+}
+
+/// Bounds + R/W probe against a **hoisted** pin (no JitCtx reloads).
+///
+/// Soft translate: `host = host_base + (addr - guest_base)`.
+fn hoisted_pin_probe(
+    bcx: &mut FunctionBuilder<'_>,
+    pin: &HoistedPin,
+    addr: Value,
+    size: u32,
+    write: bool,
+) -> (Value, Value) {
+    let size_v = iconst_u64(bcx, u64::from(size));
+    let end = bcx.ins().iadd(addr, size_v);
+    let no_wrap = bcx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, end, addr);
+    let lo_ok = bcx.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, addr, pin.guest_base);
+    let hi_ok = bcx.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, pin.guest_end);
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
+    let need_v = iconst_u64(bcx, need);
+    let prot_bits = bcx.ins().band(pin.allow, need_v);
+    let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, prot_bits, 0);
+
+    let ok1 = bcx.ins().band(pin.live, no_wrap);
+    let ok2 = bcx.ins().band(ok1, lo_ok);
+    let ok3 = bcx.ins().band(ok2, hi_ok);
+    let ok = bcx.ins().band(ok3, prot_ok);
+
+    let rel = bcx.ins().isub(addr, pin.guest_base);
+    let host = bcx.ins().iadd(pin.host_base, rel);
     (ok, host)
 }
 
@@ -2995,25 +3605,84 @@ fn call_load(
     size: u32,
     insn_ip: u64,
 ) -> Result<Value, String> {
-    // Inline sticky-TLB fast path for single-page hits; helper on miss / cross-page.
-    // (Full multi-way IR walk was measured slower; sticky covers hot loops.)
     let load_ref = mem.load_ref.ok_or("load helper missing")?;
-    let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size);
+    // `WIE_JIT_MEM=slow`: helper only (oracle / bisect).
+    if !super::jit_mem_inline_enabled() {
+        return Ok(emit_load_helper(
+            bcx, mem, gpr, rflags, addr, size, insn_ip, load_ref,
+        ));
+    }
 
-    let fast = bcx.create_block();
-    let slow = bcx.create_block();
+    // Block-wide super-fast path: entry guard already proved the whole access
+    // range sits in the stack pin — emit a bare host load (no bounds IR).
+    if let Some(super_s) = mem.super_stack {
+        let host = bcx.ins().iadd(super_s.bias, addr);
+        return Ok(load_guest_bytes(bcx, host, size));
+    }
+
+    // CFG-ordered probes (not `select`): pin hit skips sticky IR entirely.
+    // Order: stack pin → sticky → heap pin (`pin` mode) → helper.
     let merge = bcx.create_block();
     bcx.append_block_param(merge, types::I64);
 
-    bcx.ins().brif(ok, fast, &[], slow, &[]);
+    if let Some(ref pin) = mem.stack_pin {
+        let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, false);
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        let v = load_guest_bytes(bcx, host, size);
+        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
 
-    bcx.switch_to_block(fast);
-    bcx.seal_block(fast);
-    let fast_val = load_guest_bytes(bcx, host, size);
-    bcx.ins().jump(merge, &[BlockArg::Value(fast_val)]);
+    // Sticky (page-precise after TLB warm; only reached on stack-pin miss).
+    {
+        let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, false);
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        let v = load_guest_bytes(bcx, host, size);
+        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
 
-    bcx.switch_to_block(slow);
-    bcx.seal_block(slow);
+    if let Some(ref pin) = mem.heap_pin {
+        let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, false);
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        let v = load_guest_bytes(bcx, host, size);
+        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
+
+    let slow_val = emit_load_helper(bcx, mem, gpr, rflags, addr, size, insn_ip, load_ref);
+    bcx.ins().jump(merge, &[BlockArg::Value(slow_val)]);
+
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
+    Ok(bcx.block_params(merge)[0])
+}
+
+fn emit_load_helper(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+    addr: Value,
+    size: u32,
+    insn_ip: u64,
+    load_ref: FuncRef,
+) -> Value {
     let size_v = bcx.ins().iconst(types::I64, i64::from(size));
     let ip_v = iconst_u64(bcx, insn_ip);
     let call = bcx.ins().call(load_ref, &[mem.ctx_ptr, addr, size_v, ip_v]);
@@ -3026,11 +3695,7 @@ fn call_load(
     bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
     bcx.switch_to_block(cont);
     bcx.seal_block(cont);
-    bcx.ins().jump(merge, &[BlockArg::Value(slow_val)]);
-
-    bcx.switch_to_block(merge);
-    bcx.seal_block(merge);
-    Ok(bcx.block_params(merge)[0])
+    slow_val
 }
 
 fn call_store(
@@ -3044,20 +3709,79 @@ fn call_store(
     insn_ip: u64,
 ) -> Result<(), String> {
     let store_ref = mem.store_ref.ok_or("store helper missing")?;
-    let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size);
+    if !super::jit_mem_inline_enabled() {
+        emit_store_helper(bcx, mem, gpr, rflags, addr, size, value, insn_ip, store_ref);
+        return Ok(());
+    }
 
-    let fast = bcx.create_block();
-    let slow = bcx.create_block();
+    // Block-wide super-fast path (see `call_load`).
+    if let Some(super_s) = mem.super_stack {
+        let host = bcx.ins().iadd(super_s.bias, addr);
+        store_guest_bytes(bcx, host, size, value);
+        return Ok(());
+    }
+
+    // Same CFG order as `call_load`: stack pin → sticky → heap pin → helper.
     let merge = bcx.create_block();
-    bcx.ins().brif(ok, fast, &[], slow, &[]);
 
-    bcx.switch_to_block(fast);
-    bcx.seal_block(fast);
-    store_guest_bytes(bcx, host, size, value);
+    if let Some(ref pin) = mem.stack_pin {
+        let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, true);
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        store_guest_bytes(bcx, host, size, value);
+        bcx.ins().jump(merge, &[]);
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
+
+    {
+        let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, true);
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        store_guest_bytes(bcx, host, size, value);
+        bcx.ins().jump(merge, &[]);
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
+
+    if let Some(ref pin) = mem.heap_pin {
+        let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, true);
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        store_guest_bytes(bcx, host, size, value);
+        bcx.ins().jump(merge, &[]);
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
+
+    emit_store_helper(bcx, mem, gpr, rflags, addr, size, value, insn_ip, store_ref);
     bcx.ins().jump(merge, &[]);
 
-    bcx.switch_to_block(slow);
-    bcx.seal_block(slow);
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
+    Ok(())
+}
+
+fn emit_store_helper(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+    addr: Value,
+    size: u32,
+    value: Value,
+    insn_ip: u64,
+    store_ref: FuncRef,
+) {
     let size_v = bcx.ins().iconst(types::I64, i64::from(size));
     let ip_v = iconst_u64(bcx, insn_ip);
     bcx.ins()
@@ -3070,11 +3794,6 @@ fn call_store(
     bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
     bcx.switch_to_block(cont);
     bcx.seal_block(cont);
-    bcx.ins().jump(merge, &[]);
-
-    bcx.switch_to_block(merge);
-    bcx.seal_block(merge);
-    Ok(())
 }
 
 fn lower_mov(
