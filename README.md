@@ -9,7 +9,7 @@
 > [!WARNING]
 > **Work In Progress (WIP):** This is an early-stage experimental prototype.
 >
-> WIE is a research engine for freestanding and CRT micro-PEs. It is **not** a general Windows app runner yet. Pure guest compute (e.g. `long_loop`) will pin a core near 100% by design — that is useful work in the JIT, not a hang.
+> WIE is a research engine for freestanding and CRT micro-PEs. It is **not** a general Windows app runner yet. Pure guest compute (e.g. `long_loop`) will pin a core near 100% by design — that is useful work in the JIT, not a hang. However, when waiting for user input (as seen in the interactive `cli_args` test), the engine does not waste resources and drops host CPU usage down to ~1%.
 
 **Idea** — Emulate custom **64-bit Windows** user-mode binaries on **macOS Apple Silicon**.
 
@@ -30,6 +30,9 @@ time ./target/release/wie-cli run-micro micro-exes/out/winapi_heap.exe
 
 time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
 # ~100M loop iterations under Cranelift JIT; expect ~1.3–1.5s wall, ~100% CPU
+
+time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/cli_args.exe -- -n 3 -m hi -i
+# First interactive input test with flags
 ```
 
 ```bash
@@ -39,13 +42,13 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 
 ## Core Components
 
-| Crate | Role |
-| ----- | ---- |
-| **`wie-cpu`** | CPU backends: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 interpreter (`WIE_CPU=iced`). |
-| **`wie-winapi`** | KERNEL32 / UCRT / USER32 / GDI32 / … handlers. Dispatch is a dense `WinApiId` table (no string compares on the hot path). Guest heap: 24 size classes + bump + optional shared control block. |
-| **`wie-runtime`** | Session: PE load, guest memory layout, fake-API hooks, guest accelerators (stubs / heap / I/O / MBWC), run loop, TEB last-error publish, bottles (`WIE_ROOT`). |
-| **`wie-pe`** | PE64 parse, section map, import/IAT patch with fake VAs. |
-| **`wie-cli`** | `inspect` / `run-micro` / `run` / `entry-trace` / `winapi-map`. |
+| Crate             | Role                                                                                                                                                                                          |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`wie-cpu`**     | CPU backends: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 interpreter (`WIE_CPU=iced`).                                          |
+| **`wie-winapi`**  | KERNEL32 / UCRT / USER32 / GDI32 / … handlers. Dispatch is a dense `WinApiId` table (no string compares on the hot path). Guest heap: 24 size classes + bump + optional shared control block. |
+| **`wie-runtime`** | Session: PE load, guest memory layout, fake-API hooks, guest accelerators (stubs / heap / I/O / MBWC), run loop, TEB last-error publish, bottles (`WIE_ROOT`).                                |
+| **`wie-pe`**      | PE64 parse, section map, import/IAT patch with fake VAs.                                                                                                                                      |
+| **`wie-cli`**     | `inspect` / `run-micro` / `run` / `entry-trace` / `winapi-map`.                                                                                                                               |
 
 ## Execution Flow
 
@@ -79,16 +82,16 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 
 ## Environment knobs
 
-| Variable | Effect |
-| -------- | ------ |
-| `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**) |
+| Variable                | Effect                                                    |
+| ----------------------- | --------------------------------------------------------- |
+| `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**)                             |
 | `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT load/store counts, mem backend |
-| `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs |
-| `WIE_ROOT` / `--root` | Bottle root for file APIs |
-| `WIE_GUEST_HEAP=1` | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code |
-| `WIE_GUEST_IO=…` | Guest I/O accelerator policy |
-| `WIE_GUEST_MBWC=1` | Guest MultiByte↔WideChar helpers |
-| `RUST_LOG` | tracing filter |
+| `WIE_API_JOURNAL=path`  | Per-API journal for backend A/B diffs                     |
+| `WIE_ROOT` / `--root`   | Bottle root for file APIs                                 |
+| `WIE_GUEST_HEAP=1`      | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code  |
+| `WIE_GUEST_IO=…`        | Guest I/O accelerator policy                              |
+| `WIE_GUEST_MBWC=1`      | Guest MultiByte↔WideChar helpers                          |
+| `RUST_LOG`              | tracing filter                                            |
 
 ## CLI
 
@@ -96,13 +99,15 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 ./target/release/wie-cli --help
 ```
 
-| Command | Role |
-| ------- | ---- |
-| `inspect` / `sections` / `imports` / `image` | PE inspection |
-| `winapi-map` | Import coverage map |
-| `run-micro` | **Primary** gate (must reach `ExitProcess` with code 0) |
-| `run` | Run until yield / exit |
-| `entry-trace` | First N host API stops |
+| Command                                      | Role                                                                                           |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `inspect` / `sections` / `imports` / `image` | PE inspection                                                                                  |
+| `winapi-map`                                 | Import coverage map                                                                            |
+| `run-micro`                                  | **Primary** gate (must reach `ExitProcess` with code 0)                                        |
+| `run-micro … --stdin FILE -- args…`          | Inject console stdin + guest argv (`GetCommandLineA`, `ReadFile` on STD_INPUT)                 |
+| `run-micro … -- args…` (no `--stdin`)        | Live host stdin on guest `ReadFile(STD_INPUT)` (line-oriented; blocks until Enter / pipe data) |
+| `run`                                        | Run until yield / exit                                                                         |
+| `entry-trace`                                | First N host API stops                                                                         |
 
 ## Performance notes (CPU / wall)
 

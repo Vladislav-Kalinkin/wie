@@ -269,6 +269,31 @@ pub struct WinApiState {
 
     /// Guest VA of the FLS value table (u64 slots), 0 if not installed.
     pub guest_fls_table_va: u64,
+
+    /// Buffered guest stdin bytes for console `ReadFile(STD_INPUT_HANDLE)`.
+    ///
+    /// Filled either by host injection (`--stdin` / tests) or by a live host
+    /// line-fill when [`Self::stdin_mode`] is [`GuestStdinMode::LiveHost`].
+    pub stdin_bytes: Vec<u8>,
+
+    /// Read cursor into [`Self::stdin_bytes`].
+    pub stdin_cursor: usize,
+
+    /// How console stdin is sourced when the buffer is empty.
+    pub stdin_mode: GuestStdinMode,
+}
+
+/// Source policy for console `ReadFile(STD_INPUT_HANDLE)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GuestStdinMode {
+    /// Serve only [`WinApiState::stdin_bytes`]; exhausted buffer → EOF (0 bytes).
+    ///
+    /// Used for `--stdin FILE` and deterministic micro-tests (no TTY hang).
+    #[default]
+    InjectOnly,
+    /// When the buffer is empty, block-fill one host line (Microsoft Learn
+    /// default console line input / `ENABLE_LINE_INPUT` approximation).
+    LiveHost,
 }
 
 /// Runtime-published guest I/O layout (filled by `wie-runtime` at session start).
@@ -752,6 +777,9 @@ mod tests {
             guest_io: None,
             guest_file_data_next: 0,
             guest_fls_table_va: 0,
+            stdin_bytes: Vec::new(),
+            stdin_cursor: 0,
+            stdin_mode: GuestStdinMode::InjectOnly,
         }
     }
 

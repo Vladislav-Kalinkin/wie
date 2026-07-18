@@ -36,6 +36,16 @@ run_one "$ROOT/micro-exes/out/cpu_math.exe"
 run_one "$ROOT/micro-exes/out/cpu_fp.exe"
 run_one "$ROOT/micro-exes/out/crt_hello.exe"
 
+# Pseudo-CLI: flags + stdin (no bottle)
+# 1) Inject path (deterministic; never blocks on TTY)
+CLI_STDIN="$(mktemp "${TMPDIR:-/tmp}/wie-cli-stdin.XXXXXX")"
+printf 'CLI_IN\n' >"$CLI_STDIN"
+run_one "$ROOT/micro-exes/out/cli_args.exe" --stdin "$CLI_STDIN" -- -n 3 -m hi -i
+rm -f "$CLI_STDIN"
+# 2) Live host stdin path via pipe (no --stdin ⇒ stdin_live)
+echo "--- run-micro cli_args.exe (live pipe stdin) ---"
+printf 'hello-live\n' | "$CLI" run-micro "$ROOT/micro-exes/out/cli_args.exe" -- -n 3 -m hi -i
+
 # N2 — bottle v0
 BOTTLE="$(mktemp -d "${TMPDIR:-/tmp}/wie-bottle.XXXXXX")"
 mkdir -p "$BOTTLE/drive_c/App"

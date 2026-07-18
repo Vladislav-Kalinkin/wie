@@ -25,6 +25,107 @@ const FAKE_STDIN_HANDLE: u64 = 0x0000_0000_6000_0001;
 const FAKE_STDOUT_HANDLE: u64 = 0x0000_0000_6000_0002;
 const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
 
+#[inline]
+fn is_console_output_handle(handle: u64) -> bool {
+    matches!(handle, FAKE_STDOUT_HANDLE | FAKE_STDERR_HANDLE)
+}
+
+/// Host console write for `WriteFile` on stdout/stderr (Microsoft Learn: valid on console handles).
+#[cfg(unix)]
+fn write_host_console_handle(handle: u64, bytes: &[u8]) {
+    let fd = if handle == FAKE_STDOUT_HANDLE {
+        libc::STDOUT_FILENO
+    } else {
+        libc::STDERR_FILENO
+    };
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let Some(chunk) = bytes.get(offset..) else {
+            break;
+        };
+        // SAFETY: host stdout/stderr fd; `chunk` is a live contiguous buffer.
+        #[expect(unsafe_code)]
+        let n = unsafe { libc::write(fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        offset = offset.saturating_add(usize::try_from(n).unwrap_or(0));
+    }
+}
+
+#[cfg(not(unix))]
+fn write_host_console_handle(handle: u64, bytes: &[u8]) {
+    use std::io::Write;
+    if handle == FAKE_STDOUT_HANDLE {
+        drop(std::io::stdout().write_all(bytes));
+    } else if handle == FAKE_STDERR_HANDLE {
+        drop(std::io::stderr().write_all(bytes));
+    }
+}
+
+/// Cap for a single host console line fill (safety against huge pastes).
+const MAX_HOST_STDIN_LINE: usize = 64 * 1024;
+
+/// Read one line from host stdin (through `\n` or EOF), capped at
+/// [`MAX_HOST_STDIN_LINE`].
+///
+/// Models Microsoft Learn default console line input (`ENABLE_LINE_INPUT`):
+/// `ReadFile` on a console handle does not complete until a carriage return
+/// is entered. On Unix hosts we treat `\n` as the line terminator.
+///
+/// Returns:
+/// - `Ok(Some(bytes))` — non-empty fill (may omit `\n` if cap hit first)
+/// - `Ok(None)` — host EOF with no bytes
+/// - `Err(_)` — host I/O error
+fn read_host_console_stdin_line() -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let mut out = Vec::with_capacity(256);
+    let mut byte = [0_u8; 1];
+    let mut stdin = std::io::stdin().lock();
+    loop {
+        if out.len() >= MAX_HOST_STDIN_LINE {
+            break;
+        }
+        if stdin.read(&mut byte)? == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(out))
+    }
+}
+
+/// When the inject/live buffer is empty and live mode is on, block on host
+/// stdin for one line and store it in `state.stdin_bytes`.
+///
+/// Returns `Ok(true)` if bytes were stored, `Ok(false)` on host EOF,
+/// `Err(())` on host I/O failure (caller sets `ERROR_READ_FAULT`).
+fn refill_stdin_from_host(state: &mut WinApiState) -> Result<bool, ()> {
+    match read_host_console_stdin_line() {
+        Ok(None) => Ok(false),
+        Ok(Some(line)) => {
+            state.stdin_bytes = line;
+            state.stdin_cursor = 0;
+            Ok(true)
+        }
+        Err(_) => Err(()),
+    }
+}
+
 const FILE_TYPE_UNKNOWN: u64 = 0x0000;
 const FILE_TYPE_DISK: u64 = 0x0001;
 const FILE_TYPE_CHAR: u64 = 0x0002;
@@ -77,6 +178,8 @@ const LANG_EN_US: u64 = 0x0409;
 const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+/// Win32 `ERROR_READ_FAULT` — host console stdin I/O failure.
+const ERROR_READ_FAULT: u32 = 30;
 
 const TIME_ZONE_ID_UNKNOWN: u64 = 0;
 const TIME_ZONE_ID_INVALID: u64 = 0xffff_ffff;
@@ -3794,6 +3897,11 @@ pub fn handle_initialize_critical_section_and_spin_count(
 }
 
 /// Handles `KERNEL32.dll!ReadFile`.
+///
+/// Microsoft Learn: valid on disk and console handles. Console stdin is served
+/// from `WinApiState::stdin_bytes` (host inject and/or live host line-fill when
+/// `stdin_mode` is `LiveHost`). Default console line input: a live fill blocks
+/// until `\n` or EOF. Success with 0 bytes means EOF.
 pub fn handle_read_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -3808,7 +3916,86 @@ pub fn handle_read_file(
         write_guest_u32(engine, bytes_read_ptr, 0)?;
     }
 
-    let success = buffer_ptr != 0 && is_open_file_handle(state, handle);
+    if buffer_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // Console stdin: inject buffer, then optional live host line-fill.
+    if handle == FAKE_STDIN_HANDLE {
+        let requested =
+            usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
+
+        let mut available = state.stdin_bytes.len().saturating_sub(state.stdin_cursor);
+        if available == 0 && state.stdin_mode == crate::GuestStdinMode::LiveHost {
+            match refill_stdin_from_host(state) {
+                Ok(true) => {
+                    available = state.stdin_bytes.len().saturating_sub(state.stdin_cursor);
+                }
+                Ok(false) => {
+                    // Host EOF → success with 0 bytes (already zeroed count).
+                    state.last_error = 0;
+                    let return_address = engine.return_from_win64_api(1)?;
+                    return Ok(WinApiHandlerResult {
+                        return_address,
+                        return_value: 1,
+                    });
+                }
+                Err(()) => {
+                    state.last_error = ERROR_READ_FAULT;
+                    let return_address = engine.return_from_win64_api(0)?;
+                    return Ok(WinApiHandlerResult {
+                        return_address,
+                        return_value: 0,
+                    });
+                }
+            }
+        }
+
+        let read_len = requested.min(available);
+        if read_len > 0 {
+            let end = state
+                .stdin_cursor
+                .checked_add(read_len)
+                .context("ReadFile stdin end overflow")?;
+            let data = state
+                .stdin_bytes
+                .get(state.stdin_cursor..end)
+                .context("ReadFile stdin slice out of range")?;
+            engine
+                .mem_write(buffer_ptr, data)
+                .context("failed to write ReadFile stdin bytes")?;
+            state.stdin_cursor = end;
+            if bytes_read_ptr != 0 {
+                let read_len_u32 =
+                    u32::try_from(read_len).context("ReadFile byte count does not fit u32")?;
+                write_guest_u32(engine, bytes_read_ptr, read_len_u32)?;
+            }
+        }
+        // available == 0 && InjectOnly → inject exhausted → EOF (0 bytes, success).
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        });
+    }
+
+    // Console stdout/stderr are not readable.
+    if is_console_output_handle(handle) {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    let success = is_open_file_handle(state, handle);
 
     if success {
         let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
@@ -3878,6 +4065,9 @@ pub fn handle_read_file(
 }
 
 /// Handles `KERNEL32.dll!WriteFile`.
+///
+/// Microsoft Learn: valid on disk and console handles. Stdout/stderr write to the
+/// host console; stdin is not writable.
 pub fn handle_write_file(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -3903,7 +4093,50 @@ pub fn handle_write_file(
         write_guest_u32(engine, bytes_written_ptr, 0)?;
     }
 
-    let success = buffer_ptr != 0 && is_open_file_handle(state, handle);
+    if buffer_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // Console stdout/stderr → host console.
+    if is_console_output_handle(handle) {
+        let write_len =
+            usize::try_from(bytes_to_write).context("WriteFile byte count does not fit usize")?;
+        let mut data = vec![0_u8; write_len];
+        if write_len > 0 {
+            engine
+                .mem_read(buffer_ptr, &mut data)
+                .context("failed to read WriteFile console buffer")?;
+        }
+        write_host_console_handle(handle, &data);
+        if bytes_written_ptr != 0 {
+            let write_len_u32 =
+                u32::try_from(write_len).context("WriteFile byte count does not fit u32")?;
+            write_guest_u32(engine, bytes_written_ptr, write_len_u32)?;
+        }
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        });
+    }
+
+    // Console stdin is not writable.
+    if handle == FAKE_STDIN_HANDLE {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    let success = is_open_file_handle(state, handle);
 
     if success {
         let write_len =

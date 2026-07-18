@@ -256,18 +256,17 @@ fn handle_p_environ(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandler
 }
 
 fn handle_p_acmdln(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    engine.mem_write(ACMDLN_PTR_SLOT, &0_u64.to_le_bytes())?;
+    // Slot is filled at session start (points at GetCommandLineA buffer).
     ret(engine, ACMDLN_PTR_SLOT)
 }
 
 fn handle_p_argc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    engine.mem_write(ARGC_SLOT, &1_u32.to_le_bytes())?;
+    // Slot is filled at session start from guest argv.
     ret(engine, ARGC_SLOT)
 }
 
 fn handle_p_argv(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    // char*** — empty/single NULL argv for now.
-    engine.mem_write(ARGV_PTR_SLOT, &0_u64.to_le_bytes())?;
+    // Slot holds char** filled at session start.
     ret(engine, ARGV_PTR_SLOT)
 }
 

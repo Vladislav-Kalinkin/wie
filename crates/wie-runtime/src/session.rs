@@ -11,6 +11,92 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Bootstrap options for a new guest session (argv / stdin injection).
+#[derive(Debug, Clone, Default)]
+pub struct SessionOptions {
+    /// Extra command-line arguments after argv[0] (module basename).
+    pub guest_args: Vec<String>,
+    /// Bytes for console `ReadFile(STD_INPUT_HANDLE)`.
+    ///
+    /// Non-empty: inject-only (no host block). Empty: live host stdin when the
+    /// guest reads STD_INPUT (line-oriented).
+    pub stdin_bytes: Vec<u8>,
+}
+
+/// Guest CRT page layout (must match `wie_winapi::ucrt` and guest stubs).
+const CRT_GUEST_BASE: u64 = 0x0000_0000_6800_0000;
+const CRT_ARGV_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x308;
+const CRT_ARGC_SLOT: u64 = CRT_GUEST_BASE + 0x310;
+const CRT_ACMDLN_PTR_SLOT: u64 = CRT_GUEST_BASE + 0x328;
+/// Pointer table for `char *argv[]` (null-terminated).
+const CRT_ARGV_TABLE: u64 = CRT_GUEST_BASE + 0x400;
+/// Storage for argv string bodies.
+const CRT_ARGV_STRINGS: u64 = CRT_GUEST_BASE + 0x500;
+const CRT_PAGE_END: u64 = CRT_GUEST_BASE + 0x1000;
+
+/// Materialize UCRT `__p___argc` / `__p___argv` / `__p__acmdln` guest slots.
+fn materialize_crt_argv(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    argv0: &str,
+    extra_args: &[String],
+    command_line_a_ptr: u64,
+) -> Result<()> {
+    let mut argv: Vec<String> = Vec::with_capacity(1 + extra_args.len());
+    argv.push(argv0.to_owned());
+    argv.extend(extra_args.iter().cloned());
+
+    let argc = u32::try_from(argv.len()).context("argc does not fit u32")?;
+    engine
+        .mem_write(CRT_ARGC_SLOT, &argc.to_le_bytes())
+        .context("failed to write CRT argc")?;
+
+    // acmdln → GetCommandLineA buffer (char*).
+    engine
+        .mem_write(CRT_ACMDLN_PTR_SLOT, &command_line_a_ptr.to_le_bytes())
+        .context("failed to write CRT acmdln")?;
+
+    // argv pointer table at CRT_ARGV_TABLE; strings packed from CRT_ARGV_STRINGS.
+    let mut string_cursor = CRT_ARGV_STRINGS;
+    for (i, arg) in argv.iter().enumerate() {
+        let slot = CRT_ARGV_TABLE
+            .checked_add(u64::try_from(i).context("argv index")? * 8)
+            .context("argv slot overflow")?;
+        if slot.saturating_add(8) > CRT_ARGV_STRINGS {
+            anyhow::bail!("too many argv entries for CRT page");
+        }
+        let mut bytes = arg.as_bytes().to_vec();
+        bytes.push(0);
+        let end = string_cursor
+            .checked_add(u64::try_from(bytes.len()).context("arg len")?)
+            .context("argv string end overflow")?;
+        if end > CRT_PAGE_END {
+            anyhow::bail!("argv strings exceed CRT guest page");
+        }
+        engine
+            .mem_write(string_cursor, &bytes)
+            .context("failed to write argv string")?;
+        engine
+            .mem_write(slot, &string_cursor.to_le_bytes())
+            .context("failed to write argv pointer")?;
+        string_cursor = end;
+    }
+
+    // Trailing NULL pointer (char** is null-terminated).
+    let null_slot = CRT_ARGV_TABLE
+        .checked_add(u64::from(argc) * 8)
+        .context("argv null slot overflow")?;
+    engine
+        .mem_write(null_slot, &0_u64.to_le_bytes())
+        .context("failed to write argv NULL terminator")?;
+
+    // ARGV_PTR_SLOT holds char** (address of the pointer table).
+    engine
+        .mem_write(CRT_ARGV_PTR_SLOT, &CRT_ARGV_TABLE.to_le_bytes())
+        .context("failed to write CRT argv ptr slot")?;
+
+    Ok(())
+}
+
 /// Saved frame for one in-flight guest window-procedure call.
 #[derive(Debug, Clone)]
 struct PendingGuestCallback {
@@ -359,7 +445,7 @@ impl RuntimeSession {
         path: &std::path::Path,
         idle_policy: wie_winapi::MessageQueueIdlePolicy,
     ) -> Result<Self> {
-        Self::new_with_layout(path, idle_policy, DEFAULT_LAYOUT)
+        Self::new_with_options(path, idle_policy, DEFAULT_LAYOUT, SessionOptions::default())
     }
 
     /// Creates a session with an explicit guest memory layout.
@@ -367,6 +453,16 @@ impl RuntimeSession {
         path: &std::path::Path,
         idle_policy: wie_winapi::MessageQueueIdlePolicy,
         layout: RuntimeMemoryLayout,
+    ) -> Result<Self> {
+        Self::new_with_options(path, idle_policy, layout, SessionOptions::default())
+    }
+
+    /// Creates a session with guest argv / stdin bootstrap options.
+    pub fn new_with_options(
+        path: &std::path::Path,
+        idle_policy: wie_winapi::MessageQueueIdlePolicy,
+        layout: RuntimeMemoryLayout,
+        options: SessionOptions,
     ) -> Result<Self> {
         let t_init = Instant::now();
         let (image, image_summary, patched_imports) =
@@ -587,16 +683,15 @@ impl RuntimeSession {
         engine
             .mem_map(0x0000_0000_6800_0000, 0x1000, wie_cpu::perm::ALL)
             .context("failed to map guest UCRT data page")?;
-        // Pre-init slots so guest `__p__*` stubs can return pointers without a host stop.
-        // argc=1; environ/argv/acmdln null; commode/fmode 0 (matches ucrt host handlers).
+        // Pre-init CRT pointer slots (filled fully after process identity is known).
         {
             const CRT: u64 = 0x0000_0000_6800_0000;
             engine.mem_write(CRT + 0x300, &0_u64.to_le_bytes())?; // environ ptr
-            engine.mem_write(CRT + 0x308, &0_u64.to_le_bytes())?; // argv ptr
-            engine.mem_write(CRT + 0x310, &1_u32.to_le_bytes())?; // argc
+            engine.mem_write(CRT + 0x308, &0_u64.to_le_bytes())?; // argv ptr (set below)
+            engine.mem_write(CRT + 0x310, &1_u32.to_le_bytes())?; // argc (set below)
             engine.mem_write(CRT + 0x318, &0_u32.to_le_bytes())?; // commode
             engine.mem_write(CRT + 0x320, &0_u32.to_le_bytes())?; // fmode
-            engine.mem_write(CRT + 0x328, &0_u64.to_le_bytes())?; // acmdln
+            engine.mem_write(CRT + 0x328, &0_u64.to_le_bytes())?; // acmdln (set below)
         }
 
         let command_line_a_ptr = layout
@@ -624,7 +719,8 @@ impl RuntimeSession {
             .checked_add(0x800)
             .context("entry module file name W pointer overflow")?;
 
-        let process = wie_pe::process_identity_from_host_path(path);
+        let process =
+            wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
         write_process_identity_strings(
             &mut engine,
             command_line_a_ptr,
@@ -632,6 +728,14 @@ impl RuntimeSession {
             module_file_name_a_ptr,
             module_file_name_w_ptr,
             &process,
+        )?;
+
+        // UCRT argc/argv/acmdln for CRT-linked and __p__* guest stubs.
+        materialize_crt_argv(
+            engine.as_mut(),
+            &process.module_file_name,
+            &options.guest_args,
+            command_line_a_ptr,
         )?;
 
         let environment_strings_w = build_default_environment_strings_w()?;
@@ -695,6 +799,15 @@ impl RuntimeSession {
         });
         winapi_state.guest_file_data_next = layout.guest_file_data_base;
         winapi_state.guest_fls_table_va = layout.guest_fls_table_base;
+        // Empty inject ⇒ live host stdin on ReadFile(STD_INPUT); non-empty
+        // inject is deterministic and never blocks on the TTY.
+        winapi_state.stdin_mode = if options.stdin_bytes.is_empty() {
+            wie_winapi::GuestStdinMode::LiveHost
+        } else {
+            wie_winapi::GuestStdinMode::InjectOnly
+        };
+        winapi_state.stdin_bytes = options.stdin_bytes;
+        winapi_state.stdin_cursor = 0;
         winapi_state
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
@@ -742,6 +855,20 @@ impl RuntimeSession {
     /// Overrides any `WIE_ROOT` applied at session construction.
     pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
         self.winapi_state.bottle_root = root;
+    }
+
+    /// Replaces guest stdin buffer for console `ReadFile` on STD_INPUT_HANDLE.
+    ///
+    /// Non-empty bytes are inject-only. Empty enables live host stdin on the
+    /// next guest read.
+    pub fn set_stdin_bytes(&mut self, bytes: Vec<u8>) {
+        self.winapi_state.stdin_mode = if bytes.is_empty() {
+            wie_winapi::GuestStdinMode::LiveHost
+        } else {
+            wie_winapi::GuestStdinMode::InjectOnly
+        };
+        self.winapi_state.stdin_bytes = bytes;
+        self.winapi_state.stdin_cursor = 0;
     }
 
     /// Returns the original stack pointer used to start the guest.

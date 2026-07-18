@@ -21,10 +21,11 @@ pub use memory::{
     FAST_API_STUB_SIZE, FAST_VOID_RETURN_STUB_VA, PROCESS_HEAP_BASE, PROCESS_HEAP_HANDLE,
     PROCESS_HEAP_SHADOW_BASE, PROCESS_HEAP_SHADOW_DELTA, PROCESS_HEAP_SIZE, RuntimeMemoryLayout,
 };
-pub use session::{RuntimeProfile, RuntimeSession};
+pub use session::{RuntimeProfile, RuntimeSession, SessionOptions};
 pub use trace::{
-    EntryTraceEvent, EntryTraceSummary, EntryTraceTermination, MicroRunSummary, RuntimeRunSummary,
-    entry_trace, run_micro_exe, run_micro_exe_with_root, run_persistent_until_yield,
+    EntryTraceEvent, EntryTraceSummary, EntryTraceTermination, MicroRunOptions, MicroRunSummary,
+    RuntimeRunSummary, entry_trace, run_micro_exe, run_micro_exe_with_options,
+    run_micro_exe_with_root, run_persistent_until_yield,
 };
 pub use wie_cpu::{CpuEngine, CpuError, IcedCpu, JitCpu, active_backend_name, open_default_cpu};
 pub use wie_winapi::FileDialogPolicy;

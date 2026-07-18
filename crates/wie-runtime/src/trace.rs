@@ -166,10 +166,46 @@ pub fn run_micro_exe_with_root(
     max_api: usize,
     bottle_root: Option<std::path::PathBuf>,
 ) -> Result<MicroRunSummary> {
+    run_micro_exe_with_options(
+        path,
+        max_api,
+        MicroRunOptions {
+            bottle_root,
+            ..MicroRunOptions::default()
+        },
+    )
+}
+
+/// Options for [`run_micro_exe_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct MicroRunOptions {
+    /// Bottle root for guest `C:\…` mapping (`None` = no bottle / ignore `WIE_ROOT`).
+    pub bottle_root: Option<std::path::PathBuf>,
+    /// Extra guest argv after the module basename (visible via `GetCommandLine*`).
+    pub guest_args: Vec<String>,
+    /// Console stdin bytes for `ReadFile(STD_INPUT_HANDLE)`.
+    /// Non-empty injects and disables live host read; empty enables live host.
+    pub stdin_bytes: Vec<u8>,
+}
+
+/// Like [`run_micro_exe_with_root`], with guest argv and stdin injection.
+pub fn run_micro_exe_with_options(
+    path: &std::path::Path,
+    max_api: usize,
+    options: MicroRunOptions,
+) -> Result<MicroRunSummary> {
     let wall_t0 = std::time::Instant::now();
     let (cpu0_user, cpu0_sys) = wie_cpu::process_cpu_times_us();
-    let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::ExitOnIdle)?;
-    session.set_bottle_root(bottle_root);
+    let mut session = RuntimeSession::new_with_options(
+        path,
+        wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+        crate::DEFAULT_LAYOUT,
+        crate::SessionOptions {
+            guest_args: options.guest_args,
+            stdin_bytes: options.stdin_bytes,
+        },
+    )?;
+    session.set_bottle_root(options.bottle_root);
     let entry_point_va = session.entry_point_va();
     let initial_rsp = session.initial_rsp();
     let run = session.run_until_stop(max_api)?;

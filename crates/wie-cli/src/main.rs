@@ -55,6 +55,14 @@ enum Command {
         /// Bottle root: guest `C:\…` maps to `{root}/drive_c/…` (also `WIE_ROOT`).
         #[arg(long)]
         root: Option<PathBuf>,
+
+        /// Host file whose bytes are injected as guest console stdin.
+        #[arg(long)]
+        stdin: Option<PathBuf>,
+
+        /// Guest argv after the module name (`wie-cli run-micro pe -- -n 3 -m hi`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        guest_args: Vec<String>,
     },
     Run {
         path: PathBuf,
@@ -90,8 +98,17 @@ fn main() -> Result<()> {
             max_api,
             expect_code,
             root,
+            stdin,
+            guest_args,
         } => {
-            commands::run_micro(&path, max_api, expect_code, root.as_deref())?;
+            commands::run_micro(
+                &path,
+                max_api,
+                expect_code,
+                root.as_deref(),
+                stdin.as_deref(),
+                &guest_args,
+            )?;
         }
         Command::Run { path, max_api } => {
             commands::run_until_yield(&path, max_api)?;

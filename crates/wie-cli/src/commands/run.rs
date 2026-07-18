@@ -1,7 +1,7 @@
 //! Runtime run and smoke commands.
 
 use super::util::write_entry_trace_summary;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::io;
 use std::path::Path;
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
@@ -10,6 +10,8 @@ pub(crate) fn run_micro(
     max_api: usize,
     expect_code: u32,
     bottle_root: Option<&Path>,
+    stdin_path: Option<&Path>,
+    guest_args: &[String],
 ) -> Result<()> {
     let root = bottle_root
         .map(std::path::Path::to_path_buf)
@@ -17,7 +19,26 @@ pub(crate) fn run_micro(
     if let Some(ref r) = root {
         println!("bottle_root: {}", r.display());
     }
-    let summary = wie_runtime::run_micro_exe_with_root(path, max_api, root)?;
+    let stdin_bytes = match stdin_path {
+        Some(p) => std::fs::read(p)
+            .with_context(|| format!("failed to read guest stdin file: {}", p.display()))?,
+        None => Vec::new(),
+    };
+    if !guest_args.is_empty() {
+        println!("guest_args: {guest_args:?}");
+    }
+    if stdin_path.is_some() {
+        println!("guest_stdin_bytes: {} (inject)", stdin_bytes.len());
+    }
+    let summary = wie_runtime::run_micro_exe_with_options(
+        path,
+        max_api,
+        wie_runtime::MicroRunOptions {
+            bottle_root: root,
+            guest_args: guest_args.to_vec(),
+            stdin_bytes,
+        },
+    )?;
 
     println!("run_micro: path={}", summary.path);
     println!("cpu_backend: {}", summary.cpu_backend);

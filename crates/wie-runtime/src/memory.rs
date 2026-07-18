@@ -265,6 +265,10 @@ pub(crate) fn default_winapi_state(
         guest_io: None,
         guest_file_data_next: layout.guest_file_data_base,
         guest_fls_table_va: layout.guest_fls_table_base,
+        stdin_bytes: Vec::new(),
+        stdin_cursor: 0,
+        // Session bootstrap overwrites: empty inject ⇒ LiveHost.
+        stdin_mode: wie_winapi::GuestStdinMode::InjectOnly,
     })
 }
 

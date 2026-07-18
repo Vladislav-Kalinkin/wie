@@ -58,6 +58,19 @@ pub struct ProcessIdentity {
 /// Builds guest process identity from a host PE path (no PE parsing).
 #[must_use]
 pub fn process_identity_from_host_path(host_path: &Path) -> ProcessIdentity {
+    process_identity_from_host_path_with_args(host_path, &[])
+}
+
+/// Like [`process_identity_from_host_path`], appending Windows-style guest argv.
+///
+/// `extra_args` are arguments after argv[0] (the module basename). The resulting
+/// `command_line` is suitable for `GetCommandLineA/W` (Microsoft Learn: process
+/// command-line string, space-separated, quoted when needed).
+#[must_use]
+pub fn process_identity_from_host_path_with_args(
+    host_path: &Path,
+    extra_args: &[String],
+) -> ProcessIdentity {
     let module_file_name = host_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -66,13 +79,50 @@ pub fn process_identity_from_host_path(host_path: &Path) -> ProcessIdentity {
         .to_owned();
     let module_path = format!(r"C:\App\{module_file_name}");
     let current_directory = r"C:\App".to_owned();
-    let command_line = module_file_name.clone();
+    let command_line = build_windows_command_line(&module_file_name, extra_args);
     ProcessIdentity {
         module_file_name,
         module_path,
         current_directory,
         command_line,
     }
+}
+
+/// Builds a Windows-style process command line from argv[0] and extra args.
+///
+/// Clean-room subset of CommandLineToArgvW / CreateProcess quoting (Microsoft Learn):
+/// wrap in double quotes when empty or when the token contains space/tab/`"`;
+/// escape `"` as `\"` inside a quoted token.
+#[must_use]
+pub fn build_windows_command_line(argv0: &str, extra_args: &[String]) -> String {
+    let mut out = quote_windows_arg(argv0);
+    for arg in extra_args {
+        out.push(' ');
+        out.push_str(&quote_windows_arg(arg));
+    }
+    out
+}
+
+/// Quote one command-line argument for Windows CreateProcess-style cmdline.
+#[must_use]
+pub fn quote_windows_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c == ' ' || c == '\t' || c == '"');
+    if !needs_quotes {
+        return arg.to_owned();
+    }
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for c in arg.chars() {
+        if c == '"' {
+            quoted.push('\\');
+        }
+        quoted.push(c);
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Parses PE64 bytes and returns loader identity (image base + entry).
@@ -762,6 +812,22 @@ mod tests {
         assert_eq!(id.module_path, r"C:\App\heap_alloc.exe");
         assert_eq!(id.current_directory, r"C:\App");
         assert_eq!(id.command_line, "heap_alloc.exe");
+    }
+
+    #[test]
+    fn process_identity_with_args_builds_command_line() {
+        let path = Path::new(r"/tmp/cli_args.exe");
+        let args = vec!["-n".into(), "3".into(), "-m".into(), "hi there".into()];
+        let id = process_identity_from_host_path_with_args(path, &args);
+        assert_eq!(id.command_line, r#"cli_args.exe -n 3 -m "hi there""#);
+    }
+
+    #[test]
+    fn quote_windows_arg_rules() {
+        assert_eq!(quote_windows_arg("plain"), "plain");
+        assert_eq!(quote_windows_arg(""), r#""""#);
+        assert_eq!(quote_windows_arg("a b"), r#""a b""#);
+        assert_eq!(quote_windows_arg(r#"say "hi""#), r#""say \"hi\"""#);
     }
 
     #[test]

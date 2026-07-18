@@ -72,7 +72,12 @@ impl GuestMemory {
     }
 
     /// Map `[address, address+size)` with `perms`.
-    pub(crate) fn map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), crate::CpuError> {
+    pub(crate) fn map(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: u32,
+    ) -> Result<(), crate::CpuError> {
         self.backend.map(address, size, perms)
     }
 
@@ -145,10 +150,7 @@ mod tests {
             7,
         ));
         mem.map(0x2000_0000, 0x1_0000, 7).expect("map stack");
-        assert_eq!(
-            mem.find_region(0x2000_0800).expect("found").name,
-            "stack"
-        );
+        assert_eq!(mem.find_region(0x2000_0800).expect("found").name, "stack");
         assert_eq!(mem.backend_name(), "hash");
     }
 }
