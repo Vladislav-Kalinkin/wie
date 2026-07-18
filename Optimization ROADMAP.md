@@ -215,6 +215,39 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ---
 
+## Phase 5.5 – Neon Soft-Accel & Cranelift ISA Tuning ✅
+
+**Goal:** ARM64 Neon + Cranelift tuning **before** idle-park (Phase 6).
+
+### 5.5.A SSE2 → SIMD IR + lazy XMM sync ✅
+
+- `XmmSlot` 16-byte aligned bank; CLIF `I8X16` load/store when `WIE_JIT_SIMD≠0`.
+- Bitwise on `I8X16`; scalar/packed FP via native `fadd`/`fmul`/… (helpers only if SIMD off).
+- Selective entry (`xmm_live_mask`) / exit (`xmm_dirty_bits` + `xmm_may_def_mask`).
+
+### 5.5.B Set-associative Neon TLB ✅
+
+- 16 sets × 4 ways: `TlbBucket` + `TlbBucketAux` (full `u64` tags).
+- Neon tag broadcast/compare on aarch64; scalar fallback / `WIE_TLB_NEON=0`.
+
+### 5.5.C Inline small REP MOVS/STOS ✅
+
+- Dual-path: soft `wie_jit_host_span` + unrolled `I8X16` (16–64 B) else `wie_jit_string`.
+- Kill-switch: `WIE_STRING_INLINE=0`.
+
+### 5.5.D Cranelift Apple Silicon config ✅
+
+- `opt_level=speed` (`WIE_JIT_OPT`), verifier under test / `WIE_JIT_VERIFY`, no unwind/spectre-heap.
+- macOS PAC B-key re-asserted on ISA builder.
+
+**Docs:** [`docs/phase5.5-neon-cranelift.md`](docs/phase5.5-neon-cranelift.md).
+
+**DoD:** clippy `-D warnings`; micro-suite green; kill-switches work; pure GPR XMM skip preserved. ✅
+
+**Status (2026-07-18):** Done.
+
+---
+
 ## Phase 6 – Idle CPU Management
 
 **Goal:** Prevent unnecessary host CPU consumption when the guest is waiting.

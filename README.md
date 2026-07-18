@@ -17,7 +17,7 @@
 
 The WinAPI surface is intentionally incomplete: many handlers are stubs sufficient for the micro-suite and engine bring-up, not a final product surface.
 
-**Status (post Phases 0–5):** Hybrid memory (mmap arenas + sparse HashMap), software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky TLB / bulk strings, and an expanded in-guest stub set. Idle-park policy (Phase 6) and default flip to pure mmap (Phase 7) are still open — see [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
+**Status (post Phases 0–5.5):** Hybrid memory (mmap arenas + sparse HashMap), software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, and an expanded in-guest stub set. Idle-park policy (Phase 6) and default flip to pure mmap (Phase 7) are still open — see [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
 ## Examples of launch
 
@@ -98,8 +98,9 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
   - **`sticky` (default)** — sticky multi-way TLB with SPC R/W bits + `mem_gen`; **stack `MemPin`** + block-wide super path when all memops are same stack base + const disp.
   - **`pin`** — sticky + stack pin + **heap** region pin IR.
   - **`slow`** — helper-only `wie_jit_load` / `wie_jit_store` (oracle / bisect).
-- **SSE2**: common XMM moves / bitwise / scalar+packed FP; pure GPR blocks **skip full XMM bank sync** on block entry/exit.
-- **Strings**: REP MOVS/STOS (DF=0, large enough) via soft-translated host spans (`WIE_STRING_BULK=0` disables). Overlap / DF=1 stay element-loop.
+- **SSE2**: common XMM moves / bitwise / scalar+packed FP lowered with Cranelift SIMD (`I8X16`/`F32X4`/…) → host Neon when `WIE_JIT_SIMD≠0`; pure GPR blocks **skip XMM bank**; live/dirty masks selective sync.
+- **TLB**: sticky page + **16×4 set-associative** multi-way (Neon tag compare on aarch64; `WIE_TLB_NEON=0` scalar).
+- **Strings**: REP MOVS/STOS (DF=0) — inline unrolled `I8X16` for 16–64 B (`WIE_STRING_INLINE`), else soft-translated host spans (`WIE_STRING_BULK=0` disables bulk). Overlap / DF=1 stay element-loop.
 - **Fallback**: anything not lowerable → iced `step`.
 
 ## Memory & Heap
@@ -122,6 +123,11 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 | `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower mode (default **sticky** = sticky TLB + stack pin)                                      |
 | `WIE_JIT_CHAIN=0`                       | Disable FuncRef chaining / chain table / edge IC                                                      |
 | `WIE_STRING_BULK=0`                     | Disable host-span bulk REP MOVS/STOS                                                                  |
+| `WIE_STRING_INLINE=0`                   | Disable inline 16–64 B REP Neon path (Phase 5.5)                                                      |
+| `WIE_JIT_SIMD=0`                        | Scalar lo/hi XMM lowering (no CLIF SIMD / Neon)                                                       |
+| `WIE_TLB_NEON=0`                        | Scalar 4-way TLB tag scan (no Neon compare)                                                           |
+| `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**)                                                             |
+| `WIE_JIT_VERIFY=1`                      | Enable Cranelift IR verifier outside tests                                                            |
 | `WIE_RUNTIME_PROFILE=1`                 | Wall/CPU%, host stops, JIT load/store counts, `mem_backend`                                           |
 | `WIE_API_JOURNAL=path`                  | Per-API journal for backend A/B diffs                                                                 |
 | `WIE_ROOT` / `--root`                   | Bottle root for file APIs                                                                             |
@@ -166,6 +172,7 @@ Phases 0–5 landed; baselines and design notes:
 | [`docs/phase4-string-bulk.md`](docs/phase4-string-bulk.md)     | REP MOVS/STOS host spans                |
 | [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md) | Selective JIT drop on X-loss / SMC / free |
 | [`docs/phase5-guest-stubs.md`](docs/phase5-guest-stubs.md)     | In-guest WinAPI stubs (Learn policy)    |
+| [`docs/phase5.5-neon-cranelift.md`](docs/phase5.5-neon-cranelift.md) | Neon SIMD, TLB, inline strings, Cranelift flags |
 | [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md)         | Full plan (Phases 6–7 still open)       |
 
 Headline numbers on Apple Silicon release builds (order-of-magnitude; re-measure with `WIE_RUNTIME_PROFILE=1`):

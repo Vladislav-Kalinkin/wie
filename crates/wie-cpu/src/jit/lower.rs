@@ -24,14 +24,122 @@ use cranelift_module::{FuncId, Linkage, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 use std::collections::HashMap;
 
-/// Associative guest-page TLB ways (stack vs heap thrashing).
-pub(super) const TLB_WAYS: usize = 32;
+/// Set-associative TLB: number of sets (power of two). `SETS × WAYS` total entries.
+pub(super) const TLB_SETS: usize = 16;
+/// Ways per set (4-way; Neon tag compare loads two `I64X2` / `vld1q_u64`).
+pub(super) const TLB_WAYS_PER_SET: usize = 4;
 /// Empty TLB slot marker (`page_key == TLB_EMPTY`).
 pub(super) const TLB_EMPTY: u64 = u64::MAX;
 
 /// TLB / sticky software permission: bit0 = read, bit1 = write.
 pub(super) const TLB_PROT_R: u64 = 1;
 pub(super) const TLB_PROT_W: u64 = 2;
+
+/// 4-way tag+host line (16-byte aligned for Neon loads).
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub(super) struct TlbBucket {
+    /// Guest page keys (`va >> 12`) for 4 ways.
+    pub tags: [u64; TLB_WAYS_PER_SET],
+    /// Host page bases (non-owning soft-translate pointers).
+    pub host: [*mut u8; TLB_WAYS_PER_SET],
+}
+
+/// Per-set generation, prot bits, and RR victim.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub(super) struct TlbBucketAux {
+    pub generation: [u64; TLB_WAYS_PER_SET],
+    pub prot: [u8; TLB_WAYS_PER_SET],
+    /// Next victim way within the set (0..3).
+    pub rr: u8,
+    pub _pad: [u8; 11],
+}
+
+/// Empty bucket constructor (const-friendly for array init).
+#[must_use]
+pub(super) const fn empty_tlb_bucket() -> TlbBucket {
+    TlbBucket {
+        tags: [TLB_EMPTY; TLB_WAYS_PER_SET],
+        host: [std::ptr::null_mut(); TLB_WAYS_PER_SET],
+    }
+}
+
+#[must_use]
+pub(super) const fn empty_tlb_aux() -> TlbBucketAux {
+    TlbBucketAux {
+        generation: [0; TLB_WAYS_PER_SET],
+        prot: [0; TLB_WAYS_PER_SET],
+        rr: 0,
+        _pad: [0; 11],
+    }
+}
+
+/// One XMM slot as lo/hi u64 with 16-byte alignment (Neon-friendly bank).
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct XmmSlot {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+impl XmmSlot {
+    pub(super) const ZERO: Self = Self { lo: 0, hi: 0 };
+
+    #[must_use]
+    pub(super) fn from_u128(v: u128) -> Self {
+        Self {
+            lo: v as u64,
+            hi: (v >> 64) as u64,
+        }
+    }
+
+    #[must_use]
+    pub(super) fn to_u128(self) -> u128 {
+        u128::from(self.lo) | (u128::from(self.hi) << 64)
+    }
+}
+
+/// Phase 5.5: emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
+pub(super) fn jit_simd_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("WIE_JIT_SIMD"),
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        )
+    })
+}
+
+/// Neon software-TLB tag compare (`WIE_TLB_NEON=0` → scalar 4-way scan).
+pub(super) fn tlb_neon_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("WIE_TLB_NEON"),
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        )
+    })
+}
+
+/// Inline REP MOVS/STOS for 16–64 byte const counts (`WIE_STRING_INLINE=0` disables).
+pub(super) fn string_inline_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("WIE_STRING_INLINE"),
+            Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        )
+    })
+}
+
+#[inline]
+fn tlb_set_index(page_key: u64) -> usize {
+    (page_key as usize) & (TLB_SETS - 1)
+}
 
 /// Open-addressing slots for guest-VA → host block fn (block chaining).
 pub(super) const CHAIN_SLOTS: usize = 512;
@@ -117,15 +225,12 @@ pub(super) struct JitCtx {
     pub fault_size: u64,
     /// 0 = read, 1 = write (matches iced ACCESS_*).
     pub fault_access: u64,
-    /// Multi-way page TLB: guest page keys (`va >> 12`), or [`TLB_EMPTY`].
-    pub tlb_page: [u64; TLB_WAYS],
-    /// Host pointers to mapped page data (parallel to `tlb_page`).
-    pub tlb_ptr: [*mut u8; TLB_WAYS],
-    /// Round-robin victim index for TLB fill.
-    pub tlb_rr: u64,
-    /// XMM0..XMM15 as lo/hi u64 pairs (`xmm[2*i]` = low 64, `xmm[2*i+1]` = high 64).
-    /// Appended so existing OFF_* constants stay stable.
-    pub xmm: [u64; 32],
+    /// Set-associative multi-way page TLB (Phase 5.5 Track B).
+    pub tlb_sets: [TlbBucket; TLB_SETS],
+    /// Parallel gen/prot/rr for [`Self::tlb_sets`].
+    pub tlb_aux: [TlbBucketAux; TLB_SETS],
+    /// XMM0..XMM15 as 16-byte aligned slots (lo/hi layout for IR offsets).
+    pub xmm: [XmmSlot; 16],
     /// Shadow return stack: push count (modular index via `sp & (SHADOW_DEPTH-1)`).
     pub shadow_sp: u64,
     /// Predicted guest return addresses for `call`/`ret` chaining.
@@ -150,10 +255,6 @@ pub(super) struct JitCtx {
     pub tlb_hot_prot: u64,
     /// [`GuestMemory::generation`] snapshot for this `run_compiled` (pin/TLB gen check).
     pub mem_gen: u64,
-    /// Per-way software R/W bits (parallel to `tlb_page` / `tlb_ptr`).
-    pub tlb_prot: [u8; TLB_WAYS],
-    /// Per-way memory generation at install (parallel to `tlb_page`).
-    pub tlb_gen: [u64; TLB_WAYS],
     /// Generation recorded for the sticky hot page.
     pub tlb_hot_gen: u64,
     /// Region-direct pins (stack / heap); empty when `host_base == 0`.
@@ -167,6 +268,8 @@ pub(super) struct JitCtx {
     pub edge_ic_fn: [u64; EDGE_IC_SLOTS],
     /// Round-robin victim for edge-IC install after a full chain-table hit.
     pub edge_ic_rr: u64,
+    /// Dynamic XMM dirty mask written by compiled blocks (`bit i` → XMMi).
+    pub xmm_dirty_bits: u64,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
@@ -186,6 +289,7 @@ const OFF_PINS: i32 = std::mem::offset_of!(JitCtx, pins) as i32;
 const OFF_EDGE_IC_VA: i32 = std::mem::offset_of!(JitCtx, edge_ic_va) as i32;
 const OFF_EDGE_IC_FN: i32 = std::mem::offset_of!(JitCtx, edge_ic_fn) as i32;
 const OFF_EDGE_IC_RR: i32 = std::mem::offset_of!(JitCtx, edge_ic_rr) as i32;
+const OFF_XMM_DIRTY: i32 = std::mem::offset_of!(JitCtx, xmm_dirty_bits) as i32;
 
 // Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
 const _: () = {
@@ -204,7 +308,13 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, edge_ic_va) as i32 == OFF_EDGE_IC_VA);
     assert!(std::mem::offset_of!(JitCtx, edge_ic_fn) as i32 == OFF_EDGE_IC_FN);
     assert!(std::mem::offset_of!(JitCtx, edge_ic_rr) as i32 == OFF_EDGE_IC_RR);
+    assert!(std::mem::offset_of!(JitCtx, xmm_dirty_bits) as i32 == OFF_XMM_DIRTY);
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
+    assert!(std::mem::size_of::<XmmSlot>() == 16);
+    assert!(std::mem::align_of::<XmmSlot>() >= 16);
+    assert!(std::mem::align_of::<TlbBucket>() >= 16);
+    assert!(std::mem::size_of::<TlbBucket>() == 64);
+    assert!(TLB_SETS.is_power_of_two());
     assert!(SHADOW_DEPTH.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());
     assert!(EDGE_IC_SLOTS > 0);
@@ -218,9 +328,13 @@ pub(super) struct CompiledBlock {
     /// `None` for hand-written trampolines (late-bound chain only).
     pub func_id: Option<FuncId>,
     pub insn_count: u32,
-    /// Block touches XMM/SSE state — host must sync the full XMM bank.
+    /// Block touches XMM/SSE state — host must sync the XMM bank.
     /// Pure GPR blocks skip XMM copy on entry/exit (CPU + cache win).
     pub uses_sse: bool,
+    /// Bit `i` set if XMMi is referenced (selective entry load).
+    pub xmm_live_mask: u16,
+    /// Bit `i` set if XMMi may be written (selective exit writeback).
+    pub xmm_may_def_mask: u16,
     /// Guest code range covered by this block `[guest_start, guest_end)`.
     /// Used for range-selective cache invalidation on `mem_write`.
     pub guest_start: u64,
@@ -309,6 +423,8 @@ fn pin_resolve(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<
     }
     let end = addr.checked_add(size_u)?;
     let cur_gen = ctx.mem_gen;
+    // Collect a matching pin by value so we can mutably update the TLB after.
+    let mut matched: Option<(u64, u64, u64, u8)> = None; // guest_base, host_base, mem_gen, prot
     for pin in &ctx.pins {
         if pin.host_base == 0 || pin.mem_gen != cur_gen {
             continue;
@@ -320,27 +436,163 @@ fn pin_resolve(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<
         if !tlb_prot_allows(prot, write) {
             continue;
         }
-        let off = usize::try_from(addr.wrapping_sub(pin.guest_base)).unwrap_or(usize::MAX);
-        if off == usize::MAX {
+        matched = Some((pin.guest_base, pin.host_base, pin.mem_gen, prot));
+        break;
+    }
+    let (guest_base, host_base, pin_gen, prot) = matched?;
+    let off = usize::try_from(addr.wrapping_sub(guest_base)).unwrap_or(usize::MAX);
+    if off == usize::MAX {
+        return None;
+    }
+    // SAFETY: host_base is arena soft-translate base; bounds checked above.
+    let host = unsafe { (host_base as *mut u8).add(off) };
+    let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
+    let page_key = addr >> 12;
+    // SAFETY: host points into the pin span; subtract in-page offset for page base.
+    let page_base = unsafe { host.sub(page_off) };
+    tlb_install(ctx, page_key, page_base, prot, pin_gen);
+    tlb_set_hot(ctx, page_key, page_base, prot, pin_gen);
+    Some(host)
+}
+
+/// Install a page into the set-associative TLB (RR victim within set).
+fn tlb_install(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, generation: u64) {
+    let set = tlb_set_index(page_key);
+    let Some(bucket) = ctx.tlb_sets.get_mut(set) else {
+        return;
+    };
+    let Some(aux) = ctx.tlb_aux.get_mut(set) else {
+        return;
+    };
+    // Prefer empty / matching tag way.
+    let mut way = None;
+    for w in 0..TLB_WAYS_PER_SET {
+        if bucket.tags.get(w).copied() == Some(page_key)
+            || bucket.tags.get(w).copied() == Some(TLB_EMPTY)
+        {
+            way = Some(w);
+            break;
+        }
+    }
+    let way = way.unwrap_or_else(|| {
+        let w = usize::from(aux.rr) & (TLB_WAYS_PER_SET - 1);
+        aux.rr = aux.rr.wrapping_add(1);
+        w
+    });
+    if let Some(t) = bucket.tags.get_mut(way) {
+        *t = page_key;
+    }
+    if let Some(h) = bucket.host.get_mut(way) {
+        *h = page_base;
+    }
+    if let Some(g) = aux.generation.get_mut(way) {
+        *g = generation;
+    }
+    if let Some(p) = aux.prot.get_mut(way) {
+        *p = prot;
+    }
+}
+
+/// Scalar 4-way tag scan within a set.
+fn tlb_bucket_lookup_scalar(
+    bucket: &TlbBucket,
+    aux: &TlbBucketAux,
+    page_key: u64,
+    write: bool,
+    cur_gen: u64,
+) -> Option<(*mut u8, u8)> {
+    for way in 0..TLB_WAYS_PER_SET {
+        if bucket.tags.get(way).copied() != Some(page_key) {
             continue;
         }
-        // SAFETY: host_base is arena soft-translate base; bounds checked above.
-        let host = unsafe { (pin.host_base as *mut u8).add(off) };
-        // Warm sticky / multi-way for the containing page (conservative pin prot).
-        let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
-        let page_key = addr >> 12;
-        // SAFETY: host points into the pin span; subtract in-page offset for page base.
-        let page_base = unsafe { host.sub(page_off) };
-        let slot = usize::try_from(ctx.tlb_rr % u64::try_from(TLB_WAYS).unwrap_or(4)).unwrap_or(0);
-        ctx.tlb_page[slot] = page_key;
-        ctx.tlb_ptr[slot] = page_base;
-        ctx.tlb_prot[slot] = prot;
-        ctx.tlb_gen[slot] = pin.mem_gen;
-        ctx.tlb_rr = ctx.tlb_rr.wrapping_add(1);
-        tlb_set_hot(ctx, page_key, page_base, prot, pin.mem_gen);
-        return Some(host);
+        let host = bucket.host.get(way).copied().unwrap_or(std::ptr::null_mut());
+        if host.is_null() {
+            continue;
+        }
+        if aux.generation.get(way).copied() != Some(cur_gen) {
+            continue;
+        }
+        let prot = aux.prot.get(way).copied().unwrap_or(0);
+        if !tlb_prot_allows(prot, write) {
+            continue;
+        }
+        return Some((host, prot));
     }
     None
+}
+
+/// Neon / portable vector tag compare for one 4-way bucket.
+fn tlb_bucket_lookup(
+    bucket: &TlbBucket,
+    aux: &TlbBucketAux,
+    page_key: u64,
+    write: bool,
+    cur_gen: u64,
+) -> Option<(*mut u8, u8)> {
+    if !tlb_neon_enabled() {
+        return tlb_bucket_lookup_scalar(bucket, aux, page_key, write, cur_gen);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `TlbBucket` is `align(16)`; tags are 4×u64 contiguous.
+        let bits = unsafe { tlb_neon_tag_mask(bucket.tags.as_ptr(), page_key) };
+        if bits == 0 {
+            return None;
+        }
+        // First matching way (branchless prefer low index).
+        let way = bits.trailing_zeros() as usize;
+        if way >= TLB_WAYS_PER_SET {
+            return None;
+        }
+        let host = bucket.host.get(way).copied().unwrap_or(std::ptr::null_mut());
+        if host.is_null() {
+            return None;
+        }
+        if aux.generation.get(way).copied() != Some(cur_gen) {
+            return None;
+        }
+        let prot = aux.prot.get(way).copied().unwrap_or(0);
+        if !tlb_prot_allows(prot, write) {
+            return None;
+        }
+        Some((host, prot))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        tlb_bucket_lookup_scalar(bucket, aux, page_key, write, cur_gen)
+    }
+}
+
+/// Compare 4 tags against `page_key` with two Neon `cmeq` ops; return way bitmask 0..15.
+///
+/// # Safety
+/// `tags` must point to at least 4 `u64` values, 16-byte aligned.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn tlb_neon_tag_mask(tags: *const u64, page_key: u64) -> u32 {
+    use std::arch::aarch64::{vceqq_u64, vdupq_n_u64, vld1q_u64};
+    // SAFETY: caller guarantees align + length; neon enabled on Apple Silicon.
+    unsafe {
+        let t01 = vld1q_u64(tags);
+        let t23 = vld1q_u64(tags.add(2));
+        let key = vdupq_n_u64(page_key);
+        let m01 = vceqq_u64(t01, key);
+        let m23 = vceqq_u64(t23, key);
+        lane_eq_bit(m01, 0)
+            | (lane_eq_bit(m01, 1) << 1)
+            | (lane_eq_bit(m23, 0) << 2)
+            | (lane_eq_bit(m23, 1) << 3)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn lane_eq_bit(v: std::arch::aarch64::uint64x2_t, lane: usize) -> u32 {
+    // vceqq lanes are all-ones or zero; extract via transmute to [u64; 2].
+    // SAFETY: uint64x2_t is a 16-byte SIMD register; layout matches [u64; 2].
+    let arr: [u64; 2] = unsafe { std::mem::transmute(v) };
+    u32::from(arr.get(lane).copied().unwrap_or(0) != 0)
 }
 
 /// Resolve host page pointer via multi-way TLB (single-page accesses only).
@@ -365,22 +617,16 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) ->
         // SAFETY: hot ptr is a mapped page base; access stays in-page; SPC bits match.
         return Some(unsafe { ctx.tlb_hot_ptr.add(page_off) });
     }
-    for i in 0..TLB_WAYS {
-        if ctx.tlb_page[i] == page_key
-            && !ctx.tlb_ptr[i].is_null()
-            && ctx.tlb_gen[i] == cur_gen
-            && tlb_prot_allows(ctx.tlb_prot[i], write)
-        {
-            tlb_set_hot(
-                ctx,
-                page_key,
-                ctx.tlb_ptr[i],
-                ctx.tlb_prot[i],
-                ctx.tlb_gen[i],
-            );
-            // SAFETY: page mapped; access stays within the page.
-            return Some(unsafe { ctx.tlb_ptr[i].add(page_off) });
-        }
+    let set = tlb_set_index(page_key);
+    let hit = ctx
+        .tlb_sets
+        .get(set)
+        .zip(ctx.tlb_aux.get(set))
+        .and_then(|(bucket, aux)| tlb_bucket_lookup(bucket, aux, page_key, write, cur_gen));
+    if let Some((page_base, prot)) = hit {
+        tlb_set_hot(ctx, page_key, page_base, prot, cur_gen);
+        // SAFETY: page mapped; access stays within the page.
+        return Some(unsafe { page_base.add(page_off) });
     }
     // Region-direct pin (stack/heap arenas) before radix/page walk.
     if let Some(p) = pin_resolve(ctx, addr, size, write) {
@@ -395,18 +641,42 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) ->
     // Install even if this access is denied so a later opposite access can hit;
     // but only return a pointer when the *current* access is allowed.
     let prot = pack_tlb_prot(entry.allow_r, entry.allow_w);
-    let slot = usize::try_from(ctx.tlb_rr % u64::try_from(TLB_WAYS).unwrap_or(4)).unwrap_or(0);
-    ctx.tlb_page[slot] = page_key;
-    ctx.tlb_ptr[slot] = entry.host;
-    ctx.tlb_prot[slot] = prot;
-    ctx.tlb_gen[slot] = entry.generation;
-    ctx.tlb_rr = ctx.tlb_rr.wrapping_add(1);
+    tlb_install(ctx, page_key, entry.host, prot, entry.generation);
     tlb_set_hot(ctx, page_key, entry.host, prot, entry.generation);
     if !tlb_prot_allows(prot, write) {
         return None;
     }
     // SAFETY: page mapped; access stays within the page; permission checked.
     Some(unsafe { entry.host.add(page_off) })
+}
+
+/// Soft-translate a contiguous guest span to a host pointer (0 on failure).
+///
+/// Used by inline string fast-path; never returns a guest VA.
+pub(super) unsafe extern "C" fn wie_jit_host_span(
+    ctx: *mut JitCtx,
+    guest_va: u64,
+    len: u64,
+    write: u64,
+) -> u64 {
+    if ctx.is_null() || len == 0 {
+        return 0;
+    }
+    // SAFETY: live JitCtx for the block.
+    let ctx = unsafe { &mut *ctx };
+    if ctx.fault != 0 {
+        return 0;
+    }
+    let len_usize = usize::try_from(len).unwrap_or(0);
+    if len_usize == 0 {
+        return 0;
+    }
+    // SAFETY: mem pointer set by run_compiled.
+    let mem = unsafe { &mut *ctx.mem };
+    match mem.host_span(guest_va, len_usize, write != 0) {
+        Some(p) if !p.is_null() => p as u64,
+        _ => 0,
+    }
 }
 
 /// Lookup host block pointer for `va` (0 = miss). Used for late-bound chaining.
@@ -661,6 +931,9 @@ pub(super) fn compile_block(
 ) -> Result<CompiledBlock, String> {
     let live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
+    let def_xmm = analyze_def_xmm(insns);
+    let xmm_live_mask = xmm_mask_from(&live_xmm);
+    let xmm_may_def_mask = xmm_mask_from(&def_xmm);
     let needs_flags = block_needs_flags(insns, term);
     let has_fast_call = call_fast.is_some();
     let has_mem = block_has_mem(insns)
@@ -669,6 +942,8 @@ pub(super) fn compile_block(
     let has_sse = live_xmm.iter().any(|&x| x);
     let has_string = block_has_string(insns);
     let has_fp = block_has_fp(insns);
+    let need_fp_helpers = has_fp && !jit_simd_enabled();
+    let need_host_span = has_string && string_inline_enabled();
 
     // Self-loop if jcc/jmp targets this block's entry (stay in native code).
     let self_loop = match term {
@@ -743,12 +1018,17 @@ pub(super) fn compile_block(
         } else {
             None
         };
-        let f32_ref = if has_fp {
+        let host_span_ref = if need_host_span {
+            Some(eng.module.declare_func_in_func(eng.host_span_id, bcx.func))
+        } else {
+            None
+        };
+        let f32_ref = if need_fp_helpers {
             Some(eng.module.declare_func_in_func(eng.f32_id, bcx.func))
         } else {
             None
         };
-        let f64_ref = if has_fp {
+        let f64_ref = if need_fp_helpers {
             Some(eng.module.declare_func_in_func(eng.f64_id, bcx.func))
         } else {
             None
@@ -942,6 +1222,7 @@ pub(super) fn compile_block(
                     load_ref,
                     store_ref,
                     string_ref,
+                    host_span_ref,
                     f32_ref,
                     f64_ref,
                     flags,
@@ -1064,6 +1345,7 @@ pub(super) fn compile_block(
                 load_ref,
                 store_ref,
                 string_ref,
+                host_span_ref,
                 f32_ref,
                 f64_ref,
                 flags,
@@ -1150,6 +1432,8 @@ pub(super) fn compile_block(
         func_id: Some(func_id),
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
         uses_sse: has_sse || has_fp,
+        xmm_live_mask,
+        xmm_may_def_mask,
         guest_start: start_rip,
         guest_end,
     })
@@ -1651,6 +1935,7 @@ struct MemEnv {
     load_ref: Option<cranelift::codegen::ir::FuncRef>,
     store_ref: Option<cranelift::codegen::ir::FuncRef>,
     string_ref: Option<cranelift::codegen::ir::FuncRef>,
+    host_span_ref: Option<cranelift::codegen::ir::FuncRef>,
     f32_ref: Option<cranelift::codegen::ir::FuncRef>,
     f64_ref: Option<cranelift::codegen::ir::FuncRef>,
     flags: MemFlagsData,
@@ -1694,6 +1979,33 @@ fn analyze_live_xmm(insns: &[DecodedInsn]) -> [bool; 16] {
     live
 }
 
+fn analyze_def_xmm(insns: &[DecodedInsn]) -> [bool; 16] {
+    let mut defs = [false; 16];
+    for d in insns {
+        // Destination is typically op0 for SSE ops that write XMM.
+        if d.instr.op_count() > 0
+            && d.instr.op_kind(0) == OpKind::Register
+            && d.instr.op_register(0).is_xmm()
+        {
+            let n = d.instr.op_register(0).number();
+            if n < 16 {
+                defs[n] = true;
+            }
+        }
+    }
+    defs
+}
+
+fn xmm_mask_from(bits: &[bool; 16]) -> u16 {
+    let mut m = 0_u16;
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            m |= 1_u16 << i;
+        }
+    }
+    m
+}
+
 fn mark_insn_xmm(instr: &Instruction, live: &mut [bool; 16]) {
     for i in 0..instr.op_count() {
         if instr.op_kind(i) == OpKind::Register {
@@ -1720,11 +2032,47 @@ fn load_xmm_pair(
         return;
     }
     let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
-    let plo = bcx.ins().iadd_imm(ctx_ptr, base);
-    let phi = bcx.ins().iadd_imm(ctx_ptr, base + 8);
-    xmm[idx * 2] = bcx.ins().load(types::I64, flags, plo, 0);
-    xmm[idx * 2 + 1] = bcx.ins().load(types::I64, flags, phi, 0);
+    let p = bcx.ins().iadd_imm(ctx_ptr, base);
+    if jit_simd_enabled() {
+        // Single 128-bit load → Neon Q reg; split for lo/hi SSA compatibility.
+        let v = bcx.ins().load(types::I8X16, flags, p, 0);
+        let as_i64x2 = bcx.ins().bitcast(types::I64X2, flags, v);
+        xmm[idx * 2] = bcx.ins().extractlane(as_i64x2, 0);
+        xmm[idx * 2 + 1] = bcx.ins().extractlane(as_i64x2, 1);
+    } else {
+        let plo = p;
+        let phi = bcx.ins().iadd_imm(ctx_ptr, base + 8);
+        xmm[idx * 2] = bcx.ins().load(types::I64, flags, plo, 0);
+        xmm[idx * 2 + 1] = bcx.ins().load(types::I64, flags, phi, 0);
+    }
     loaded[idx] = true;
+}
+
+/// Mark XMMi dirty in `JitCtx.xmm_dirty_bits` (for selective host writeback).
+fn mark_xmm_dirty_ir(bcx: &mut FunctionBuilder<'_>, mem: &MemEnv, idx: usize) {
+    if idx >= 16 {
+        return;
+    }
+    let p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_XMM_DIRTY));
+    let old = bcx.ins().load(types::I64, mem.flags, p, 0);
+    let bit = iconst_u64(bcx, 1_u64 << idx);
+    let new = bcx.ins().bor(old, bit);
+    bcx.ins().store(mem.flags, new, p, 0);
+}
+
+fn pair_to_i8x16(bcx: &mut FunctionBuilder<'_>, flags: MemFlagsData, lo: Value, hi: Value) -> Value {
+    let zero = iconst_u64(bcx, 0);
+    let mut v = bcx.ins().splat(types::I64X2, zero);
+    v = bcx.ins().insertlane(v, lo, 0);
+    v = bcx.ins().insertlane(v, hi, 1);
+    bcx.ins().bitcast(types::I8X16, flags, v)
+}
+
+fn i8x16_to_pair(bcx: &mut FunctionBuilder<'_>, flags: MemFlagsData, v: Value) -> (Value, Value) {
+    let as_i64x2 = bcx.ins().bitcast(types::I64X2, flags, v);
+    let lo = bcx.ins().extractlane(as_i64x2, 0);
+    let hi = bcx.ins().extractlane(as_i64x2, 1);
+    (lo, hi)
 }
 
 fn ensure_xmm_loaded(
@@ -1756,10 +2104,16 @@ fn store_xmm_pair(
     xmm[idx * 2] = lo;
     xmm[idx * 2 + 1] = hi;
     let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
-    let plo = bcx.ins().iadd_imm(mem.ctx_ptr, base);
-    let phi = bcx.ins().iadd_imm(mem.ctx_ptr, base + 8);
-    bcx.ins().store(mem.flags, lo, plo, 0);
-    bcx.ins().store(mem.flags, hi, phi, 0);
+    let p = bcx.ins().iadd_imm(mem.ctx_ptr, base);
+    if jit_simd_enabled() {
+        let v = pair_to_i8x16(bcx, mem.flags, lo, hi);
+        bcx.ins().store(mem.flags, v, p, 0);
+    } else {
+        let phi = bcx.ins().iadd_imm(mem.ctx_ptr, base + 8);
+        bcx.ins().store(mem.flags, lo, p, 0);
+        bcx.ins().store(mem.flags, hi, phi, 0);
+    }
+    mark_xmm_dirty_ir(bcx, mem, idx);
 }
 
 fn xmm_index(reg: Register) -> Result<usize, String> {
@@ -1997,19 +2351,43 @@ fn lower_sse_bitwise(
         }
         _ => return Err("sse bitwise src".into()),
     };
-    let (lo, hi) = match op {
-        SseBit::Xor => (bcx.ins().bxor(a_lo, b_lo), bcx.ins().bxor(a_hi, b_hi)),
-        SseBit::And => (bcx.ins().band(a_lo, b_lo), bcx.ins().band(a_hi, b_hi)),
-        SseBit::Or => (bcx.ins().bor(a_lo, b_lo), bcx.ins().bor(a_hi, b_hi)),
-        // andn: ~a & b  (Intel: dest = NOT(dest) AND src)
-        SseBit::Andn => {
-            let na_lo = bcx.ins().bnot(a_lo);
-            let na_hi = bcx.ins().bnot(a_hi);
-            (bcx.ins().band(na_lo, b_lo), bcx.ins().band(na_hi, b_hi))
+    let (lo, hi) = if jit_simd_enabled() {
+        let a = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
+        let b = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
+        let c = match op {
+            SseBit::Xor => bcx.ins().bxor(a, b),
+            SseBit::And => bcx.ins().band(a, b),
+            SseBit::Or => bcx.ins().bor(a, b),
+            // andn: ~a & b  (Intel: dest = NOT(dest) AND src)
+            SseBit::Andn => {
+                let na = bcx.ins().bnot(a);
+                bcx.ins().band(na, b)
+            }
+        };
+        i8x16_to_pair(bcx, mem.flags, c)
+    } else {
+        match op {
+            SseBit::Xor => (bcx.ins().bxor(a_lo, b_lo), bcx.ins().bxor(a_hi, b_hi)),
+            SseBit::And => (bcx.ins().band(a_lo, b_lo), bcx.ins().band(a_hi, b_hi)),
+            SseBit::Or => (bcx.ins().bor(a_lo, b_lo), bcx.ins().bor(a_hi, b_hi)),
+            SseBit::Andn => {
+                let na_lo = bcx.ins().bnot(a_lo);
+                let na_hi = bcx.ins().bnot(a_hi);
+                (bcx.ins().band(na_lo, b_lo), bcx.ins().band(na_hi, b_hi))
+            }
         }
     };
     store_xmm_pair(bcx, mem, xmm, di, lo, hi);
     Ok(())
+}
+
+fn clif_fbinop(bcx: &mut FunctionBuilder<'_>, op: u64, a: Value, b: Value) -> Value {
+    match op {
+        1 => bcx.ins().fsub(a, b),
+        2 => bcx.ins().fmul(a, b),
+        3 => bcx.ins().fdiv(a, b),
+        _ => bcx.ins().fadd(a, b),
+    }
 }
 
 /// Scalar SSE FP: ss (f32 merge) or sd (f64 merge). `op`: 0=add 1=sub 2=mul 3=div.
@@ -2036,21 +2414,43 @@ fn lower_sse_scalar_fp(
         _ => return Err("sse scalar fp src".into()),
     };
     let _ = b_hi;
-    let op_v = iconst_u64(bcx, op);
-    let (new_lo, new_hi) = if is_f64 {
-        let fref = mem.f64_ref.ok_or("f64 helper missing")?;
-        let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
-        let r = bcx.inst_results(call)[0];
-        (r, a_hi) // sd merges low 64, keeps high
+    let (new_lo, new_hi) = if jit_simd_enabled() {
+        if is_f64 {
+            let fa = bcx.ins().bitcast(types::F64, mem.flags, a_lo);
+            let fb = bcx.ins().bitcast(types::F64, mem.flags, b_lo);
+            let fr = clif_fbinop(bcx, op, fa, fb);
+            let r = bcx.ins().bitcast(types::I64, mem.flags, fr);
+            (r, a_hi)
+        } else {
+            // Operate on low f32; merge bits [63:32] of old_lo.
+            let a32 = bcx.ins().ireduce(types::I32, a_lo);
+            let b32 = bcx.ins().ireduce(types::I32, b_lo);
+            let fa = bcx.ins().bitcast(types::F32, mem.flags, a32);
+            let fb = bcx.ins().bitcast(types::F32, mem.flags, b32);
+            let fr = clif_fbinop(bcx, op, fa, fb);
+            let r32 = bcx.ins().bitcast(types::I32, mem.flags, fr);
+            let r64 = bcx.ins().uextend(types::I64, r32);
+            let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+            let cleared = bcx.ins().band(a_lo, hi32);
+            (bcx.ins().bor(cleared, r64), a_hi)
+        }
     } else {
-        let fref = mem.f32_ref.ok_or("f32 helper missing")?;
-        let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
-        let r = bcx.inst_results(call)[0];
-        let mask = iconst_u64(bcx, 0xffff_ffff);
-        let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
-        let cleared = bcx.ins().band(a_lo, hi32);
-        let low = bcx.ins().band(r, mask);
-        (bcx.ins().bor(cleared, low), a_hi)
+        let op_v = iconst_u64(bcx, op);
+        if is_f64 {
+            let fref = mem.f64_ref.ok_or("f64 helper missing")?;
+            let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
+            let r = bcx.inst_results(call)[0];
+            (r, a_hi)
+        } else {
+            let fref = mem.f32_ref.ok_or("f32 helper missing")?;
+            let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
+            let r = bcx.inst_results(call)[0];
+            let mask = iconst_u64(bcx, 0xffff_ffff);
+            let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
+            let cleared = bcx.ins().band(a_lo, hi32);
+            let low = bcx.ins().band(r, mask);
+            (bcx.ins().bor(cleared, low), a_hi)
+        }
     };
     store_xmm_pair(bcx, mem, xmm, di, new_lo, new_hi);
     Ok(())
@@ -2078,6 +2478,25 @@ fn lower_sse_packed_fp(
         }
         _ => return Err("sse packed fp src".into()),
     };
+    if jit_simd_enabled() {
+        let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
+        let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
+        let (lo, hi) = if is_f64 {
+            let a = bcx.ins().bitcast(types::F64X2, mem.flags, a8);
+            let b = bcx.ins().bitcast(types::F64X2, mem.flags, b8);
+            let c = clif_fbinop(bcx, op, a, b);
+            let c8 = bcx.ins().bitcast(types::I8X16, mem.flags, c);
+            i8x16_to_pair(bcx, mem.flags, c8)
+        } else {
+            let a = bcx.ins().bitcast(types::F32X4, mem.flags, a8);
+            let b = bcx.ins().bitcast(types::F32X4, mem.flags, b8);
+            let c = clif_fbinop(bcx, op, a, b);
+            let c8 = bcx.ins().bitcast(types::I8X16, mem.flags, c);
+            i8x16_to_pair(bcx, mem.flags, c8)
+        };
+        store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+        return Ok(());
+    }
     let op_v = iconst_u64(bcx, op);
     if is_f64 {
         let fref = mem.f64_ref.ok_or("f64 helper missing")?;
@@ -2090,7 +2509,6 @@ fn lower_sse_packed_fp(
         let fref = mem.f32_ref.ok_or("f32 helper missing")?;
         let mask = iconst_u64(bcx, 0xffff_ffff);
         let sh = iconst_u64(bcx, 32);
-        // lanes 0,1 in lo; 2,3 in hi
         let mut pack_pair = |half_a: Value, half_b: Value| -> Result<Value, String> {
             let a0 = bcx.ins().band(half_a, mask);
             let b0 = bcx.ins().band(half_b, mask);
@@ -2622,6 +3040,272 @@ fn lower_insn(
     }
 }
 
+/// Emit dual-path inline Neon copy for small REP MOVS/STOS (16–64 bytes).
+///
+/// Fast path: soft-translate spans + unrolled `I8X16` stores. Slow path: `wie_jit_string`.
+/// Returns exit RIP SSA value, or `None` if preconditions fail (no IR emitted).
+fn try_lower_inline_rep(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    rflags: &mut Value,
+    gpr_loaded: &mut [bool; 16],
+    mem: &mut MemEnv,
+    op: u64,
+    size: u32,
+) -> Option<Value> {
+    if !string_inline_enabled() || !jit_simd_enabled() {
+        return None;
+    }
+    if !matches!(op, 0 | 1) {
+        return None;
+    }
+    if !(instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix()) {
+        return None;
+    }
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return None;
+    }
+    let span_ref = mem.host_span_ref?;
+    let string_ref = mem.string_ref?;
+    // Ensure RSI/RDI/RCX/(RAX for STOS) are in SSA before building CFG.
+    if !gpr_loaded[1] || !gpr_loaded[7] {
+        return None;
+    }
+    if op == 1 && !gpr_loaded[6] {
+        return None;
+    }
+    if op == 0 && !gpr_loaded[0] {
+        return None;
+    }
+
+    // DF clear + byte_len in [16, 64].
+    let df_mask = iconst_u64(bcx, rflags::DF);
+    let df_bits = bcx.ins().band(*rflags, df_mask);
+    let df_clear = bcx.ins().icmp_imm(IntCC::Equal, df_bits, 0);
+    let rcx = gpr[1];
+    let size_v = iconst_u64(bcx, u64::from(size));
+    let byte_len = bcx.ins().imul(rcx, size_v);
+    let min16 = iconst_u64(bcx, 16);
+    let max64 = iconst_u64(bcx, 64);
+    let ge_min = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_len, min16);
+    let le_max = bcx
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, byte_len, max64);
+    let len_ok = bcx.ins().band(ge_min, le_max);
+    let eligible = bcx.ins().band(df_clear, len_ok);
+
+    let cont_fast = bcx.create_block();
+    let cont_slow = bcx.create_block();
+    let done = bcx.create_block();
+    // done params: exit_rip + gpr[0,1,6,7] + rflags (string can touch these)
+    bcx.append_block_param(done, types::I64); // rip
+    bcx.append_block_param(done, types::I64); // rax
+    bcx.append_block_param(done, types::I64); // rcx
+    bcx.append_block_param(done, types::I64); // rsi
+    bcx.append_block_param(done, types::I64); // rdi
+    bcx.append_block_param(done, types::I64); // rflags
+
+    bcx.ins()
+        .brif(eligible, cont_fast, &[], cont_slow, &[]);
+
+    // ---- fast path ----
+    bcx.switch_to_block(cont_fast);
+    bcx.seal_block(cont_fast);
+    let rdi = gpr[7];
+    let write_one = iconst_u64(bcx, 1);
+    let call_dst = bcx
+        .ins()
+        .call(span_ref, &[mem.ctx_ptr, rdi, byte_len, write_one]);
+    let dst_host = bcx.inst_results(call_dst)[0];
+    let dst_ok = bcx.ins().icmp_imm(IntCC::NotEqual, dst_host, 0);
+    let do_copy = bcx.create_block();
+    bcx.ins().brif(dst_ok, do_copy, &[], cont_slow, &[]);
+
+    bcx.switch_to_block(do_copy);
+    bcx.seal_block(do_copy);
+
+    let new_rax = gpr[0];
+    let new_rcx = iconst_u64(bcx, 0);
+    let (new_rsi, new_rdi) = if op == 1 {
+        let zero = iconst_u64(bcx, 0);
+        let call_src = bcx
+            .ins()
+            .call(span_ref, &[mem.ctx_ptr, gpr[6], byte_len, zero]);
+        let src_host = bcx.inst_results(call_src)[0];
+        let src_ok = bcx.ins().icmp_imm(IntCC::NotEqual, src_host, 0);
+        let copy_body = bcx.create_block();
+        bcx.ins().brif(src_ok, copy_body, &[], cont_slow, &[]);
+        bcx.switch_to_block(copy_body);
+        bcx.seal_block(copy_body);
+        emit_inline_copy_chunks(bcx, mem, src_host, dst_host, byte_len, None);
+        (
+            bcx.ins().iadd(gpr[6], byte_len),
+            bcx.ins().iadd(gpr[7], byte_len),
+        )
+    } else {
+        let pat = stos_splat_pattern(bcx, mem, gpr[0], size)?;
+        emit_inline_copy_chunks(bcx, mem, dst_host, dst_host, byte_len, Some(pat));
+        (gpr[6], bcx.ins().iadd(gpr[7], byte_len))
+    };
+    let next = iconst_u64(bcx, instr.next_ip());
+    bcx.ins().jump(
+        done,
+        &[
+            BlockArg::Value(next),
+            BlockArg::Value(new_rax),
+            BlockArg::Value(new_rcx),
+            BlockArg::Value(new_rsi),
+            BlockArg::Value(new_rdi),
+            BlockArg::Value(*rflags),
+        ],
+    );
+
+    // ---- slow path: existing bulk helper ----
+    bcx.switch_to_block(cont_slow);
+    bcx.seal_block(cont_slow);
+    for i in 0..16 {
+        if gpr_loaded[i] {
+            let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+            let p = bcx.ins().iadd_imm(mem.ctx_ptr, off);
+            bcx.ins().store(mem.flags, gpr[i], p, 0);
+        }
+    }
+    let rflags_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_RFLAGS));
+    bcx.ins().store(mem.flags, *rflags, rflags_ptr, 0);
+    let mut flags = 1_u64; // REP
+    if instr.has_repe_prefix() {
+        flags |= 2;
+    }
+    if instr.has_repne_prefix() {
+        flags |= 4;
+    }
+    let op_v = iconst_u64(bcx, op);
+    let size_c = iconst_u64(bcx, u64::from(size));
+    let flags_v = iconst_u64(bcx, flags);
+    let ip_v = iconst_u64(bcx, instr.ip());
+    let call = bcx
+        .ins()
+        .call(string_ref, &[mem.ctx_ptr, op_v, size_c, flags_v, ip_v]);
+    let stay = bcx.inst_results(call)[0];
+    let mut slow_gpr = *gpr;
+    for &i in &[0_usize, 1, 6, 7] {
+        let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
+        let p = bcx.ins().iadd_imm(mem.ctx_ptr, off);
+        slow_gpr[i] = bcx.ins().load(types::I64, mem.flags, p, 0);
+    }
+    let slow_flags = bcx.ins().load(types::I64, mem.flags, rflags_ptr, 0);
+    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
+    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
+    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
+    let cont = bcx.create_block();
+    let args = exit_args(&slow_gpr, slow_flags);
+    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
+    bcx.switch_to_block(cont);
+    bcx.seal_block(cont);
+    let stay_nz = bcx.ins().icmp_imm(IntCC::NotEqual, stay, 0);
+    let cur_ip = iconst_u64(bcx, instr.ip());
+    let next_ip = iconst_u64(bcx, instr.next_ip());
+    let exit_rip = bcx.ins().select(stay_nz, cur_ip, next_ip);
+    bcx.ins().jump(
+        done,
+        &[
+            BlockArg::Value(exit_rip),
+            BlockArg::Value(slow_gpr[0]),
+            BlockArg::Value(slow_gpr[1]),
+            BlockArg::Value(slow_gpr[6]),
+            BlockArg::Value(slow_gpr[7]),
+            BlockArg::Value(slow_flags),
+        ],
+    );
+
+    bcx.switch_to_block(done);
+    bcx.seal_block(done);
+    let params = bcx.block_params(done);
+    gpr[0] = params[1];
+    gpr[1] = params[2];
+    gpr[6] = params[3];
+    gpr[7] = params[4];
+    *rflags = params[5];
+    gpr_loaded[0] = true;
+    gpr_loaded[1] = true;
+    gpr_loaded[6] = true;
+    gpr_loaded[7] = true;
+    Some(params[0])
+}
+
+/// Unrolled up to 4×16-byte host copies. If `fill` is `Some`, stores that vector
+/// (STOS); otherwise loads from `src_host` (MOVS). `src_host` may equal `dst_host` for fill.
+fn emit_inline_copy_chunks(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    src_host: Value,
+    dst_host: Value,
+    byte_len: Value,
+    fill: Option<Value>,
+) {
+    for chunk in 0..4_u64 {
+        let off = iconst_u64(bcx, chunk.saturating_mul(16));
+        let need = iconst_u64(bcx, chunk.saturating_mul(16).saturating_add(16));
+        let take = bcx
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, byte_len, need);
+        let do_chunk = bcx.create_block();
+        let next_chunk = bcx.create_block();
+        bcx.ins().brif(take, do_chunk, &[], next_chunk, &[]);
+        bcx.switch_to_block(do_chunk);
+        bcx.seal_block(do_chunk);
+        let dp = bcx.ins().iadd(dst_host, off);
+        let v = if let Some(pat) = fill {
+            pat
+        } else {
+            let sp = bcx.ins().iadd(src_host, off);
+            bcx.ins().load(types::I8X16, mem.flags, sp, 0)
+        };
+        bcx.ins().store(mem.flags, v, dp, 0);
+        bcx.ins().jump(next_chunk, &[]);
+        bcx.switch_to_block(next_chunk);
+        bcx.seal_block(next_chunk);
+    }
+}
+
+fn stos_splat_pattern(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    rax: Value,
+    size: u32,
+) -> Option<Value> {
+    match size {
+        1 => {
+            let m = iconst_u64(bcx, 0xff);
+            let b = bcx.ins().band(rax, m);
+            let b8 = bcx.ins().ireduce(types::I8, b);
+            Some(bcx.ins().splat(types::I8X16, b8))
+        }
+        2 => {
+            let m = iconst_u64(bcx, 0xffff);
+            let w = bcx.ins().band(rax, m);
+            let w16 = bcx.ins().ireduce(types::I16, w);
+            let s = bcx.ins().splat(types::I16X8, w16);
+            Some(bcx.ins().bitcast(types::I8X16, mem.flags, s))
+        }
+        4 => {
+            let m = iconst_u64(bcx, 0xffff_ffff);
+            let d = bcx.ins().band(rax, m);
+            let d32 = bcx.ins().ireduce(types::I32, d);
+            let s = bcx.ins().splat(types::I32X4, d32);
+            Some(bcx.ins().bitcast(types::I8X16, mem.flags, s))
+        }
+        8 => {
+            let s = bcx.ins().splat(types::I64X2, rax);
+            Some(bcx.ins().bitcast(types::I8X16, mem.flags, s))
+        }
+        _ => None,
+    }
+}
+
 /// Lower a string op via host bulk helper; returns exit RIP value.
 fn lower_string(
     bcx: &mut FunctionBuilder<'_>,
@@ -2631,7 +3315,6 @@ fn lower_string(
     gpr_loaded: &mut [bool; 16],
     mem: &mut MemEnv,
 ) -> Result<Value, String> {
-    let string_ref = mem.string_ref.ok_or("string helper missing")?;
     let size = string_op_size(instr).ok_or("string size")?;
     let (op, size) = match instr.mnemonic() {
         Mnemonic::Stosb | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq => (0_u64, size),
@@ -2642,6 +3325,17 @@ fn lower_string(
         Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd | Mnemonic::Cmpsq => (4, size),
         other => return Err(format!("string op {other:?}")),
     };
+
+    // Phase 5.5: dual-path inline for small REP MOVS/STOS when helpers available.
+    if matches!(op, 0 | 1)
+        && string_inline_enabled()
+        && mem.host_span_ref.is_some()
+        && let Some(rip) = try_lower_inline_rep(bcx, instr, gpr, rflags, gpr_loaded, mem, op, size)
+    {
+        return Ok(rip);
+    }
+
+    let string_ref = mem.string_ref.ok_or("string helper missing")?;
     let mut flags = 0_u64;
     if instr.has_rep_prefix() || instr.has_repe_prefix() || instr.has_repne_prefix() {
         flags |= 1;

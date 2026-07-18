@@ -37,8 +37,9 @@ use fast_api::{
     wie_ucrt_malloc, wie_ucrt_memcpy, wie_ucrt_strlen,
 };
 use lower::{
-    CHAIN_SLOTS, CompiledBlock, JitCtx, MemPin, PIN_SLOTS, TLB_EMPTY, TLB_WAYS, chain_table_clear,
-    chain_table_insert, compile_block, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup,
+    CHAIN_SLOTS, CompiledBlock, JitCtx, MemPin, PIN_SLOTS, TLB_EMPTY, TLB_SETS, TlbBucket,
+    TlbBucketAux, XmmSlot, chain_table_clear, chain_table_insert, compile_block, empty_tlb_aux,
+    empty_tlb_bucket, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_host_span,
     wie_jit_load, wie_jit_store, wie_jit_string,
 };
 use std::collections::HashMap;
@@ -116,12 +117,9 @@ pub struct JitCpu {
     /// rebuilding a full HashMap on every compile).
     chain_ids: HashMap<u64, cranelift_module::FuncId>,
     stats: JitStats,
-    /// Persistent multi-way page TLB across chained blocks (invalidate on protect/free).
-    tlb_page: [u64; TLB_WAYS],
-    tlb_ptr: [*mut u8; TLB_WAYS],
-    tlb_prot: [u8; TLB_WAYS],
-    tlb_gen: [u64; TLB_WAYS],
-    tlb_rr: u64,
+    /// Persistent set-associative page TLB across chained blocks (invalidate on protect/free).
+    tlb_sets: [TlbBucket; TLB_SETS],
+    tlb_aux: [TlbBucketAux; TLB_SETS],
     /// Sticky last-hit page for inline IR mem path.
     tlb_hot_page: u64,
     tlb_hot_ptr: *mut u8,
@@ -169,6 +167,8 @@ struct JitEngine {
     store_id: cranelift_module::FuncId,
     /// Host bulk string helper.
     string_id: cranelift_module::FuncId,
+    /// Soft-translated host span for inline string copies.
+    host_span_id: cranelift_module::FuncId,
     /// Scalar f32 binop helper.
     f32_id: cranelift_module::FuncId,
     /// Scalar f64 binop helper.
@@ -248,11 +248,8 @@ impl JitCpu {
             stats: JitStats {
                 ..JitStats::default()
             },
-            tlb_page: [TLB_EMPTY; TLB_WAYS],
-            tlb_ptr: [std::ptr::null_mut(); TLB_WAYS],
-            tlb_prot: [0; TLB_WAYS],
-            tlb_gen: [0; TLB_WAYS],
-            tlb_rr: 0,
+            tlb_sets: [empty_tlb_bucket(); TLB_SETS],
+            tlb_aux: [empty_tlb_aux(); TLB_SETS],
             tlb_hot_page: TLB_EMPTY,
             tlb_hot_ptr: std::ptr::null_mut(),
             tlb_hot_prot: 0,
@@ -576,6 +573,8 @@ impl JitCpu {
                         func_id: None,
                         insn_count: micro.insn_count(),
                         uses_sse: false,
+                        xmm_live_mask: 0,
+                        xmm_may_def_mask: 0,
                         guest_start: rip,
                         guest_end,
                     };
@@ -685,13 +684,25 @@ impl JitCpu {
         for (i, slot) in gpr.iter_mut().enumerate() {
             *slot = regs.gpr(i);
         }
-        // Pure GPR blocks skip the 16×u128 XMM bank copy on both sides of the call.
-        let mut xmm = [0_u64; 32];
+        // Pure GPR blocks skip the XMM bank copy on both sides of the call.
+        // SSE blocks load only live XMMs (Phase 5.5 Track A live mask).
+        let mut xmm = [XmmSlot::ZERO; 16];
         if meta.uses_sse {
-            for i in 0..16 {
-                let v = regs.xmm_at(i);
-                xmm[i * 2] = v as u64;
-                xmm[i * 2 + 1] = (v >> 64) as u64;
+            let mut m = meta.xmm_live_mask;
+            // If mask is empty but uses_sse (fp-only edge), load all.
+            if m == 0 {
+                m = 0xffff;
+            }
+            let mut i = 0_usize;
+            while m != 0 {
+                if m & 1 != 0 {
+                    let v = regs.xmm_at(i);
+                    if let Some(slot) = xmm.get_mut(i) {
+                        *slot = XmmSlot::from_u128(v);
+                    }
+                }
+                m >>= 1;
+                i = i.saturating_add(1);
             }
         }
         let mut ctx = JitCtx {
@@ -703,9 +714,8 @@ impl JitCpu {
             fault_addr: 0,
             fault_size: 0,
             fault_access: 0,
-            tlb_page: self.tlb_page,
-            tlb_ptr: self.tlb_ptr,
-            tlb_rr: self.tlb_rr,
+            tlb_sets: self.tlb_sets,
+            tlb_aux: self.tlb_aux,
             xmm,
             shadow_sp: self.shadow_sp,
             shadow_ret: self.shadow_ret,
@@ -720,13 +730,12 @@ impl JitCpu {
             store_calls: 0,
             tlb_hot_prot: self.tlb_hot_prot,
             mem_gen,
-            tlb_prot: self.tlb_prot,
-            tlb_gen: self.tlb_gen,
             tlb_hot_gen: self.tlb_hot_gen,
             pins: self.pins,
             edge_ic_va: self.edge_ic_va,
             edge_ic_fn: self.edge_ic_fn,
             edge_ic_rr: self.edge_ic_rr,
+            xmm_dirty_bits: 0,
         };
         // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
         unsafe {
@@ -736,12 +745,9 @@ impl JitCpu {
         self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
         // Phase 4.x: guest stores via `GuestMemory::write` leave a pending range;
         // apply selective code invalidation only after the native frame returns.
-        // Persist multi-way TLB + sticky hot page + shadow stack across chained blocks.
-        self.tlb_page = ctx.tlb_page;
-        self.tlb_ptr = ctx.tlb_ptr;
-        self.tlb_prot = ctx.tlb_prot;
-        self.tlb_gen = ctx.tlb_gen;
-        self.tlb_rr = ctx.tlb_rr;
+        // Persist set-associative TLB + sticky hot page + shadow stack across chained blocks.
+        self.tlb_sets = ctx.tlb_sets;
+        self.tlb_aux = ctx.tlb_aux;
         self.tlb_hot_page = ctx.tlb_hot_page;
         self.tlb_hot_ptr = ctx.tlb_hot_ptr;
         self.tlb_hot_prot = ctx.tlb_hot_prot;
@@ -779,11 +785,27 @@ impl JitCpu {
             }
         }
         if meta.uses_sse {
-            for i in 0..16 {
-                let lo = ctx.xmm[i * 2];
-                let hi = ctx.xmm[i * 2 + 1];
-                let v = u128::from(lo) | (u128::from(hi) << 64);
-                regs.set_xmm_at(i, v);
+            // Prefer dynamic dirty bits; on fault use may_def so partial defs are visible.
+            let mut mask = if ctx.fault != 0 {
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0xffff) | meta.xmm_may_def_mask
+            } else if ctx.xmm_dirty_bits != 0 {
+                u16::try_from(ctx.xmm_dirty_bits).unwrap_or(0)
+            } else {
+                meta.xmm_may_def_mask
+            };
+            if mask == 0 {
+                mask = meta.xmm_live_mask;
+            }
+            let mut i = 0_usize;
+            let mut m = mask;
+            while m != 0 {
+                if m & 1 != 0
+                    && let Some(slot) = ctx.xmm.get(i)
+                {
+                    regs.set_xmm_at(i, slot.to_u128());
+                }
+                m >>= 1;
+                i = i.saturating_add(1);
             }
         }
         regs.rflags = ctx.rflags;
@@ -804,11 +826,8 @@ impl JitCpu {
     }
 
     fn invalidate_tlb(&mut self) {
-        self.tlb_page = [TLB_EMPTY; TLB_WAYS];
-        self.tlb_ptr = [std::ptr::null_mut(); TLB_WAYS];
-        self.tlb_prot = [0; TLB_WAYS];
-        self.tlb_gen = [0; TLB_WAYS];
-        self.tlb_rr = 0;
+        self.tlb_sets = [empty_tlb_bucket(); TLB_SETS];
+        self.tlb_aux = [empty_tlb_aux(); TLB_SETS];
         self.tlb_hot_page = TLB_EMPTY;
         self.tlb_hot_ptr = std::ptr::null_mut();
         self.tlb_hot_prot = 0;
@@ -834,6 +853,10 @@ struct CompiledRunMeta {
     func: unsafe extern "C" fn(*mut JitCtx),
     insn_count: u32,
     uses_sse: bool,
+    /// XMMi referenced in the block (selective entry load).
+    xmm_live_mask: u16,
+    /// XMMi that may be defined (conservative exit writeback on fault).
+    xmm_may_def_mask: u16,
 }
 
 impl From<&CompiledBlock> for CompiledRunMeta {
@@ -842,6 +865,8 @@ impl From<&CompiledBlock> for CompiledRunMeta {
             func: c.func,
             insn_count: c.insn_count,
             uses_sse: c.uses_sse,
+            xmm_live_mask: c.xmm_live_mask,
+            xmm_may_def_mask: c.xmm_may_def_mask,
         }
     }
 }
@@ -896,18 +921,59 @@ fn resolve_thunk_va(cpu: &IcedCpu, mut va: u64) -> u64 {
     va
 }
 
+/// Cranelift `opt_level` from `WIE_JIT_OPT` (`speed` | `speed_and_size` | `none`).
+/// Default: `speed` (Phase 5.5 — hot guest blocks over code size).
+fn jit_opt_level() -> &'static str {
+    use std::sync::OnceLock;
+    static LVL: OnceLock<&'static str> = OnceLock::new();
+    LVL.get_or_init(|| match std::env::var("WIE_JIT_OPT") {
+        Ok(v) if v.eq_ignore_ascii_case("none") || v == "0" => "none",
+        Ok(v)
+            if v.eq_ignore_ascii_case("speed_and_size")
+                || v.eq_ignore_ascii_case("size")
+                || v.eq_ignore_ascii_case("speed-and-size") =>
+        {
+            "speed_and_size"
+        }
+        Ok(v) if v.eq_ignore_ascii_case("speed") || v.eq_ignore_ascii_case("fast") => "speed",
+        _ => "speed",
+    })
+}
+
+/// Run Cranelift IR verifier (`WIE_JIT_VERIFY=1` or always under `cfg(test)`).
+fn jit_verifier_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if cfg!(test) {
+        return true;
+    }
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("WIE_JIT_VERIFY"),
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        )
+    })
+}
+
 impl JitEngine {
     fn new() -> Result<Self, String> {
         use cranelift::prelude::*;
+        use cranelift_codegen::settings::Configurable;
         use cranelift_jit::{JITBuilder, JITModule};
         use cranelift_module::{Linkage, Module, default_libcall_names};
 
         let mut flag_builder = settings::builder();
+        // Phase 5.5 Track D: prefer speed of host code for hot translated blocks.
         flag_builder
-            .set("opt_level", "speed_and_size")
+            .set("opt_level", jit_opt_level())
             .map_err(|e| e.to_string())?;
+        let verify = if jit_verifier_enabled() {
+            "true"
+        } else {
+            "false"
+        };
         flag_builder
-            .set("enable_verifier", "false")
+            .set("enable_verifier", verify)
             .map_err(|e| e.to_string())?;
         flag_builder
             .set("is_pic", "false")
@@ -918,9 +984,29 @@ impl JitEngine {
         flag_builder
             .set("enable_probestack", "false")
             .map_err(|e| e.to_string())?;
-        // Prefer speed of generated code; opt_level=speed is default for cranelift-native.
-        let isa_builder =
+        // Guest frames are not host-unwound; skip metadata tax.
+        flag_builder
+            .set("unwind_info", "false")
+            .map_err(|e| e.to_string())?;
+        // Not a Wasm sandbox heap — soft-translate already bounds guest accesses.
+        flag_builder
+            .set("enable_heap_access_spectre_mitigation", "false")
+            .map_err(|e| e.to_string())?;
+
+        let mut isa_builder =
             cranelift_native::builder().map_err(|msg| format!("host ISA unsupported: {msg}"))?;
+        // Apple Silicon: cranelift_native already enables LSE/PAC/FP16 + macOS PAC B-key.
+        // Re-assert PAC signing so JIT call/return stays ABI-consistent if detect fails.
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            isa_builder
+                .enable("sign_return_address")
+                .map_err(|e| e.to_string())?;
+            isa_builder
+                .enable("sign_return_address_with_bkey")
+                .map_err(|e| e.to_string())?;
+            isa_builder.enable("has_pauth").map_err(|e| e.to_string())?;
+        }
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .map_err(|e| e.to_string())?;
@@ -930,6 +1016,7 @@ impl JitEngine {
         builder.symbol("wie_jit_load", wie_jit_load as *const u8);
         builder.symbol("wie_jit_store", wie_jit_store as *const u8);
         builder.symbol("wie_jit_string", wie_jit_string as *const u8);
+        builder.symbol("wie_jit_host_span", wie_jit_host_span as *const u8);
         builder.symbol("wie_f32_binop", wie_f32_binop as *const u8);
         builder.symbol("wie_f64_binop", wie_f64_binop as *const u8);
         builder.symbol("wie_jit_chain_lookup", wie_jit_chain_lookup as *const u8);
@@ -978,6 +1065,17 @@ impl JitEngine {
         string_sig.returns.push(AbiParam::new(types::I64));
         let string_id = module
             .declare_function("wie_jit_string", Linkage::Import, &string_sig)
+            .map_err(|e| e.to_string())?;
+
+        // host_span: (ctx, guest_va, len, write) -> host_ptr_or_0
+        let mut span_sig = module.make_signature();
+        span_sig.params.push(AbiParam::new(types::I64));
+        span_sig.params.push(AbiParam::new(types::I64));
+        span_sig.params.push(AbiParam::new(types::I64));
+        span_sig.params.push(AbiParam::new(types::I64));
+        span_sig.returns.push(AbiParam::new(types::I64));
+        let host_span_id = module
+            .declare_function("wie_jit_host_span", Linkage::Import, &span_sig)
             .map_err(|e| e.to_string())?;
 
         // f32/f64 binop: (op, a, b) -> r
@@ -1057,6 +1155,7 @@ impl JitEngine {
             load_id,
             store_id,
             string_id,
+            host_span_id,
             f32_id,
             f64_id,
             lookup_id,
@@ -1411,6 +1510,8 @@ mod tests {
                     func_id: None,
                     insn_count: 1,
                     uses_sse: false,
+                    xmm_live_mask: 0,
+                    xmm_may_def_mask: 0,
                     guest_start: rip,
                     guest_end,
                 },
