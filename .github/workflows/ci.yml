@@ -29,5 +29,11 @@ jobs:
       - name: Run Clippy (Linter)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run Cargo Tests
-        run: cargo test -- --test-threads=1
+      - name: Install MinGW (если собираете .exe на Linux)
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+
+      - name: Build test executables
+        run: make -C micro-exes
+
+      - name: Run tests
+        run: cargo test
