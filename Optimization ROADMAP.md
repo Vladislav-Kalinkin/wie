@@ -87,7 +87,7 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 **DoD:** Measurement shows reduced memory‑helper overhead on hot paths.
 
-**Status (2026-07-18):** Default `WIE_MEM=hybrid` (threshold 64 KiB → arena). Force `hash` / `mmap` / `hybrid`. `GuestRegion.host_base` filled for arena-backed layout regions. Details: [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md).
+**Status (2026-07-18):** Landed hybrid (threshold 64 KiB → arena). Force `hash` / `mmap` / `hybrid`. `GuestRegion.host_base` filled for arena-backed layout regions. **Default later flipped to `mmap` in Phase 7.** Details: [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md).
 
 ---
 
@@ -248,57 +248,61 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ---
 
-## Phase 6 – Idle CPU Management
+## Phase 6 – Idle CPU Management ✅
 
 **Goal:** Prevent unnecessary host CPU consumption when the guest is waiting.
 
-### 6.1 Idle Policy Design
+**Status (2026-07-18):** Done (MVP). Docs: [`docs/phase6-idle.md`](docs/phase6-idle.md).
 
-- Define states: `Running` | `HostCall` | `Parked` | `Exit`.
-- Park only on blocking waits: `Sleep`, `WaitForSingleObject`, `GetMessage`/`MsgWaitForMultipleObjects` with an empty queue, etc.
-- Never park on pure guest spin loops (e.g., `while(1)`).
+### 6.1 Idle Policy Design ✅
 
-### 6.2 Implementation
+- States: `Running` | `HostCall` | `Parked` | `Exit` (logical; profiled via park counters).
+- Park only on blocking waits: `Sleep(n>0)`, empty `GetMessage` under persistent `YieldOnIdle` + `IdlePolicy::Park`.
+- Never park on pure guest spin loops (e.g., `while(1)` / `long_loop`).
+- `WaitForSingleObject` / `MsgWait*` deferred (no full wait graph in MVP).
 
-- Implement host thread parking via `thread::sleep` for `Sleep` and timed waits.
-- Extend the existing `GetMessage` yield to actually park when `YieldOnIdle` policy is active.
-- Add environment knobs (`WIE_IDLE`) to optionally insert short sleeps between slices for user‑controlled responsiveness.
+### 6.2 Implementation ✅
 
-**DoD:** An idle GUI application (e.g., one waiting for messages) uses < 5–15% CPU; `long_loop` still runs at ~100% (correct behaviour).
+- `wie_winapi::idle::{IdlePolicy, apply_sleep, apply_message_park}` + env knobs.
+- `Sleep` **not** planted as guest stub; host `handle_sleep` parks under `WIE_IDLE=park` or legacy `WIE_HOST_SLEEP=1`.
+- Persistent `run` outer loop parks on `WaitingForMessage` and re-enters GetMessage (`WIE_IDLE_PARK_MS` / `WIE_IDLE_MAX_PARKS`).
+- Micros: default `WIE_IDLE=yield` + `ExitOnIdle` (deterministic, no long sleeps).
+
+**DoD:** Idle message path parks host (low CPU); `long_loop` still ~100%; micro-suite green; clippy `-D warnings`. ✅
 
 ---
 
-## Phase 7 – Hardening & Cutover
+## Phase 7 – Hardening & Cutover ✅
 
-### 7.1 Invalidation Rules
+**Status (2026-07-18):** Done. Docs: [`docs/phase7-hardening.md`](docs/phase7-hardening.md), [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 
-- Unify invalidation of TLB, JIT cache, and region table when memory protection changes or code is written.
-- Ensure stale host pointers are never used after `VirtualFree` or `Unmap`.
+### 7.1 Invalidation Rules ✅
 
-**Status:** Core rules landed in **Phase 4.x** ([`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md)): selective JIT drop on X-loss/SMC/free, no W soft-translate on X, edge IC clear. Phase 7 may still add stress / multi-region edge cases and optional `FlushInstructionCache` stub.
+- Core rules in **Phase 4.x** ([`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md)).
+- Phase 7 residual: multi-region protect/free stress, SMC across page boundary, optional `FlushInstructionCache` → selective/full Ready drop.
 
-**DoD:** Self‑modifying code and `VirtualProtect` tests pass. (4.x unit coverage done; broader stress remains.)
+**DoD:** Self‑modifying code and `VirtualProtect` tests pass; stress units green. ✅
 
-### 7.2 Stress Testing
+### 7.2 Stress Testing ✅
 
-- Test high‑VA addresses, wrap‑around, large allocations (> 1 GB), and concurrent host reads.
-- Verify that no fixed low‑address mappings are used (anti‑Wine checklist).
+- High guest VA, wrap-around map reject, ≥1 GiB RESERVE demand-zero, anti-Wine host≠guest on all backends.
+- Single-threaded guest model (no concurrent guest writers); dual-backend oracle remains Phase 1.
 
-**DoD:** No address space conflicts; process survives `mmap` pressure.
+**DoD:** No identity map; process survives large reserve / pressure paths. ✅
 
-### 7.3 Default Flip
+### 7.3 Default Flip ✅
 
-- Make `WIE_MEM=mmap` the default; keep `hash` available for one release as a fallback.
-- Update `README.md` with performance notes, clarifying that mmap improves memory throughput but **does not** reduce idle CPU.
+- Default `WIE_MEM=mmap`; keep `hash` and `hybrid` as explicit overrides.
+- README: mmap is storage throughput / soft arenas — **not** idle CPU (Phase 6).
 
-**DoD:** CI uses `mmap` by default; `hash` builds continue to work.
+**DoD:** Default path is mmap; `hash` / `hybrid` continue to work. ✅
 
-### 7.4 Rollback Playbook
+### 7.4 Rollback Playbook ✅
 
-- Document a one‑page `RUNBOOK` with symptoms and remedial actions (`WIE_MEM=hash`, `WIE_CPU=iced`).
-- Include a startup log line showing the active memory backend when `WIE_RUNTIME_PROFILE=1`.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md): symptoms → `WIE_MEM=hash|hybrid`, `WIE_CPU=iced`, idle/JIT knobs.
+- `WIE_RUNTIME_PROFILE=1` reports `mem_backend` + `idle_policy`.
 
-**DoD:** Any regressions can be quickly mitigated by the user.
+**DoD:** Regressions mitigable by env. ✅
 
 ---
 

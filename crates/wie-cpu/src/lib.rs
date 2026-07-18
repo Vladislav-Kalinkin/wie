@@ -201,6 +201,21 @@ pub trait CpuEngine {
         }
     }
 
+    /// `FlushInstructionCache` — drop JIT Ready blocks for `[addr, addr+size)`.
+    ///
+    /// Microsoft Learn: after software patches code, flush so the CPU fetches
+    /// the new bytes. Under WIE this means selective JIT invalidation (soft
+    /// translate); host I-cache for Cranelift output is unrelated.
+    ///
+    /// When `size == 0`, flush the entire process instruction cache (all Ready).
+    /// Default: success no-op (non-JIT backends).
+    ///
+    /// # Errors
+    /// Backend-specific (normally never).
+    fn flush_instruction_cache(&mut self, _addr: u64, _size: usize) -> Result<(), CpuError> {
+        Ok(())
+    }
+
     /// Map a PE image range as `MEM_IMAGE` (committed) with Unicorn-style `perms`.
     ///
     /// Default: same as [`Self::mem_map`] (private).
@@ -297,6 +312,9 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn virtual_query(&self, addr: u64) -> MemoryBasicInformation {
         (**self).virtual_query(addr)
+    }
+    fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
+        (**self).flush_instruction_cache(addr, size)
     }
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
         (**self).mem_map_image(address, size, perms)

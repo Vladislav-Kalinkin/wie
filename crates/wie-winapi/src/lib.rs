@@ -14,6 +14,7 @@ pub mod guest_heap;
 pub mod guest_io_host;
 mod guest_memory;
 mod guest_string;
+pub mod idle;
 pub mod kernel32;
 pub mod ucrt;
 pub mod user32;
@@ -21,6 +22,7 @@ pub mod uxtheme;
 pub mod winmm;
 pub use bottle::{bottle_root_from_env, guest_path_to_host};
 pub use guest_heap::GuestHeap;
+pub use idle::{IdleContext, IdlePolicy};
 pub use kernel32::WinApiHandlerResult;
 
 /// Runtime environment values visible to WinAPI handlers.

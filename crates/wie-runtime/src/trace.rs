@@ -236,15 +236,81 @@ pub fn run_micro_exe_with_options(
     })
 }
 
-/// Runs Lunar Magic until the runtime yields waiting for a message
-/// or reaches another terminal condition.
+/// Runs until the runtime yields waiting for a message or another terminal condition.
+///
+/// Phase 6: under [`wie_winapi::IdlePolicy::Park`] (default for persistent when
+/// `WIE_IDLE` is unset), empty `GetMessage` parks the host for short quanta and
+/// re-enters until a message arrives or `WIE_IDLE_MAX_PARKS` is hit (then yields).
 pub fn run_persistent_until_yield(
     path: &std::path::Path,
     max_api: usize,
 ) -> Result<EntryTraceSummary> {
-    run_session_to_summary(
-        path,
-        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
-        max_api,
-    )
+    use std::time::Instant;
+    use wie_winapi::{IdleContext, IdlePolicy};
+
+    let idle = IdlePolicy::from_env_for(IdleContext::Persistent);
+    let mut session =
+        RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)?;
+
+    if session.profile_enabled() {
+        session.profile_mut().idle_policy = idle.as_str().to_owned();
+    }
+
+    let entry_point_va = session.entry_point_va();
+    let initial_rsp = session.initial_rsp();
+    let mut events = Vec::new();
+    let mut final_rip = 0;
+    let mut final_rsp = 0;
+    let mut remaining_api = max_api;
+    let mut message_parks: u32 = 0;
+    let max_parks = wie_winapi::idle::idle_max_message_parks();
+
+    let termination = loop {
+        if remaining_api == 0 {
+            break EntryTraceTermination::ApiLimit;
+        }
+
+        let run_summary = session.run_until_stop(remaining_api)?;
+        let used = run_summary.events.len();
+        remaining_api = remaining_api.saturating_sub(used);
+        events.extend(run_summary.events);
+        final_rip = run_summary.final_rip;
+        final_rsp = run_summary.final_rsp;
+
+        match run_summary.termination {
+            EntryTraceTermination::WaitingForMessage if idle.should_park_message() => {
+                let unlimited = max_parks == 0;
+                if !unlimited && message_parks >= max_parks {
+                    break EntryTraceTermination::WaitingForMessage;
+                }
+                let t0 = Instant::now();
+                wie_winapi::idle::apply_message_park();
+                let park_ns = t0.elapsed().as_nanos();
+                message_parks = message_parks.saturating_add(1);
+                if session.profile_enabled() {
+                    let p = session.profile_mut();
+                    p.idle_parks = p.idle_parks.saturating_add(1);
+                    p.idle_park_ns = p.idle_park_ns.saturating_add(park_ns);
+                }
+                // Re-enter GetMessage (guest still at fake-API entry).
+            }
+            other => break other,
+        }
+    };
+
+    let profile = if session.profile_enabled() {
+        Some(session.profile().clone())
+    } else {
+        None
+    };
+
+    Ok(EntryTraceSummary {
+        entry_point_va,
+        initial_rsp,
+        events,
+        termination,
+        final_rip,
+        final_rsp,
+        profile,
+    })
 }

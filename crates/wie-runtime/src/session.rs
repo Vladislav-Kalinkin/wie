@@ -144,6 +144,12 @@ pub struct RuntimeProfile {
     pub jit: Option<wie_cpu::JitStats>,
     /// Active memory backend name (`hash`, …).
     pub mem_backend: String,
+    /// Host idle policy name (`busy` / `yield` / `park`, Phase 6).
+    pub idle_policy: String,
+    /// Empty-message / host park quanta applied by the outer run loop.
+    pub idle_parks: u64,
+    /// Wall nanoseconds spent in host idle parks (message quanta).
+    pub idle_park_ns: u128,
 }
 
 impl RuntimeProfile {
@@ -165,6 +171,16 @@ impl RuntimeProfile {
         lines.push("=== WIE_RUNTIME_PROFILE ===".to_owned());
         if !self.mem_backend.is_empty() {
             lines.push(format!("mem_backend={}", self.mem_backend));
+        }
+        if !self.idle_policy.is_empty() {
+            lines.push(format!("idle_policy={}", self.idle_policy));
+        }
+        if self.idle_parks > 0 || self.idle_park_ns > 0 {
+            lines.push(format!(
+                "idle_parks={} idle_park_ms={:.2}",
+                self.idle_parks,
+                self.idle_park_ns as f64 / 1e6
+            ));
         }
         lines.push(format!(
             "host_stops={} noisy={} charged={}",
@@ -529,6 +545,11 @@ impl RuntimeSession {
     #[must_use]
     pub fn profile(&self) -> &RuntimeProfile {
         &self.profile
+    }
+
+    /// Mutable profile for outer run-loop counters (e.g. idle parks).
+    pub fn profile_mut(&mut self) -> &mut RuntimeProfile {
+        &mut self.profile
     }
 
     /// Whether profiling is enabled for this session.
@@ -968,6 +989,11 @@ impl RuntimeSession {
         if session.profile_enabled {
             session.profile.init_ns = t_init.elapsed().as_nanos();
             session.profile.mem_backend = session.engine.mem_backend_name().to_owned();
+            // Micro / default sessions: idle from env with Micro default (Yield).
+            session.profile.idle_policy =
+                wie_winapi::IdlePolicy::from_env_for(wie_winapi::IdleContext::Micro)
+                    .as_str()
+                    .to_owned();
             session.profile.jit = session.engine.cpu_stats();
         }
         Ok(session)

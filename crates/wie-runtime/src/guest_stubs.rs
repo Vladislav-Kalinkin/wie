@@ -445,10 +445,7 @@ pub(crate) fn classify_guest_stub(
     if n.eq_ignore_ascii_case("IsDebuggerPresent") {
         return Some(GuestStubKind::ReturnZero);
     }
-    if n.eq_ignore_ascii_case("Sleep") {
-        // No-op Sleep is a pre-existing policy (Phase 6 will park). Not expanded here.
-        return Some(GuestStubKind::VoidRet);
-    }
+    // Sleep is never planted: host idle policy (Phase 6) must see every call.
     if n.eq_ignore_ascii_case("GetACP") {
         return Some(GuestStubKind::ReturnImm32(1252));
     }

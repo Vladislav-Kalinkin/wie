@@ -1239,6 +1239,20 @@ impl CpuEngine for JitCpu {
         self.iced.virtual_query(addr)
     }
 
+    fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
+        // Phase 7: map WinAPI flush to selective (or full) Ready drop.
+        if size == 0 {
+            if !self.cache.is_empty() {
+                self.clear_compiled();
+                self.invalidate_chain_and_shadow();
+                self.stats.code_invs = self.stats.code_invs.saturating_add(1);
+            }
+        } else {
+            self.invalidate_code_range(addr, size);
+        }
+        Ok(())
+    }
+
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
         let r = self.iced.mem_map_image(address, size, perms);
         self.invalidate_tlb();
@@ -1673,5 +1687,94 @@ mod tests {
             .expect("data tlb");
         assert!(e2.allow_r && e2.allow_w);
         let _ = perm::ALL; // silence if unused in some cfgs
+    }
+
+    // --- Phase 7 stress residual (invalidation multi-region / FIC) ---
+
+    #[test]
+    fn code_inv_smc_across_page_boundary() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1010_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc 2 pages");
+        // Ready block straddles page boundary (last 8 B of page0 + first of page1).
+        let entry = base + 0x0ff8;
+        cpu.test_plant_ready(entry, entry + 16);
+        assert!(cpu.has_ready_at(entry));
+        // Store on page1 half of the range.
+        cpu.mem_write(base + 0x1000, &[0x90, 0x90]).expect("smc p1");
+        assert!(!cpu.has_ready_at(entry));
+        assert_eq!(cpu.edge_ic_va[0], 0);
+    }
+
+    #[test]
+    fn code_inv_multi_region_protect_and_free() {
+        let mut cpu = JitCpu::open_x86_64();
+        let a = 0x1011_0000_u64;
+        let b = 0x1012_0000_u64;
+        for base in [a, b] {
+            cpu.virtual_alloc(
+                base,
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_EXECUTE_READWRITE,
+            )
+            .expect("alloc");
+            cpu.test_plant_ready(base, base + 8);
+        }
+        assert!(cpu.has_ready_at(a) && cpu.has_ready_at(b));
+        // X-loss on A only.
+        cpu.virtual_protect(a, 0x1000, protect::PAGE_READONLY)
+            .expect("protect a");
+        assert!(!cpu.has_ready_at(a));
+        assert!(cpu.has_ready_at(b));
+        assert_eq!(cpu.edge_ic_va[0], 0); // edge IC cleared on any selective drop
+        // Free B.
+        cpu.virtual_free(b, 0, MEM_RELEASE).expect("free b");
+        assert!(!cpu.has_ready_at(b));
+    }
+
+    #[test]
+    fn flush_instruction_cache_drops_ready_range() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1013_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.test_plant_ready(base, base + 16);
+        assert!(cpu.has_ready_at(base));
+        cpu.flush_instruction_cache(base, 16).expect("fic");
+        assert!(!cpu.has_ready_at(base));
+        assert!(cpu.stats().code_invs >= 1);
+    }
+
+    #[test]
+    fn flush_instruction_cache_size_zero_clears_all() {
+        let mut cpu = JitCpu::open_x86_64();
+        let a = 0x1014_0000_u64;
+        let b = 0x1015_0000_u64;
+        for base in [a, b] {
+            cpu.virtual_alloc(
+                base,
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_EXECUTE_READWRITE,
+            )
+            .expect("alloc");
+            cpu.test_plant_ready(base, base + 4);
+        }
+        cpu.flush_instruction_cache(0, 0).expect("fic all");
+        assert!(!cpu.has_ready_at(a));
+        assert!(!cpu.has_ready_at(b));
+        assert!(cpu.code_pages.is_empty());
     }
 }

@@ -1,7 +1,7 @@
 # Phase 2 – Mmap Storage Backend
 
 **Date:** 2026-07-18  
-**Goal:** Soft-translated anonymous mmap arenas for guest memory, with HashMap fallback and hybrid default. Foundation for Phase 3 (perms / VirtualAlloc) and Phase 4 (region-direct JIT).
+**Goal:** Soft-translated anonymous mmap arenas for guest memory, with HashMap fallback and hybrid mode. (Default later flipped to pure **mmap** in Phase 7.) Foundation for Phase 3 (perms / VirtualAlloc) and Phase 4 (region-direct JIT).
 
 **Follow-on:** Phase 3 guest permissions and Virtual* APIs are documented in [`phase3-permissions.md`](phase3-permissions.md).
 
@@ -9,8 +9,8 @@
 
 | Value | Behaviour |
 | ----- | --------- |
-| `hybrid` (default) | Maps with `size ≥ 64 KiB` → one anonymous arena each; smaller maps → `HashMap` + radix |
-| `mmap` | Every map is an anonymous arena (even 4 KiB) |
+| `mmap` (**default**, Phase 7) | Every map is an anonymous arena (even 4 KiB) |
+| `hybrid` | Maps with `size ≥ 64 KiB` → one anonymous arena each; smaller maps → `HashMap` + radix |
 | `hash` | Pre-Phase-2 storage only (rollback) |
 
 ```bash

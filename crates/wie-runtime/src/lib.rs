@@ -28,4 +28,4 @@ pub use trace::{
     run_micro_exe_with_root, run_persistent_until_yield,
 };
 pub use wie_cpu::{CpuEngine, CpuError, IcedCpu, JitCpu, active_backend_name, open_default_cpu};
-pub use wie_winapi::FileDialogPolicy;
+pub use wie_winapi::{FileDialogPolicy, IdleContext, IdlePolicy};

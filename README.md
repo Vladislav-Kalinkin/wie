@@ -17,7 +17,7 @@
 
 The WinAPI surface is intentionally incomplete: many handlers are stubs sufficient for the micro-suite and engine bring-up, not a final product surface.
 
-**Status (post Phases 0–5.5):** Hybrid memory (mmap arenas + sparse HashMap), software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, and an expanded in-guest stub set. Idle-park policy (Phase 6) and default flip to pure mmap (Phase 7) are still open — see [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
+**Status (post Phases 0–7):** Soft-translate guest memory defaulting to pure **mmap** arenas (`hybrid` / `hash` still available), software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`, and a short [`docs/RUNBOOK.md`](docs/RUNBOOK.md). See [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
 ## Examples of launch
 
@@ -37,7 +37,7 @@ time ./target/release/wie-cli run-micro micro-exes/out/winapi_heap.exe
 
 # ~100M stack-volatile loop under Cranelift JIT (block-wide super path)
 time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/long_loop.exe
-# expect ~0.28–0.32s wall, ~100% CPU, mem_backend=hybrid
+# expect ~0.28–0.32s wall, ~100% CPU, mem_backend=mmap
 
 # Interactive argv + live stdin (blocks on host Read until Enter / pipe data)
 time WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run-micro micro-exes/out/cli_args.exe -- -n 3 -m hi -i
@@ -105,7 +105,7 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 ## Memory & Heap
 
-- **Backends** (`WIE_MEM`): default **`hybrid`** (maps ≥ 64 KiB → anonymous arena; tiny pages HashMap); force `mmap` (all arenas) or `hash` (legacy sparse only). Soft translate only — guest VA ≠ host VA.
+- **Backends** (`WIE_MEM`): default **`mmap`** (every map → anonymous arena); force `hybrid` (≥ 64 KiB arenas + sparse tiny pages) or `hash` (legacy sparse only). Soft translate only — guest VA ≠ host VA.
 - **Layout**: `RegionTable` names stack / heap / image / fake API / TEB / stubs; arena-backed regions expose `host_base` for JIT pins.
 - **Permissions**: software PageMap + VAD (Free / Reserved / Committed, `PAGE_*`); SPC on every read/write/fetch and JIT TLB install. Optional dual `mprotect` on arena frames (`WIE_MPROTECT`, default on) — never the sole oracle under 4K guest / 16K host clinch.
 - **Dynamic mapping**: real `VirtualAlloc` / `VirtualFree` / `VirtualProtect` / `VirtualQuery` (64 KiB reserve granularity, 4 KiB commit).
@@ -118,7 +118,7 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 | Variable                                | Effect                                                                                                |
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `WIE_CPU=jit` \| `iced`                 | CPU backend (default **jit**)                                                                         |
-| `WIE_MEM=hybrid` \| `mmap` \| `hash`    | Guest storage (default **hybrid**) — see [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md) |
+| `WIE_MEM=mmap` \| `hybrid` \| `hash`    | Guest storage (default **mmap**, Phase 7) — see [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md) |
 | `WIE_MPROTECT=0`                        | Disable optional host `mprotect` dual-protection on arenas (SPC remains on)                           |
 | `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower mode (default **sticky** = sticky TLB + stack pin)                                      |
 | `WIE_JIT_CHAIN=0`                       | Disable FuncRef chaining / chain table / edge IC                                                      |
@@ -134,7 +134,11 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 | `WIE_GUEST_HEAP=1`                      | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code                                              |
 | `WIE_GUEST_IO=0` \| `all`               | I/O accelerator: default seeks/size in-guest; `all` also guest Read (large → host); `0` = all host    |
 | `WIE_GUEST_MBWC=1`                      | Guest MultiByte↔WideChar helpers                                                                      |
-| `WIE_HOST_SLEEP=1`                      | `Sleep(n>0)` parks the host thread (default is non-blocking slice)                                    |
+| `WIE_IDLE=busy\|yield\|park`            | Host idle policy (Phase 6): micros default **yield**; interactive `run` default **park** when unset   |
+| `WIE_IDLE_CAP_MS`                       | Max single `Sleep` park (default 60000)                                                               |
+| `WIE_IDLE_PARK_MS`                      | Empty-`GetMessage` park quantum ms (default 25)                                                       |
+| `WIE_IDLE_MAX_PARKS`                    | Max message park quanta before CLI yield (`0` = unlimited; default 40)                                |
+| `WIE_HOST_SLEEP=1`                      | **Legacy:** enable `Sleep(n>0)` park only (prefer `WIE_IDLE=park`)                                    |
 | `RUST_LOG`                              | tracing filter (CLI defaults to `warn`)                                                               |
 
 ## CLI
@@ -173,7 +177,10 @@ Phases 0–5 landed; baselines and design notes:
 | [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md) | Selective JIT drop on X-loss / SMC / free |
 | [`docs/phase5-guest-stubs.md`](docs/phase5-guest-stubs.md)     | In-guest WinAPI stubs (Learn policy)    |
 | [`docs/phase5.5-neon-cranelift.md`](docs/phase5.5-neon-cranelift.md) | Neon SIMD, TLB, inline strings, Cranelift flags |
-| [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md)         | Full plan (Phases 6–7 still open)       |
+| [`docs/phase6-idle.md`](docs/phase6-idle.md)                   | Host idle park (`Sleep` / empty GetMessage) |
+| [`docs/phase7-hardening.md`](docs/phase7-hardening.md)         | Stress, FIC stub, mmap default cutover  |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md)                           | Symptom → kill-switch playbook          |
+| [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md)         | Full plan (Phases 0–7 complete)         |
 
 Headline numbers on Apple Silicon release builds (order-of-magnitude; re-measure with `WIE_RUNTIME_PROFILE=1`):
 
@@ -191,7 +198,7 @@ What actually burns CPU today:
 4. **Block entry/exit** — GPR sync is mandatory; XMM sync is skipped for pure GPR blocks.
 5. **Cold compile tax** — hotness threshold avoids compiling one-shot code; short micros spend most wall in session init.
 
-Further wins worth pursuing (roadmap): idle park for Sleep/message waits (Phase 6); stress / cutover + optional default flip to `WIE_MEM=mmap` (Phase 7; core code invalidation is Phase 4.x); denser stop/API lookup.
+Further wins worth pursuing: denser stop/API lookup; full wait objects beyond Sleep/GetMessage; optional SIGSEGV fault epic (explicit non-goal of Phases 0–7).
 
 ## Installation & Prerequisites
 

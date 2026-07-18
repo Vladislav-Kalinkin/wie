@@ -4294,9 +4294,7 @@ pub fn handle_get_current_directory_w(
         .context("GetCurrentDirectoryW required size overflow")?;
 
     // Need nBufferLength > character_count so there is room for the NUL.
-    let return_value = if buffer_ptr == 0
-        || buffer_length == 0
-        || buffer_length <= character_count
+    let return_value = if buffer_ptr == 0 || buffer_length == 0 || buffer_length <= character_count
     {
         required_with_nul
     } else {
@@ -4402,11 +4400,59 @@ pub fn dispatch_kernel32_extra(
         "virtualfree" => Ok(Some(handle_virtual_free(engine, state)?)),
         "virtualprotect" => Ok(Some(handle_virtual_protect(engine, state)?)),
         "virtualquery" => Ok(Some(handle_virtual_query(engine, state)?)),
+        "flushinstructioncache" => Ok(Some(handle_flush_instruction_cache(engine, state)?)),
         "tlsgetvalue" => Ok(Some(handle_tls_get_value(engine, state)?)),
         "tlssetvalue" => Ok(Some(handle_tls_set_value(engine, state)?)),
         "tlsalloc" => Ok(Some(handle_tls_alloc(engine, state)?)),
         "tlsfree" => Ok(Some(handle_tls_free(engine, state)?)),
         _ => Ok(None),
+    }
+}
+
+/// `FlushInstructionCache(hProcess, lpBaseAddress, dwSize)`.
+///
+/// Microsoft Learn: after patching code, flush so subsequent fetches see new
+/// bytes. WIE maps this to selective JIT Ready invalidation (Phase 7).
+/// `dwSize == 0` flushes the whole process instruction cache.
+fn handle_flush_instruction_cache(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _process = engine
+        .read_rcx()
+        .context("failed to read RCX for FlushInstructionCache")?;
+    let base = engine
+        .read_rdx()
+        .context("failed to read RDX for FlushInstructionCache")?;
+    let size = engine
+        .read_r8()
+        .context("failed to read R8 for FlushInstructionCache")?;
+    let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+    if size_usize == usize::MAX && size != 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    match engine.flush_instruction_cache(base, size_usize) {
+        Ok(()) => {
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(1)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 1,
+            })
+        }
+        Err(e) => {
+            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let return_address = engine.return_from_win64_api(0)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
+        }
     }
 }
 
@@ -4641,23 +4687,18 @@ fn handle_tls_free(
 
 /// Handles `KERNEL32.dll!Sleep`.
 ///
-/// Idle policy:
-/// - `Sleep(0)` always yields the host thread (`yield_now`) — cheap cooperative park.
-/// - Non-zero sleeps: by default a **no-op** so smokes/diff-traces stay deterministic
-///   and fast. Set `WIE_HOST_SLEEP=1` to park the host thread for up to 60s
-///   (interactive / idle CPU).
+/// Idle policy (Phase 6 — see [`crate::idle`]):
+/// - `Sleep(0)` always yields the host thread (`yield_now`).
+/// - `Sleep(n>0)`: **no-op** under `WIE_IDLE=yield|busy` (micros); parks under
+///   `WIE_IDLE=park` or legacy `WIE_HOST_SLEEP=1` (capped by `WIE_IDLE_CAP_MS`).
+///
+/// Not planted as an in-guest stub — side effects depend on host idle policy.
 pub fn handle_sleep(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let milliseconds = engine.read_rcx().context("failed to read RCX for Sleep")?;
     let low32 = milliseconds & u64::from(u32::MAX);
 
-    if low32 == 0 {
-        // Guest idle spin: park briefly so a tight Sleep(0) loop does not burn a core.
-        std::thread::yield_now();
-    } else if host_sleep_enabled() {
-        // INFINITE / huge values: cap so the host cannot hang forever.
-        let ms = low32.min(60_000);
-        std::thread::sleep(std::time::Duration::from_millis(ms));
-    }
+    let policy = crate::idle::IdlePolicy::from_env();
+    crate::idle::apply_sleep(policy, low32);
 
     let return_value = 0;
 
@@ -4669,11 +4710,6 @@ pub fn handle_sleep(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandler
         return_address,
         return_value,
     })
-}
-
-/// Whether `Sleep(n>0)` should block the host thread (`WIE_HOST_SLEEP=1`).
-fn host_sleep_enabled() -> bool {
-    std::env::var_os("WIE_HOST_SLEEP").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 fn allocate_fake_heap_block(

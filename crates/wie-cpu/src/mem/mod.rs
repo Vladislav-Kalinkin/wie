@@ -2,9 +2,9 @@
 //!
 //! Phase 2–3 layout:
 //! - [`GuestMemBackend`] — storage trait
-//! - [`HashMapBackend`] — `WIE_MEM=hash` (eager pages + radix)
-//! - [`MmapArenaBackend`] — `WIE_MEM=mmap` (contiguous anonymous arenas)
-//! - [`HybridBackend`] — large arenas + sparse HashMap (`WIE_MEM=hybrid`, default)
+//! - [`MmapArenaBackend`] — `WIE_MEM=mmap` (contiguous anonymous arenas; **default**)
+//! - [`HybridBackend`] — large arenas + sparse HashMap (`WIE_MEM=hybrid`)
+//! - [`HashMapBackend`] — `WIE_MEM=hash` (eager pages + radix; rollback)
 //! - [`RegionTable`] — named layout ranges (`host_base` filled for mmap arenas)
 //! - [`PageMap`] / [`protect`] — Windows page state + software permission checks
 //! - [`GuestMemory`] — facade used by iced/JIT (SPC on read/write/fetch)
@@ -90,7 +90,9 @@ pub(crate) enum MemBackendKind {
 }
 
 impl MemBackendKind {
-    /// Parse `WIE_MEM` (`hash` / `mmap` / `hybrid`). Default: hybrid.
+    /// Parse `WIE_MEM` (`hash` / `mmap` / `hybrid`). Default: **mmap** (Phase 7 cutover).
+    ///
+    /// Rollback: `WIE_MEM=hash` or `WIE_MEM=hybrid`.
     #[must_use]
     pub(crate) fn from_env() -> Self {
         match std::env::var("WIE_MEM") {
@@ -98,7 +100,7 @@ impl MemBackendKind {
             Ok(v) if v.eq_ignore_ascii_case("mmap") => Self::Mmap,
             Ok(v) if v.eq_ignore_ascii_case("hybrid") => Self::Hybrid,
             Ok(v) if v.eq_ignore_ascii_case("mmap_page") => Self::Mmap, // alias
-            _ => Self::Hybrid,
+            _ => Self::Mmap,
         }
     }
 }
@@ -1992,5 +1994,113 @@ mod tests {
         mem.write(base + 0x1000, &[1]).expect("rw page");
         let mut b = [0_u8; 1];
         mem.read(base, &mut b).expect("ro read");
+    }
+
+    // --- Phase 7 stress / anti-Wine ---
+
+    #[test]
+    fn phase7_high_va_mmap_roundtrip() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        // High canonical-ish guest VA (not low 4 GiB identity).
+        let base = 0x0000_7fff_0000_0000_u64;
+        mem.map(base, 0x2000, crate::perm::ALL).expect("map high");
+        mem.write(base + 0x100, &[0xaa, 0xbb, 0xcc, 0xdd])
+            .expect("write");
+        let mut buf = [0_u8; 4];
+        mem.read(base + 0x100, &mut buf).expect("read");
+        assert_eq!(buf, [0xaa, 0xbb, 0xcc, 0xdd]);
+        let page = mem.page_data_ptr(page_key(base)).expect("host page");
+        let host = u64::try_from(page.addr()).expect("host addr");
+        assert_ne!(host, base, "anti-Wine: host VA must not equal guest VA");
+        assert_ne!(host, 0);
+    }
+
+    #[test]
+    fn phase7_map_wraparound_rejected() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        // Page-aligned base near u64::MAX so `base + size` overflows.
+        let base = u64::MAX - 0xfff;
+        let aligned = base & !0xfff; // 0xffff_ffff_ffff_f000
+        let err = mem
+            .map(aligned, 0x2000, crate::perm::ALL)
+            .expect_err("wrap");
+        let s = err.to_string();
+        assert!(
+            s.contains("overflow") || s.contains("wrap") || s.contains("invalid"),
+            "unexpected err: {s}"
+        );
+    }
+
+    #[test]
+    fn phase7_large_reserve_demand_zero_survives() {
+        // >1 GiB RESERVE should not charge full RSS (anonymous demand-zero).
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let base = 0x6000_0000_u64;
+        let size = 0x4000_0000_usize; // 1 GiB
+        let r = mem.virtual_alloc(base, size, MEM_RESERVE, protect::PAGE_READWRITE);
+        match r {
+            Ok(b) => {
+                assert_eq!(b, base);
+                // Touch one page only.
+                mem.virtual_alloc(base, 0x1000, MEM_COMMIT, protect::PAGE_READWRITE)
+                    .expect("commit first page");
+                mem.write(base, &[1, 2, 3, 4]).expect("touch");
+                let mut buf = [0_u8; 4];
+                mem.read(base, &mut buf).expect("read");
+                assert_eq!(buf, [1, 2, 3, 4]);
+                mem.virtual_free(base, 0, MEM_RELEASE).expect("release");
+            }
+            Err(e) => {
+                // Some hosts may refuse huge mmap; still must not panic.
+                let s = e.to_string();
+                assert!(
+                    s.contains("mmap") || s.contains("win32") || s.contains("failed"),
+                    "unexpected large-reserve err: {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phase7_anti_wine_soft_translate_all_backends() {
+        for kind in [
+            MemBackendKind::Hash,
+            MemBackendKind::Mmap,
+            MemBackendKind::Hybrid,
+        ] {
+            let mut mem = GuestMemory::with_kind(kind);
+            let guest = 0x1800_0000_u64;
+            mem.map(guest, 0x1_0000, crate::perm::ALL).expect("map");
+            if let Some(page) = mem.page_data_ptr(page_key(guest)) {
+                let host = u64::try_from(page.addr()).expect("host addr");
+                // Soft translate: host pointer is OS-chosen, never the guest VA.
+                assert_ne!(
+                    host, guest,
+                    "backend {} identity-mapped guest VA",
+                    mem.backend_name()
+                );
+            }
+            // Never reserve fixed low 4 GiB for identity — guest layout uses
+            // soft bases; host_base when present must differ from guest.
+            let name = mem.backend_name();
+            assert!(
+                matches!(name, "hash" | "mmap" | "hybrid"),
+                "unknown backend {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase7_virtual_alloc_size_overflow_rejected() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hybrid);
+        let err = mem
+            .virtual_alloc(
+                0x7000_0000,
+                usize::MAX,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_READWRITE,
+            )
+            .expect_err("overflow size");
+        assert!(!err.to_string().is_empty());
     }
 }
