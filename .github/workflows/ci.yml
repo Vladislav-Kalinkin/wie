@@ -30,4 +30,4 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run Cargo Tests
-        run: cargo test --workspace
+        run: cargo test -- --test-threads=1
