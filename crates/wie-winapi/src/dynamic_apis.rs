@@ -127,7 +127,8 @@ pub fn dynamic_fake_target_va(library: &str, name: &str) -> Option<u64> {
     DYNAMIC_FAKE_APIS
         .iter()
         .position(|e| e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name))
-        .map(|idx| encode_unresolved(idx as u16))
+        .and_then(|idx| u16::try_from(idx).ok())
+        .map(encode_unresolved)
 }
 
 /// Resolves a `GetProcAddress` export name to a fake target VA.
@@ -149,6 +150,7 @@ pub fn resolve_get_proc_address(proc_name: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::fake_va::decode;

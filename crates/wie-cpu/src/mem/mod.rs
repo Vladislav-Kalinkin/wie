@@ -16,11 +16,6 @@ pub mod protect;
 mod region;
 mod vad;
 
-#[cfg(test)]
-mod mmap_page;
-#[cfg(test)]
-mod oracle;
-
 pub use backend::{GuestMemBackend, PAGE_SIZE, PAGE_SIZE_USIZE};
 pub use mmap_arena::MmapArenaBackend;
 pub use pagemap::{PageMap, PageRun, PageState};

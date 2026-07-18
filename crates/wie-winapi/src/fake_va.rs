@@ -67,6 +67,7 @@ pub enum FakeVa {
 
 /// Pack `kind` + `payload` into a guest fake VA.
 #[must_use]
+#[allow(clippy::as_conversions)] // const: widen kind/payload into the packed VA bitfield
 pub const fn encode(kind: u8, payload: u16) -> u64 {
     FAKE_API_BASE
         | ((kind as u64) << KIND_SHIFT)
@@ -112,12 +113,18 @@ pub const fn callback_return_trampoline_va() -> u64 {
 
 /// Decode a guest VA into a [`FakeVa`], if it lies in the fake-API window.
 #[must_use]
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::arithmetic_side_effects
+)] // bitfield decode: checked window, then truncating payload/kind extracts
 pub fn decode(va: u64) -> Option<FakeVa> {
     if va < FAKE_API_BASE {
         return None;
     }
     let off = va - FAKE_API_BASE;
-    if off >= FAKE_API_SIZE as u64 {
+    let window = FAKE_API_SIZE as u64;
+    if off >= window {
         return None;
     }
     // Require 16-byte alignment (IAT / stub stride).
@@ -125,9 +132,7 @@ pub fn decode(va: u64) -> Option<FakeVa> {
         return None;
     }
 
-    #[allow(clippy::as_conversions)]
     let payload = ((off >> ALIGN_SHIFT) & PAYLOAD_MASK) as u16;
-    #[allow(clippy::as_conversions)]
     let kind = ((off >> KIND_SHIFT) & KIND_MASK) as u8;
 
     match kind {
@@ -136,9 +141,7 @@ pub fn decode(va: u64) -> Option<FakeVa> {
             Some(FakeVa::Export(id))
         }
         KIND_COM => {
-            #[allow(clippy::as_conversions)]
             let iface = (payload >> 8) as u8;
-            #[allow(clippy::as_conversions)]
             let method = payload as u8;
             Some(FakeVa::Com { iface, method })
         }
@@ -160,6 +163,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::as_conversions)] // test: FAKE_API_SIZE usize → u64 window bound
     fn export_round_trip() {
         let id = WinApiId::Kernel32Getlasterror;
         let va = encode_export(id);
@@ -194,6 +198,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::as_conversions)] // test: FAKE_API_SIZE usize → u64 window bound
     fn rejects_outside_window() {
         assert!(decode(0x140_000_000).is_none());
         assert!(decode(FAKE_API_BASE + FAKE_API_SIZE as u64).is_none());
