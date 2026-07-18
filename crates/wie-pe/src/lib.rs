@@ -221,6 +221,150 @@ pub struct PeSectionSummary {
     pub virtual_address_va: u64,
 }
 
+// COFF section characteristics (Microsoft PE format / Learn).
+/// `IMAGE_SCN_MEM_EXECUTE`
+pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+/// `IMAGE_SCN_MEM_READ`
+pub const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+/// `IMAGE_SCN_MEM_WRITE`
+pub const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+
+// Windows PAGE_* (subset used for PE final protects; matches `wie_cpu::protect`).
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_EXECUTE_READ: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+/// One section in a [`PeMapPlan`] with final guest protect.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PeSectionMap {
+    /// Section name (e.g. `.text`).
+    pub name: String,
+    /// Section RVA (`VirtualAddress`).
+    pub va: u32,
+    /// `VirtualSize` (bytes).
+    pub virtual_size: u32,
+    /// Raw file offset.
+    pub pointer_to_raw_data: u32,
+    /// Raw size on disk.
+    pub size_of_raw_data: u32,
+    /// COFF `Characteristics`.
+    pub characteristics: u32,
+    /// Derived Windows `PAGE_*` for post-load protect.
+    pub final_protect: u32,
+}
+
+/// Structured PE load plan: one host image arena + differentiated page protects.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PeMapPlan {
+    /// Preferred image base.
+    pub image_base: u64,
+    /// `SizeOfImage`.
+    pub size_of_image: u64,
+    /// `SizeOfHeaders`.
+    pub header_size: u32,
+    /// Section map entries with final protects.
+    pub sections: Vec<PeSectionMap>,
+}
+
+impl PeMapPlan {
+    /// Final protect for PE headers after load (`PAGE_READONLY`).
+    #[must_use]
+    pub fn header_protect() -> u32 {
+        PAGE_READONLY
+    }
+
+    /// Absolute VA of section `i`, if present.
+    #[must_use]
+    pub fn section_va(&self, i: usize) -> Option<u64> {
+        let s = self.sections.get(i)?;
+        self.image_base.checked_add(u64::from(s.va))
+    }
+}
+
+/// Map COFF section characteristics to a Windows `PAGE_*` protect value.
+///
+/// Uses only documented `IMAGE_SCN_MEM_{EXECUTE,READ,WRITE}` bits.
+#[must_use]
+pub fn protect_from_section_characteristics(characteristics: u32) -> u32 {
+    let x = (characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+    let r = (characteristics & IMAGE_SCN_MEM_READ) != 0;
+    let w = (characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+    match (r, w, x) {
+        (_, true, true) => PAGE_EXECUTE_READWRITE,
+        (true, false, true) => PAGE_EXECUTE_READ,
+        (_, true, false) => PAGE_READWRITE,
+        (true, false, false) => PAGE_READONLY,
+        (false, false, true) => PAGE_EXECUTE_READ, // exec-only → XR for fetch/read of code
+        (false, false, false) => PAGE_NOACCESS,
+    }
+}
+
+/// Build a [`PeMapPlan`] from a PE file on disk.
+pub fn pe_map_plan_from_file(path: &Path) -> Result<PeMapPlan> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    pe_map_plan_from_bytes(&bytes)
+}
+
+/// Build a [`PeMapPlan`] from PE bytes.
+pub fn pe_map_plan_from_bytes(bytes: &[u8]) -> Result<PeMapPlan> {
+    let pe = PE::parse(bytes).context("failed to parse PE image")?;
+    if !pe.is_64 {
+        bail!("expected PE64 image, got PE32");
+    }
+    let identity = pe_identity_from_bytes(Path::new("<memory>"), bytes)?;
+    let mut sections = Vec::with_capacity(pe.sections.len());
+    for section in &pe.sections {
+        let name = section
+            .name()
+            .context("failed to read section name")?
+            .to_owned();
+        let characteristics = section.characteristics;
+        sections.push(PeSectionMap {
+            name,
+            va: section.virtual_address,
+            virtual_size: section.virtual_size,
+            pointer_to_raw_data: section.pointer_to_raw_data,
+            size_of_raw_data: section.size_of_raw_data,
+            characteristics,
+            final_protect: protect_from_section_characteristics(characteristics),
+        });
+    }
+    Ok(PeMapPlan {
+        image_base: identity.image_base,
+        size_of_image: identity.size_of_image,
+        header_size: identity.size_of_headers,
+        sections,
+    })
+}
+
+/// Page-aligned half-open range `[start, end)` within `size_of_image` for a
+/// section/header span starting at `rva` with `len` bytes.
+#[must_use]
+pub fn page_align_image_range(rva: u64, len: u64, size_of_image: u64) -> Option<(u64, u64)> {
+    const PAGE: u64 = 0x1000;
+    if len == 0 || rva >= size_of_image {
+        return None;
+    }
+    let end = (rva.saturating_add(len)).min(size_of_image);
+    let start = rva / PAGE * PAGE;
+    let end_aligned = end.div_ceil(PAGE).saturating_mul(PAGE).min(
+        size_of_image
+            .div_ceil(PAGE)
+            .saturating_mul(PAGE)
+            .max(end),
+    );
+    // Clamp end to size_of_image rounded up to page within image mapping.
+    let img_end = size_of_image.div_ceil(PAGE).saturating_mul(PAGE);
+    let end_aligned = end_aligned.min(img_end);
+    if end_aligned <= start {
+        return None;
+    }
+    Some((start, end_aligned))
+}
+
 /// Imported `PE` function metadata.
 #[derive(Debug, Clone, Serialize)]
 pub struct PeImportSummary {
@@ -855,6 +999,46 @@ mod tests {
     fn pe_identity_rejects_invalid_bytes() {
         let result = pe_identity_from_bytes(Path::new("test.exe"), b"not a PE");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn section_characteristics_to_protect() {
+        assert_eq!(
+            protect_from_section_characteristics(IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ),
+            PAGE_EXECUTE_READ
+        );
+        assert_eq!(
+            protect_from_section_characteristics(IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+            PAGE_READWRITE
+        );
+        assert_eq!(
+            protect_from_section_characteristics(IMAGE_SCN_MEM_READ),
+            PAGE_READONLY
+        );
+        assert_eq!(protect_from_section_characteristics(0), PAGE_NOACCESS);
+    }
+
+    #[test]
+    fn pe_map_plan_from_micro_if_present() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.pop();
+        path.pop();
+        path.push("micro-exes/out/crt_hello.exe");
+        if !path.is_file() {
+            return;
+        }
+        let plan = pe_map_plan_from_file(&path).expect("plan");
+        assert!(plan.size_of_image > 0);
+        assert!(!plan.sections.is_empty());
+        // .text should be executable+read when present.
+        if let Some(text) = plan.sections.iter().find(|s| s.name.starts_with(".text")) {
+            assert!(
+                text.final_protect == PAGE_EXECUTE_READ
+                    || text.final_protect == PAGE_EXECUTE_READWRITE,
+                "unexpected .text protect {:#x}",
+                text.final_protect
+            );
+        }
     }
 
     #[test]

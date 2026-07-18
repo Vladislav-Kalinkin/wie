@@ -93,26 +93,28 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ## Phase 3 – Permissions and Dynamic Mapping
 
+**Status (2026-07-18):** Complete (PR A–E). SPC + PageMap + VAD; real `VirtualAlloc`/`Free`/`Protect`/`Query`; PE section protects; optional host `mprotect`. Details: [`docs/phase3-permissions.md`](docs/phase3-permissions.md), plan [`phase3_plan.md`](phase3_plan.md).
+
 ### 3.1 Software + mprotect Dual Protection
 
-- Keep software permission checks (as today) and optionally apply `mprotect` for host‑side enforcement.
-- Do **not** rely on host faults for correctness yet.
+- Software permission checks at guest 4 KiB on all backends (correctness plane).
+- Optional host `mprotect` on arena frames (`WIE_MPROTECT`, default on); never the sole oracle under 4K/16K clinch.
 
-**DoD:** Reads/writes to unmapped or read‑only regions produce the same errors as the `HashMap` backend.
+**DoD:** Reads/writes to unmapped or read‑only regions produce the same errors as the `HashMap` backend. ✅
 
 ### 3.2 VirtualAlloc / Free / Protect Support
 
-- Route `KERNEL32!VirtualAlloc`, `VirtualFree`, `VirtualProtect` through `RegionTable` and the mmap backend.
-- Support committing/decommitting within arenas.
+- `KERNEL32!VirtualAlloc` / `VirtualFree` / `VirtualProtect` / `VirtualQuery` via `GuestMemory` PageMap + VAD (not RegionTable alone).
+- RESERVE one arena (mmap/hybrid); COMMIT software; DECOMMIT zeros; RELEASE munmap; Query returns real MBI.
 
-**DoD:** `winapi_heap` and custom allocation tests pass with `WIE_MEM=mmap`.
+**DoD:** unit matrix + micros green with `WIE_MEM=mmap` / hash / hybrid. ✅
 
 ### 3.3 PE Section Mapping
 
-- Load PE sections using mmap arenas (copy‑based, not file‑backed initially).
-- Apply section permissions via `mprotect`.
+- One image arena (`MEM_IMAGE`); copy-based load; section protects from COFF characteristics after IAT patch.
+- Named `RegionTable` entries per section; SPC denies writes to `.text` after load.
 
-**DoD:** `run-micro` on all PE files shows no regressions.
+**DoD:** `run-micro` on all PE files shows no regressions. ✅
 
 ---
 

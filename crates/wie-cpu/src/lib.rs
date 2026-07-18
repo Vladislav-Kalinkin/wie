@@ -16,15 +16,16 @@ mod regs;
 
 pub use iced_cpu::IcedCpu;
 pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
-pub use mem::{
-    align_down, align_up, win32_from_cpu_error, GuestMemBackend, GuestRegion, HashMapBackend,
-    HybridBackend, MemType, MmapArenaBackend, PageMap, PageRun, PageState, RegionKind, RegionTable,
-    VadNode, VadTable, GUEST_ALLOC_GRANULARITY, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_IMAGE,
-    MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, PAGE_SIZE, PAGE_SIZE_USIZE, ERROR_INVALID_ADDRESS,
-    ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
-};
 /// Windows `PAGE_*` constants and software access checks (Phase 3).
 pub use mem::protect;
+pub use mem::{
+    ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
+    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestRegion, HashMapBackend, HybridBackend,
+    MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType,
+    MemoryBasicInformation, MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun,
+    PageState, RegionKind, RegionTable, VadNode, VadTable, align_down, align_up,
+    win32_from_cpu_error,
+};
 pub use regs::RegFile;
 
 /// Memory protection flags for [`CpuEngine::mem_map`] (Unicorn-compatible r/w/x bits).
@@ -166,15 +167,48 @@ pub trait CpuEngine {
     ///
     /// # Errors
     /// Invalid free type / address.
-    fn virtual_free(
-        &mut self,
-        _addr: u64,
-        _size: usize,
-        _free_type: u32,
-    ) -> Result<(), CpuError> {
+    fn virtual_free(&mut self, _addr: u64, _size: usize, _free_type: u32) -> Result<(), CpuError> {
         Err(CpuError::Message(
             "win32(120): VirtualFree not implemented".into(),
         ))
+    }
+
+    /// `VirtualProtect` — change page protect; returns previous protect of the first page.
+    ///
+    /// # Errors
+    /// Non-committed range, cross-allocation, or unsupported protect.
+    fn virtual_protect(
+        &mut self,
+        _addr: u64,
+        _size: usize,
+        _new_protect: u32,
+    ) -> Result<u32, CpuError> {
+        Err(CpuError::Message(
+            "win32(120): VirtualProtect not implemented".into(),
+        ))
+    }
+
+    /// `VirtualQuery` — describe the page state at `addr`.
+    fn virtual_query(&self, addr: u64) -> MemoryBasicInformation {
+        MemoryBasicInformation {
+            base_address: addr & !0xfff,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size: PAGE_SIZE,
+            state: MEM_FREE,
+            protect: 0,
+            type_: 0,
+        }
+    }
+
+    /// Map a PE image range as `MEM_IMAGE` (committed) with Unicorn-style `perms`.
+    ///
+    /// Default: same as [`Self::mem_map`] (private).
+    ///
+    /// # Errors
+    /// Backend mapping failure.
+    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+        self.mem_map(address, size, perms)
     }
 
     /// Run until a stop-bitmap hit, invalid memory, or instruction budget.
@@ -250,13 +284,22 @@ impl CpuEngine for Box<dyn CpuEngine> {
     ) -> Result<u64, CpuError> {
         (**self).virtual_alloc(addr, size, alloc_type, protect)
     }
-    fn virtual_free(
+    fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
+        (**self).virtual_free(addr, size, free_type)
+    }
+    fn virtual_protect(
         &mut self,
         addr: u64,
         size: usize,
-        free_type: u32,
-    ) -> Result<(), CpuError> {
-        (**self).virtual_free(addr, size, free_type)
+        new_protect: u32,
+    ) -> Result<u32, CpuError> {
+        (**self).virtual_protect(addr, size, new_protect)
+    }
+    fn virtual_query(&self, addr: u64) -> MemoryBasicInformation {
+        (**self).virtual_query(addr)
+    }
+    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+        (**self).mem_map_image(address, size, perms)
     }
     fn install_runtime_hooks(
         &mut self,

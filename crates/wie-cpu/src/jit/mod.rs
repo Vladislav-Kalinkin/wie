@@ -851,7 +851,10 @@ impl CpuEngine for JitCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        self.iced.virtual_alloc(addr, size, alloc_type, protect)
+        let r = self.iced.virtual_alloc(addr, size, alloc_type, protect);
+        // PageMap/generation may change; drop TLB host pointers.
+        self.invalidate_tlb();
+        r
     }
 
     fn virtual_free(
@@ -860,8 +863,30 @@ impl CpuEngine for JitCpu {
         size: usize,
         free_type: u32,
     ) -> Result<(), CpuError> {
-        // Full TLB/cache invalidate is PR C; release may drop host pages.
+        // Flush TLB before munmap so JIT never holds freed host pointers.
+        self.invalidate_tlb();
         self.iced.virtual_free(addr, size, free_type)
+    }
+
+    fn virtual_protect(
+        &mut self,
+        addr: u64,
+        size: usize,
+        new_protect: u32,
+    ) -> Result<u32, CpuError> {
+        let r = self.iced.virtual_protect(addr, size, new_protect);
+        self.invalidate_tlb();
+        r
+    }
+
+    fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
+        self.iced.virtual_query(addr)
+    }
+
+    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+        let r = self.iced.mem_map_image(address, size, perms);
+        self.invalidate_tlb();
+        r
     }
 
     fn cpu_stats(&self) -> Option<crate::JitStats> {

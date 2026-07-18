@@ -37,6 +37,43 @@ pub use vad::{
 };
 use vad::va_error;
 
+/// `MEMORY_BASIC_INFORMATION` (x64 layout, 48 bytes) for `VirtualQuery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MemoryBasicInformation {
+    /// Start of the homogeneous run containing the query address.
+    pub base_address: u64,
+    /// Allocation base (`0` when free).
+    pub allocation_base: u64,
+    /// Protect at reserve / create time (`0` when free).
+    pub allocation_protect: u32,
+    /// Bytes from [`Self::base_address`] to the end of the homogeneous run.
+    pub region_size: u64,
+    /// `MEM_COMMIT` / `MEM_RESERVE` / `MEM_FREE`.
+    pub state: u32,
+    /// Page protect when committed; otherwise `0`.
+    pub protect: u32,
+    /// `MEM_PRIVATE` / `MEM_IMAGE` / `0` when free.
+    pub type_: u32,
+}
+
+impl MemoryBasicInformation {
+    /// Pack into the 48-byte guest `MEMORY_BASIC_INFORMATION` layout (x64).
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; 48] {
+        let mut mbi = [0_u8; 48];
+        mbi[0..8].copy_from_slice(&self.base_address.to_le_bytes());
+        mbi[8..16].copy_from_slice(&self.allocation_base.to_le_bytes());
+        mbi[16..20].copy_from_slice(&self.allocation_protect.to_le_bytes());
+        // 20..24: padding / PartitionId
+        mbi[24..32].copy_from_slice(&self.region_size.to_le_bytes());
+        mbi[32..36].copy_from_slice(&self.state.to_le_bytes());
+        mbi[36..40].copy_from_slice(&self.protect.to_le_bytes());
+        mbi[40..44].copy_from_slice(&self.type_.to_le_bytes());
+        // 44..48: padding
+        mbi
+    }
+}
+
 #[cfg(test)]
 use backend::page_key;
 
@@ -147,6 +184,15 @@ impl Storage {
         }
     }
 
+    /// Guest base of an mmap arena covering `va`, if any.
+    fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
+        match self {
+            Self::Hash(_) => None,
+            Self::Mmap(b) => b.arena_guest_base_for_va(va),
+            Self::Hybrid(b) => b.arena_guest_base_for_va(va),
+        }
+    }
+
     /// Whether RESERVE should create host storage immediately (mmap/hybrid).
     fn reserve_maps_host(&self) -> bool {
         !matches!(self, Self::Hash(_))
@@ -170,7 +216,44 @@ impl Storage {
             Self::Hybrid(b) => b.discard_range(address, size),
         }
     }
+
+    /// Optional host `mprotect` for a guest-range covered by an arena (no-op on hash).
+    fn mprotect_guest_range(&mut self, address: u64, size: usize, prot: i32) -> Result<(), ()> {
+        match self {
+            Self::Hash(_) => Ok(()),
+            Self::Mmap(b) => b.mprotect_guest_range(address, size, prot),
+            Self::Hybrid(b) => b.mprotect_guest_range(address, size, prot),
+        }
+    }
 }
+
+/// Whether optional host mprotect dual-protection is enabled (`WIE_MPROTECT`, default on).
+fn host_mprotect_enabled() -> bool {
+    !matches!(
+        std::env::var("WIE_MPROTECT"),
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+    )
+}
+
+/// Host page size (cached). Guest granule remains 4 KiB.
+fn host_page_size() -> usize {
+    use std::sync::OnceLock;
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        // SAFETY: sysconf(_SC_PAGESIZE) is thread-safe and returns a positive page size.
+        #[expect(unsafe_code)]
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if n > 0 {
+            usize::try_from(n).unwrap_or(0x1000)
+        } else {
+            0x1000
+        }
+    })
+}
+
+// POSIX PROT_* (data plane only — guest execute is never host execute).
+const HOST_PROT_READ: i32 = libc::PROT_READ;
+const HOST_PROT_WRITE: i32 = libc::PROT_WRITE;
 
 /// Guest memory: pluggable backend + region registry + software page map (SPC).
 ///
@@ -269,6 +352,26 @@ impl GuestMemory {
         size: usize,
         perms: u32,
     ) -> Result<(), crate::CpuError> {
+        self.map_with_type(address, size, perms, MemType::Private)
+    }
+
+    /// Like [`Self::map`], but register the VAD as a PE image (`MEM_IMAGE`).
+    pub(crate) fn map_image(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: u32,
+    ) -> Result<(), crate::CpuError> {
+        self.map_with_type(address, size, perms, MemType::Image)
+    }
+
+    fn map_with_type(
+        &mut self,
+        address: u64,
+        size: usize,
+        perms: u32,
+        mem_type: MemType,
+    ) -> Result<(), crate::CpuError> {
         self.backend.map(address, size, perms)?;
         let protect = protect::page_protect_from_rwx(perms);
         self.pages
@@ -283,7 +386,7 @@ impl GuestMemory {
                 allocation_base: address,
                 size: size_u64,
                 allocation_protect: protect,
-                mem_type: MemType::Private,
+                mem_type,
                 owns_host: true,
             })?;
         }
@@ -292,7 +395,316 @@ impl GuestMemory {
         if let Some(hb) = self.backend.arena_host_base_for_va(address) {
             self.regions.set_host_base_if_covers(address, hb);
         }
+        // Optional host mprotect for uniform host frames (defense-in-depth).
+        self.sync_host_protect(address, size);
         Ok(())
+    }
+
+    /// `VirtualProtect` — change protect on committed pages; returns previous protect
+    /// of the first page (after validating the full range).
+    pub(crate) fn virtual_protect(
+        &mut self,
+        addr: u64,
+        size: usize,
+        new_protect: u32,
+    ) -> Result<u32, crate::CpuError> {
+        if size == 0 {
+            return Err(va_error(
+                ERROR_INVALID_PARAMETER,
+                "VirtualProtect size 0",
+            ));
+        }
+        if !protect::is_supported_protect(new_protect) {
+            return Err(va_error(
+                ERROR_INVALID_PARAMETER,
+                "VirtualProtect unsupported protect",
+            ));
+        }
+        let page_base = align_down(addr, PAGE_SIZE);
+        let end = addr
+            .checked_add(u64::try_from(size).map_err(|_| {
+                va_error(ERROR_INVALID_PARAMETER, "VirtualProtect size overflow")
+            })?)
+            .ok_or_else(|| va_error(ERROR_INVALID_PARAMETER, "VirtualProtect end overflow"))?;
+        let page_end = align_up(end, PAGE_SIZE);
+        let size_u64 = page_end.saturating_sub(page_base);
+        let size_usize = usize::try_from(size_u64)
+            .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "VirtualProtect size"))?;
+
+        // Entire range must lie in one allocation and every page must be Committed.
+        let node = self.vad.find(page_base).ok_or_else(|| {
+            va_error(ERROR_INVALID_ADDRESS, "VirtualProtect outside allocation")
+        })?;
+        if !node.contains_range(page_base, size_u64) {
+            return Err(va_error(
+                ERROR_INVALID_ADDRESS,
+                "VirtualProtect range crosses allocation",
+            ));
+        }
+        let mut page = page_base >> 12;
+        let last = page_end >> 12;
+        let mut old_protect = 0_u32;
+        let mut first = true;
+        while page < last {
+            match self.pages.lookup(page) {
+                Some(run) if run.state == PageState::Committed => {
+                    if first {
+                        old_protect = run.protect;
+                        first = false;
+                    }
+                    let next = run.end_page.min(last);
+                    if next <= page {
+                        return Err(va_error(
+                            ERROR_INVALID_ADDRESS,
+                            "VirtualProtect corrupt pagemap",
+                        ));
+                    }
+                    page = next;
+                }
+                Some(_) => {
+                    return Err(va_error(
+                        ERROR_INVALID_ADDRESS,
+                        "VirtualProtect on non-committed page",
+                    ));
+                }
+                None => {
+                    return Err(va_error(
+                        ERROR_INVALID_ADDRESS,
+                        "VirtualProtect free page in range",
+                    ));
+                }
+            }
+        }
+
+        self.pages
+            .set_range(page_base, size_usize, PageState::Committed, new_protect)?;
+        self.generation = self.generation.saturating_add(1);
+        self.sync_host_protect(page_base, size_usize);
+        Ok(old_protect)
+    }
+
+    /// `VirtualQuery` — build a real `MEMORY_BASIC_INFORMATION` for `addr`.
+    #[must_use]
+    pub(crate) fn virtual_query(&self, addr: u64) -> MemoryBasicInformation {
+        let page_va = align_down(addr, PAGE_SIZE);
+        let page_key = page_va >> 12;
+
+        // Free: not in PageMap.
+        let Some(run) = self.pages.lookup(page_key) else {
+            return self.query_free(page_va);
+        };
+
+        let Some(node) = self.vad.find(page_va) else {
+            // PageMap entry without VAD (should not happen after bootstrap wiring).
+            return self.query_free(page_va);
+        };
+
+        // Clip homogeneous run to allocation and to continuous same state/protect.
+        let alloc_start_page = node.allocation_base >> 12;
+        let alloc_end_page = node.end() >> 12;
+        let mut run_start = run.start_page.max(alloc_start_page);
+        let mut run_end = run.end_page.min(alloc_end_page);
+        // Ensure query page is inside clipped run (lookup already guarantees).
+        if page_key < run_start {
+            run_start = page_key;
+        }
+        if page_key >= run_end {
+            run_end = page_key.saturating_add(1);
+        }
+
+        // Extend left within allocation while same state+protect.
+        while run_start > alloc_start_page {
+            let prev = run_start.saturating_sub(1);
+            match self.pages.lookup(prev) {
+                Some(r)
+                    if r.state == run.state
+                        && (run.state != PageState::Committed || r.protect == run.protect) =>
+                {
+                    run_start = r.start_page.max(alloc_start_page);
+                }
+                _ => break,
+            }
+        }
+        // Extend right.
+        while run_end < alloc_end_page {
+            match self.pages.lookup(run_end) {
+                Some(r)
+                    if r.state == run.state
+                        && (run.state != PageState::Committed || r.protect == run.protect) =>
+                {
+                    run_end = r.end_page.min(alloc_end_page);
+                }
+                _ => break,
+            }
+        }
+
+        let base_address = run_start.saturating_mul(PAGE_SIZE);
+        let region_size = run_end
+            .saturating_sub(run_start)
+            .saturating_mul(PAGE_SIZE);
+        let (state, protect) = match run.state {
+            PageState::Committed => (MEM_COMMIT, run.protect),
+            PageState::Reserved => (MEM_RESERVE, 0),
+            PageState::Free => (MEM_FREE, 0),
+        };
+        MemoryBasicInformation {
+            base_address,
+            allocation_base: node.allocation_base,
+            allocation_protect: node.allocation_protect,
+            region_size,
+            state,
+            protect,
+            type_: node.mem_type.win32(),
+        }
+    }
+
+    fn query_free(&self, page_va: u64) -> MemoryBasicInformation {
+        // Free run: from this page to the next VAD or next PageMap entry.
+        let page_key = page_va >> 12;
+        let mut end_page = page_key.saturating_add(1);
+        // Cap free-run report to allocation granularity steps for sanity, but
+        // prefer next VAD base when present.
+        let next_vad = self
+            .vad
+            .iter()
+            .map(|n| n.allocation_base)
+            .filter(|&b| b > page_va)
+            .min();
+        let next_run = self
+            .pages
+            .iter_runs()
+            .map(|r| r.start_page.saturating_mul(PAGE_SIZE))
+            .find(|&b| b > page_va);
+
+        let end_va = match (next_vad, next_run) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => {
+                // Unbounded free: report one allocation granularity worth.
+                page_va.saturating_add(GUEST_ALLOC_GRANULARITY)
+            }
+        };
+        let end_page_cap = end_va >> 12;
+        if end_page_cap > end_page {
+            end_page = end_page_cap;
+        }
+        let region_size = end_page
+            .saturating_sub(page_key)
+            .saturating_mul(PAGE_SIZE)
+            .max(PAGE_SIZE);
+        MemoryBasicInformation {
+            base_address: page_va,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size,
+            state: MEM_FREE,
+            protect: 0,
+            type_: 0,
+        }
+    }
+
+    /// Optional dual protection: tighten host `mprotect` only for host-aligned
+    /// frames where every guest 4 KiB page is committed with the same R/W needs.
+    ///
+    /// Frames are relative to each arena's guest base so host pointers stay
+    /// host-page aligned (soft translate: `host + (va - guest_base)`).
+    /// Correctness remains SPC; failures of `mprotect` are ignored.
+    /// Disabled with `WIE_MPROTECT=0`.
+    fn sync_host_protect(&mut self, address: u64, size: usize) {
+        if !host_mprotect_enabled() {
+            return;
+        }
+        if size == 0 {
+            return;
+        }
+        let host_ps = host_page_size();
+        if host_ps == 0 {
+            return;
+        }
+        let host_ps_u64 = u64::try_from(host_ps).unwrap_or(PAGE_SIZE);
+        let end = address.saturating_add(u64::try_from(size).unwrap_or(0));
+        let mut va = address;
+        while va < end {
+            let Some(arena_base) = self.backend.arena_guest_base_for_va(va) else {
+                // Sparse HashMap pages: no host mprotect.
+                va = va.saturating_add(PAGE_SIZE);
+                continue;
+            };
+            let off = va.saturating_sub(arena_base);
+            let frame_off = align_down(off, host_ps_u64);
+            let frame_guest = arena_base.saturating_add(frame_off);
+            let prot = self.host_prot_for_frame(frame_guest, host_ps_u64);
+            let _ = self
+                .backend
+                .mprotect_guest_range(frame_guest, host_ps, prot);
+            let next = frame_guest.saturating_add(host_ps_u64);
+            if next <= va {
+                va = va.saturating_add(PAGE_SIZE);
+            } else {
+                va = next;
+            }
+        }
+    }
+
+    /// Host PROT flags for one host page frame covering `frame`..`frame+host_ps`.
+    fn host_prot_for_frame(&self, frame: u64, host_ps: u64) -> i32 {
+        // Default RW — safe under clinch.
+        let mut need_r = false;
+        let mut need_w = false;
+        let mut any_committed = false;
+        let mut uniform = true;
+        let mut first_protect: Option<u32> = None;
+        let mut page = frame;
+        let end = frame.saturating_add(host_ps);
+        while page < end {
+            match self.pages.lookup(page >> 12) {
+                Some(run) if run.state == PageState::Committed => {
+                    any_committed = true;
+                    if protect::allows_read(run.protect) || protect::allows_execute(run.protect) {
+                        need_r = true;
+                    }
+                    if protect::allows_write(run.protect) {
+                        need_w = true;
+                    }
+                    match first_protect {
+                        None => first_protect = Some(run.protect),
+                        Some(p) if p != run.protect => uniform = false,
+                        _ => {}
+                    }
+                    page = page.saturating_add(PAGE_SIZE);
+                }
+                Some(_) | None => {
+                    // Reserved/free inside frame → keep host RW so SPC alone gates.
+                    return HOST_PROT_READ | HOST_PROT_WRITE;
+                }
+            }
+        }
+        if !any_committed {
+            return HOST_PROT_READ | HOST_PROT_WRITE;
+        }
+        if !uniform {
+            // Mixed guest protects: host union of R/W needs (never RX host tricks).
+            let mut p = 0;
+            if need_r {
+                p |= HOST_PROT_READ;
+            }
+            if need_w {
+                p |= HOST_PROT_WRITE;
+            }
+            if p == 0 {
+                // All NOACCESS-like: still leave host RW so we can re-protect later
+                // without faulting the emulator; SPC denies guest.
+                return HOST_PROT_READ | HOST_PROT_WRITE;
+            }
+            return p;
+        }
+        // Uniform: optional tighten.
+        match first_protect {
+            Some(p) if protect::allows_write(p) => HOST_PROT_READ | HOST_PROT_WRITE,
+            Some(p) if protect::allows_read(p) || protect::allows_execute(p) => HOST_PROT_READ,
+            _ => HOST_PROT_READ | HOST_PROT_WRITE,
+        }
     }
 
     /// `VirtualAlloc` — reserve and/or commit private pages.
@@ -999,5 +1411,114 @@ mod tests {
         mem.write(base + 0x3000, &[2]).expect("after");
         // Arena still present.
         assert!(mem.backend.arena_host_base_for_va(base).is_some());
+    }
+
+    #[test]
+    fn virtual_protect_splits_query() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let base = mem
+            .virtual_alloc(
+                0,
+                0x1_0000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_READWRITE,
+            )
+            .expect("alloc");
+        let old = mem
+            .virtual_protect(base + 0x1000, 0x1000, protect::PAGE_READONLY)
+            .expect("protect");
+        assert_eq!(old, protect::PAGE_READWRITE);
+        let mid = mem.virtual_query(base + 0x1000);
+        assert_eq!(mid.state, MEM_COMMIT);
+        assert_eq!(mid.protect, protect::PAGE_READONLY);
+        assert_eq!(mid.region_size, 0x1000);
+        assert_eq!(mid.allocation_base, base);
+        // Neighbours still RW.
+        assert_eq!(
+            mem.virtual_query(base).protect,
+            protect::PAGE_READWRITE
+        );
+        assert_eq!(
+            mem.virtual_query(base + 0x2000).protect,
+            protect::PAGE_READWRITE
+        );
+        // SPC denies write on RO island.
+        assert!(mem.write(base + 0x1000, &[1]).is_err());
+        mem.write(base, &[1]).expect("rw ok");
+    }
+
+    #[test]
+    fn virtual_protect_reserved_fails() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let base = mem
+            .virtual_alloc(0, 0x1_0000, MEM_RESERVE, protect::PAGE_READWRITE)
+            .expect("reserve");
+        assert!(mem
+            .virtual_protect(base, 0x1000, protect::PAGE_READONLY)
+            .is_err());
+    }
+
+    #[test]
+    fn virtual_protect_cross_alloc_fails() {
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let a = mem
+            .virtual_alloc(
+                0,
+                0x1_0000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_READWRITE,
+            )
+            .expect("a");
+        let b = mem
+            .virtual_alloc(
+                0,
+                0x1_0000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_READWRITE,
+            )
+            .expect("b");
+        assert_ne!(a, b);
+        // Range from end of a into b — must fail entirely.
+        let span = b.saturating_sub(a).saturating_add(0x1000);
+        let size = usize::try_from(span).expect("size");
+        assert!(mem
+            .virtual_protect(a, size, protect::PAGE_READONLY)
+            .is_err());
+    }
+
+    #[test]
+    fn virtual_query_free() {
+        let mem = GuestMemory::with_kind(MemBackendKind::Hash);
+        let mbi = mem.virtual_query(0x0000_0001_5000_0000);
+        assert_eq!(mbi.state, MEM_FREE);
+        assert_eq!(mbi.allocation_base, 0);
+        assert!(mbi.region_size >= PAGE_SIZE);
+    }
+
+    #[test]
+    fn checkerboard_spc_no_host_crash() {
+        // Mixed RO/RW every 4K inside 64K — SPC enforces; process stays alive.
+        let mut mem = GuestMemory::with_kind(MemBackendKind::Mmap);
+        let base = mem
+            .virtual_alloc(
+                0,
+                0x1_0000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_READWRITE,
+            )
+            .expect("alloc");
+        for i in 0..16_u64 {
+            let page = base + i * 0x1000;
+            let p = if i % 2 == 0 {
+                protect::PAGE_READONLY
+            } else {
+                protect::PAGE_READWRITE
+            };
+            mem.virtual_protect(page, 0x1000, p).expect("protect");
+        }
+        assert!(mem.write(base, &[1]).is_err());
+        mem.write(base + 0x1000, &[1]).expect("rw page");
+        let mut b = [0_u8; 1];
+        mem.read(base, &mut b).expect("ro read");
     }
 }

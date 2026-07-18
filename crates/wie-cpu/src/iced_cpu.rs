@@ -162,6 +162,23 @@ impl CpuEngine for IcedCpu {
         self.mem.virtual_free(addr, size, free_type)
     }
 
+    fn virtual_protect(
+        &mut self,
+        addr: u64,
+        size: usize,
+        new_protect: u32,
+    ) -> Result<u32, CpuError> {
+        self.mem.virtual_protect(addr, size, new_protect)
+    }
+
+    fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
+        self.mem.virtual_query(addr)
+    }
+
+    fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+        self.mem.map_image(address, size, perms)
+    }
+
     fn register_region(&mut self, region: GuestRegion) {
         self.mem.register_region(region);
     }

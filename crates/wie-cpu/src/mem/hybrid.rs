@@ -50,6 +50,11 @@ impl HybridBackend {
         self.arenas.arena_host_base_for_va(va)
     }
 
+    #[must_use]
+    pub(super) fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
+        self.arenas.arena_guest_base_for_va(va)
+    }
+
     /// MEM_RELEASE: drop exact arena and/or sparse pages in range.
     pub(super) fn unmap_range(&mut self, address: u64, size: usize) {
         self.arenas.unmap_exact(address, size);
@@ -65,6 +70,16 @@ impl HybridBackend {
         self.arenas.discard_range(address, size)?;
         self.sparse.discard_range(address, size);
         Ok(())
+    }
+
+    /// Optional dual-protection `mprotect` on arena-backed guest range.
+    pub(super) fn mprotect_guest_range(
+        &mut self,
+        address: u64,
+        size: usize,
+        prot: i32,
+    ) -> Result<(), ()> {
+        self.arenas.mprotect_guest_range(address, size, prot)
     }
 
     /// Map a fully unmapped run into arena or sparse storage.

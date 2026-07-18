@@ -231,17 +231,110 @@ impl RuntimeProfile {
     }
 }
 
-/// Register default layout ranges into the CPU region table (Phase 1.2).
+/// Apply final PE section / header protects after image copy (Phase 3.3).
+///
+/// Sequence: whole image → `PAGE_NOACCESS` (gap pages), headers → RO, each
+/// section → characteristics-derived protect. IAT must already be patched in
+/// the host-side image buffer before this runs.
+fn apply_pe_section_protects(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    plan: &wie_pe::PeMapPlan,
+) -> Result<()> {
+    use wie_cpu::protect::{PAGE_NOACCESS, PAGE_READONLY};
+
+    let image_size = usize::try_from(plan.size_of_image).context("size_of_image")?;
+    if image_size == 0 {
+        return Ok(());
+    }
+    // Gaps / padding: committed NOACCESS so VirtualQuery sees image space.
+    engine
+        .virtual_protect(plan.image_base, image_size, PAGE_NOACCESS)
+        .context("PE gap NOACCESS protect")?;
+
+    let header_len = u64::from(plan.header_size);
+    if let Some((start, end)) =
+        wie_pe::page_align_image_range(0, header_len, plan.size_of_image)
+    {
+        let len = usize::try_from(end.saturating_sub(start)).context("header range")?;
+        if len > 0 {
+            engine
+                .virtual_protect(plan.image_base.saturating_add(start), len, PAGE_READONLY)
+                .context("PE headers protect")?;
+        }
+    }
+
+    for sec in &plan.sections {
+        let rva = u64::from(sec.va);
+        let vsize = u64::from(sec.virtual_size);
+        if vsize == 0 {
+            continue;
+        }
+        let Some((start, end)) = wie_pe::page_align_image_range(rva, vsize, plan.size_of_image)
+        else {
+            continue;
+        };
+        let len = usize::try_from(end.saturating_sub(start)).context("section range")?;
+        if len == 0 {
+            continue;
+        }
+        engine
+            .virtual_protect(
+                plan.image_base.saturating_add(start),
+                len,
+                sec.final_protect,
+            )
+            .with_context(|| format!("PE section {} protect", sec.name))?;
+    }
+    Ok(())
+}
+
+/// Register default layout ranges into the CPU region table (Phase 1.2 / 3.3).
 fn register_layout_regions(
     engine: &mut dyn wie_cpu::CpuEngine,
     layout: &RuntimeMemoryLayout,
     image_base: u64,
     image_size: usize,
+    pe_plan: Option<&wie_pe::PeMapPlan>,
 ) {
     use wie_cpu::{GuestRegion, RegionKind};
 
-    let regs: [GuestRegion; 16] = [
-        GuestRegion::new("image", RegionKind::Image, image_base, image_size, wie_cpu::perm::ALL),
+    // Whole image + optional per-section named regions for diagnostics / Phase 4.
+    engine.register_region(GuestRegion::new(
+        "image",
+        RegionKind::Image,
+        image_base,
+        image_size,
+        wie_cpu::perm::ALL,
+    ));
+    if let Some(plan) = pe_plan {
+        let header_len = usize::try_from(plan.header_size).unwrap_or(0);
+        if header_len > 0 {
+            engine.register_region(GuestRegion::new(
+                "image.headers",
+                RegionKind::Image,
+                image_base,
+                header_len,
+                wie_cpu::protect::rwx_from_page_protect(wie_pe::PeMapPlan::header_protect()),
+            ));
+        }
+        for sec in &plan.sections {
+            let va = image_base.saturating_add(u64::from(sec.va));
+            let size = usize::try_from(sec.virtual_size).unwrap_or(0);
+            if size == 0 {
+                continue;
+            }
+            let name = format!("image.{}", sec.name.trim_matches('\0'));
+            engine.register_region(GuestRegion::new(
+                name,
+                RegionKind::Image,
+                va,
+                size,
+                wie_cpu::protect::rwx_from_page_protect(sec.final_protect),
+            ));
+        }
+    }
+
+    let regs: [GuestRegion; 15] = [
         GuestRegion::new(
             "stack",
             RegionKind::Stack,
@@ -474,8 +567,10 @@ impl RuntimeSession {
         // WIE CPU backend (Unicorn default; `WIE_CPU=iced` for interpreter).
         let mut engine = crate::open_default_cpu().context("failed to open WIE CPU backend")?;
 
+        // Phase 3.3: one MEM_IMAGE arena, temporary RWX for copy/IAT (IAT patched
+        // in the host buffer already), then section protects via VirtualProtect.
         engine
-            .mem_map(
+            .mem_map_image(
                 image_summary.image_base,
                 image_summary.image_size,
                 wie_cpu::perm::ALL,
@@ -484,7 +579,12 @@ impl RuntimeSession {
 
         engine
             .mem_write(image_summary.image_base, &image)
-            .context("failed to write PE image into Unicorn memory")?;
+            .context("failed to write PE image into guest memory")?;
+
+        let pe_map_plan = wie_pe::pe_map_plan_from_file(path)
+            .context("failed to build PE section map plan")?;
+        apply_pe_section_protects(engine.as_mut(), &pe_map_plan)
+            .context("failed to apply PE section protects")?;
 
         engine
             .mem_map(
@@ -793,12 +893,13 @@ impl RuntimeSession {
             )
             .context("failed to map fake resource memory")?;
 
-        // Phase 1.2: register named layout ranges for region-table lookups.
+        // Phase 1.2 / 3.3: register named layout + PE section ranges.
         register_layout_regions(
             engine.as_mut(),
             &layout,
             image_summary.image_base,
             image_summary.image_size,
+            Some(&pe_map_plan),
         );
 
         let environment = default_winapi_environment(

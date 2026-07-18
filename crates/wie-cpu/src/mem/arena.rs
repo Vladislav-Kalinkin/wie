@@ -269,6 +269,11 @@ impl ArenaSet {
         Some(a.host() as usize as u64)
     }
 
+    /// Guest base of the arena containing `va`, if any.
+    pub(super) fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
+        Some(self.find_va(va)?.guest_base())
+    }
+
     /// Read `bytes.len()` from guest `address` into `bytes` (may span arenas page-wise).
     pub(super) fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         if bytes.is_empty() {
@@ -428,6 +433,60 @@ impl ArenaSet {
         {
             // Drop runs munmap via `MmapArena::Drop`.
             self.arenas.remove(i);
+        }
+    }
+
+    /// Optional host `mprotect` for guest range covered by an arena.
+    ///
+    /// `address`/`size` must be host-page aligned relative to the arena host
+    /// base when tightening; if the range is not fully inside one arena, this
+    /// is a no-op success (SPC still enforces guest rights).
+    pub(super) fn mprotect_guest_range(
+        &mut self,
+        address: u64,
+        size: usize,
+        prot: i32,
+    ) -> Result<(), ()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let Some(arena) = self.find_va_mut(address) else {
+            return Ok(());
+        };
+        let end = address.saturating_add(u64::try_from(size).unwrap_or(0));
+        if end > arena.guest_end() || address < arena.guest_base() {
+            // Span not fully inside this arena — leave host mapping alone.
+            return Ok(());
+        }
+        if arena.host().is_null() {
+            return Ok(());
+        }
+        let off = address.saturating_sub(arena.guest_base());
+        let off_usize = usize::try_from(off).map_err(|_| ())?;
+        // Host base is host-page aligned; require offset multiple of host page size.
+        let host_ps = {
+            #[expect(unsafe_code)]
+            let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if n > 0 {
+                usize::try_from(n).unwrap_or(0x1000)
+            } else {
+                0x1000
+            }
+        };
+        if host_ps == 0 || !off_usize.is_multiple_of(host_ps) || !size.is_multiple_of(host_ps) {
+            return Ok(()); // skip non-aligned (SPC remains the oracle)
+        }
+        if off_usize.saturating_add(size) > arena.size() {
+            return Ok(());
+        }
+        // SAFETY: host came from mmap of arena.size; offset+size host-page aligned in arena.
+        let rc = unsafe {
+            libc::mprotect(arena.host().add(off_usize).cast(), size, prot)
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(())
         }
     }
 

@@ -3,6 +3,8 @@
 **Date:** 2026-07-18  
 **Goal:** Soft-translated anonymous mmap arenas for guest memory, with HashMap fallback and hybrid default. Foundation for Phase 3 (perms / VirtualAlloc) and Phase 4 (region-direct JIT).
 
+**Follow-on:** Phase 3 guest permissions and Virtual* APIs are documented in [`phase3-permissions.md`](phase3-permissions.md).
+
 ## Backends (`WIE_MEM`)
 
 | Value | Behaviour |

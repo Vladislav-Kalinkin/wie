@@ -42,6 +42,12 @@ impl MmapArenaBackend {
         self.arenas.arena_host_base_for_va(va)
     }
 
+    /// Guest base of the arena containing `va`, if any.
+    #[must_use]
+    pub(super) fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
+        self.arenas.arena_guest_base_for_va(va)
+    }
+
     /// MEM_RELEASE: munmap exact reservation arena.
     pub(super) fn unmap_range(&mut self, address: u64, size: usize) {
         self.arenas.unmap_exact(address, size);
@@ -54,6 +60,16 @@ impl MmapArenaBackend {
         size: usize,
     ) -> Result<(), CpuError> {
         self.arenas.discard_range(address, size)
+    }
+
+    /// Optional dual-protection `mprotect` on arena-backed guest range.
+    pub(super) fn mprotect_guest_range(
+        &mut self,
+        address: u64,
+        size: usize,
+        prot: i32,
+    ) -> Result<(), ()> {
+        self.arenas.mprotect_guest_range(address, size, prot)
     }
 }
 

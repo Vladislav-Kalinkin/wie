@@ -4486,15 +4486,14 @@ fn handle_virtual_free(
 }
 
 /// `VirtualProtect` — Microsoft Learn: `lpflOldProtect` must be non-NULL or the
-/// call fails. Real page protection is still deferred (Phase 3 RegionTable);
-/// when `lpflOldProtect` is valid we report previous protect as PAGE_EXECUTE_READWRITE.
+/// call fails. Real page protection via guest PageMap (Phase 3).
 fn handle_virtual_protect(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _addr = engine.read_rcx()?;
-    let _size = engine.read_rdx()?;
-    let _new = engine.read_r8()?;
+    let addr = engine.read_rcx()?;
+    let size = engine.read_rdx()?;
+    let new_protect = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
     let old_prot = engine.read_r9()?;
     // Microsoft Learn: if lpflOldProtect is NULL or invalid, the function fails.
     if old_prot == 0 {
@@ -4505,17 +4504,37 @@ fn handle_virtual_protect(
             return_value: 0,
         });
     }
-    // PAGE_EXECUTE_READWRITE — provisional previous protect until RegionTable.
-    write_guest_u32(engine, old_prot, 0x40)?;
-    state.last_error = 0;
-    let return_address = engine.return_from_win64_api(1)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: 1,
-    })
+    let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+    if size_usize == 0 || size_usize == usize::MAX {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    match engine.virtual_protect(addr, size_usize, new_protect) {
+        Ok(old) => {
+            write_guest_u32(engine, old_prot, old)?;
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(1)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 1,
+            })
+        }
+        Err(e) => {
+            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let return_address = engine.return_from_win64_api(0)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
+        }
+    }
 }
 
-/// `VirtualQuery` — fill a minimal `MEMORY_BASIC_INFORMATION` for mapped ranges.
+/// `VirtualQuery` — fill real `MEMORY_BASIC_INFORMATION` from PageMap / VAD.
 fn handle_virtual_query(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -4533,18 +4552,9 @@ fn handle_virtual_query(
         });
     }
 
-    // MEMORY_BASIC_INFORMATION (x64): BaseAddress, AllocationBase, AllocationProtect,
-    // RegionSize, State, Protect, Type — 7×u64/u32 layout simplified as zeros + committed.
-    let page_base = address & !0xfff;
-    let mut mbi = [0_u8; 48];
-    mbi[0..8].copy_from_slice(&page_base.to_le_bytes());
-    mbi[8..16].copy_from_slice(&page_base.to_le_bytes());
-    mbi[16..20].copy_from_slice(&0x40_u32.to_le_bytes()); // AllocationProtect
-    mbi[24..32].copy_from_slice(&0x1000_u64.to_le_bytes()); // RegionSize
-    mbi[32..36].copy_from_slice(&0x1000_u32.to_le_bytes()); // MEM_COMMIT
-    mbi[36..40].copy_from_slice(&0x40_u32.to_le_bytes()); // Protect
-    mbi[40..44].copy_from_slice(&0x20000_u32.to_le_bytes()); // MEM_PRIVATE
-    engine.mem_write(buffer, &mbi)?;
+    let mbi = engine.virtual_query(address);
+    let bytes = mbi.to_bytes();
+    engine.mem_write(buffer, &bytes)?;
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(48)?;
     Ok(WinApiHandlerResult {
