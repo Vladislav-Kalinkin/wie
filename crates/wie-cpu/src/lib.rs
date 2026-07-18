@@ -17,8 +17,8 @@ mod regs;
 pub use iced_cpu::IcedCpu;
 pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
 pub use mem::{
-    GuestMemBackend, GuestRegion, HashMapBackend, RegionKind, RegionTable, PAGE_SIZE,
-    PAGE_SIZE_USIZE,
+    GuestMemBackend, GuestRegion, HashMapBackend, HybridBackend, MmapArenaBackend, RegionKind,
+    RegionTable, PAGE_SIZE, PAGE_SIZE_USIZE,
 };
 pub use regs::RegFile;
 
@@ -119,7 +119,7 @@ pub trait CpuEngine {
         None
     }
 
-    /// Active guest memory storage backend name (`hash`, `mmap_page`, …).
+    /// Active guest memory storage backend name (`hash` / `mmap` / `hybrid`).
     fn mem_backend_name(&self) -> &'static str {
         "hash"
     }

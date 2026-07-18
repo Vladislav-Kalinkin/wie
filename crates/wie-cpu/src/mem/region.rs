@@ -125,6 +125,17 @@ impl RegionTable {
     pub fn is_empty(&self) -> bool {
         self.regions.is_empty()
     }
+
+    /// Set `host_base` on every region that contains `va` when still unset.
+    ///
+    /// Used after an mmap arena is attached so Phase 4 can pin host pointers.
+    pub fn set_host_base_if_covers(&mut self, va: u64, host_base: u64) {
+        for r in &mut self.regions {
+            if r.contains(va) && r.host_base.is_none() {
+                r.host_base = Some(host_base);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

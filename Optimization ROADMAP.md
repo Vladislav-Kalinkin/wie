@@ -59,9 +59,9 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ---
 
-## Phase 2 – Mmap Storage Backend
+## Phase 2 – Mmap Storage Backend ✅
 
-### 2.1 `MmapArenaBackend`
+### 2.1 `MmapArenaBackend` ✅
 
 - Implement a new backend that uses anonymous `mmap` for contiguous arenas (heap, stack, image, file cache).
 - Each region is mapped as a single arena; pages are committed lazily (demand‑zero).
@@ -69,19 +69,25 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 **DoD:** Micro‑suite passes with `WIE_MEM=mmap`; oracle tests show identical results.
 
-### 2.2 Radix Tree Integration
+**Status:** `MmapArenaBackend` + `ArenaSet` in `crates/wie-cpu/src/mem/`; soft translate only; oracle HashMap ↔ arena.
+
+### 2.2 Radix Tree Integration ✅
 
 - Update the radix page‑table to store host pointers returned by the mmap backend (instead of `Box<[u8;4096]>`).
 - Ensure `Drop` does not free mmap‑backed pages incorrectly.
 
 **DoD:** No double‑free; address sanitizer clean; high‑VA tests pass.
 
-### 2.3 Hybrid Default
+**Status:** Pure mmap derives page host pointers from arena base (no owning radix leaves). Hybrid keeps HashMap radix for sparse pages only. Arena `Drop` owns `munmap`; TLB/JIT pointers non-owning.
+
+### 2.3 Hybrid Default ✅
 
 - Switch large regions (heap, stack, image, file arena) to `mmap` by default; keep tiny pages (TEB, stubs) on `HashMap` for now.
 - The environment variable `WIE_MEM` still allows forcing `hash` or `mmap`.
 
 **DoD:** Measurement shows reduced memory‑helper overhead on hot paths.
+
+**Status (2026-07-18):** Default `WIE_MEM=hybrid` (threshold 64 KiB → arena). Force `hash` / `mmap` / `hybrid`. `GuestRegion.host_base` filled for arena-backed layout regions. Details: [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md).
 
 ---
 

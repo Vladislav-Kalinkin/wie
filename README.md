@@ -85,6 +85,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 | Variable                | Effect                                                    |
 | ----------------------- | --------------------------------------------------------- |
 | `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**)                             |
+| `WIE_MEM=hybrid` \| `mmap` \| `hash` | Guest memory storage (default **hybrid**: large arenas via anonymous mmap; tiny pages HashMap). Soft translate only — see [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md) |
 | `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT load/store counts, mem backend |
 | `WIE_API_JOURNAL=path`  | Per-API journal for backend A/B diffs                     |
 | `WIE_ROOT` / `--root`   | Bottle root for file APIs                                 |
@@ -111,7 +112,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 
 ## Performance notes (CPU / wall)
 
-Phase 0 baselines (wall/CPU%, host stops, JIT load/store): see [`docs/phase0-baseline.md`](docs/phase0-baseline.md). Optimisation plan: [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
+Phase 0 baselines (wall/CPU%, host stops, JIT load/store): see [`docs/phase0-baseline.md`](docs/phase0-baseline.md). Phase 2 mmap memory backend: [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md). Optimisation plan: [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
 What actually burns CPU today:
 

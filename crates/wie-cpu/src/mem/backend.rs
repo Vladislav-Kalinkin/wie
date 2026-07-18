@@ -1,8 +1,8 @@
-//! Guest memory storage backend trait (Phase 1).
+//! Guest memory storage backend trait (Phase 1–2).
 //!
-//! Implementations own page data; the radix page table lives on
-//! [`crate::mem::hashmap::HashMapBackend`] today. Future mmap arenas will
-//! implement the same surface without changing JIT/interpreter call sites.
+//! Implementations own page data. [`crate::mem::hashmap::HashMapBackend`] uses
+//! a radix of non-owning page pointers; [`crate::mem::mmap_arena::MmapArenaBackend`]
+//! owns contiguous anonymous arenas and derives host pointers by soft translation.
 
 use crate::CpuError;
 
