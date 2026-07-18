@@ -143,6 +143,25 @@ impl CpuEngine for IcedCpu {
         self.mem.read(address, bytes)
     }
 
+    fn virtual_alloc(
+        &mut self,
+        addr: u64,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> Result<u64, CpuError> {
+        self.mem.virtual_alloc(addr, size, alloc_type, protect)
+    }
+
+    fn virtual_free(
+        &mut self,
+        addr: u64,
+        size: usize,
+        free_type: u32,
+    ) -> Result<(), CpuError> {
+        self.mem.virtual_free(addr, size, free_type)
+    }
+
     fn register_region(&mut self, region: GuestRegion) {
         self.mem.register_region(region);
     }

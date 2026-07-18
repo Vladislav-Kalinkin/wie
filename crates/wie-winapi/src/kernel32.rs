@@ -4398,6 +4398,8 @@ pub fn dispatch_kernel32_extra(
 ) -> Result<Option<WinApiHandlerResult>> {
     let n = name.to_ascii_lowercase();
     match n.as_str() {
+        "virtualalloc" => Ok(Some(handle_virtual_alloc(engine, state)?)),
+        "virtualfree" => Ok(Some(handle_virtual_free(engine, state)?)),
         "virtualprotect" => Ok(Some(handle_virtual_protect(engine, state)?)),
         "virtualquery" => Ok(Some(handle_virtual_query(engine, state)?)),
         "tlsgetvalue" => Ok(Some(handle_tls_get_value(engine, state)?)),
@@ -4405,6 +4407,81 @@ pub fn dispatch_kernel32_extra(
         "tlsalloc" => Ok(Some(handle_tls_alloc(engine, state)?)),
         "tlsfree" => Ok(Some(handle_tls_free(engine, state)?)),
         _ => Ok(None),
+    }
+}
+
+/// `VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)`.
+fn handle_virtual_alloc(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let addr = engine.read_rcx()?;
+    let size = engine.read_rdx()?;
+    let alloc_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
+    let protect = u32::try_from(engine.read_r9()? & 0xffff_ffff).unwrap_or(0);
+    let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+    if size_usize == usize::MAX {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    match engine.virtual_alloc(addr, size_usize, alloc_type, protect) {
+        Ok(base) => {
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(base)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: base,
+            })
+        }
+        Err(e) => {
+            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let return_address = engine.return_from_win64_api(0)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
+        }
+    }
+}
+
+/// `VirtualFree(lpAddress, dwSize, dwFreeType)`.
+fn handle_virtual_free(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let addr = engine.read_rcx()?;
+    let size = engine.read_rdx()?;
+    let free_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
+    let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
+    if size_usize == usize::MAX {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    match engine.virtual_free(addr, size_usize, free_type) {
+        Ok(()) => {
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(1)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 1,
+            })
+        }
+        Err(e) => {
+            state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let return_address = engine.return_from_win64_api(0)?;
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
+        }
     }
 }
 

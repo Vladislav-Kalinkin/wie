@@ -416,6 +416,54 @@ impl ArenaSet {
         }
         Ok(())
     }
+
+    /// Drop the arena that exactly covers `[address, address+size)` (MEM_RELEASE).
+    ///
+    /// No-op if no exact match (partial ranges must not munmap sibling pages).
+    pub(super) fn unmap_exact(&mut self, address: u64, size: usize) {
+        if let Some(i) = self
+            .arenas
+            .iter()
+            .position(|a| a.is_exact_range(address, size))
+        {
+            // Drop runs munmap via `MmapArena::Drop`.
+            self.arenas.remove(i);
+        }
+    }
+
+    /// Zero host bytes in `[address, address+size)` without munmap (MEM_DECOMMIT).
+    pub(super) fn discard_range(
+        &mut self,
+        address: u64,
+        size: usize,
+    ) -> Result<(), CpuError> {
+        if size == 0 {
+            return Ok(());
+        }
+        let zeros = vec![0_u8; size.min(PAGE_SIZE_USIZE)];
+        let mut offset = 0_usize;
+        let mut va = address;
+        while offset < size {
+            let remaining = size.saturating_sub(offset);
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1)).map_err(|_| {
+                CpuError::Message("page offset does not fit usize".into())
+            })?;
+            let chunk = remaining
+                .min(PAGE_SIZE_USIZE.saturating_sub(page_off))
+                .min(zeros.len());
+            if chunk == 0 {
+                break;
+            }
+            let src = zeros
+                .get(..chunk)
+                .ok_or_else(|| CpuError::Message("discard slice OOB".into()))?;
+            // Best-effort: unmapped gaps are ignored (software already Reserved).
+            drop(self.write(va, src));
+            offset = offset.saturating_add(chunk);
+            va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

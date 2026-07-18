@@ -50,6 +50,23 @@ impl HybridBackend {
         self.arenas.arena_host_base_for_va(va)
     }
 
+    /// MEM_RELEASE: drop exact arena and/or sparse pages in range.
+    pub(super) fn unmap_range(&mut self, address: u64, size: usize) {
+        self.arenas.unmap_exact(address, size);
+        self.sparse.unmap_range(address, size);
+    }
+
+    /// MEM_DECOMMIT: zero arena bytes; drop sparse pages.
+    pub(super) fn discard_range(
+        &mut self,
+        address: u64,
+        size: usize,
+    ) -> Result<(), CpuError> {
+        self.arenas.discard_range(address, size)?;
+        self.sparse.discard_range(address, size);
+        Ok(())
+    }
+
     /// Map a fully unmapped run into arena or sparse storage.
     fn map_unmapped_run(
         &mut self,

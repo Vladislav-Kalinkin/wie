@@ -844,6 +844,26 @@ impl CpuEngine for JitCpu {
         self.iced.mem_read(address, bytes)
     }
 
+    fn virtual_alloc(
+        &mut self,
+        addr: u64,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> Result<u64, CpuError> {
+        self.iced.virtual_alloc(addr, size, alloc_type, protect)
+    }
+
+    fn virtual_free(
+        &mut self,
+        addr: u64,
+        size: usize,
+        free_type: u32,
+    ) -> Result<(), CpuError> {
+        // Full TLB/cache invalidate is PR C; release may drop host pages.
+        self.iced.virtual_free(addr, size, free_type)
+    }
+
     fn cpu_stats(&self) -> Option<crate::JitStats> {
         Some(self.stats)
     }

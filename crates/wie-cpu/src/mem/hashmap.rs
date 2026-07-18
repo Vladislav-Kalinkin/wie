@@ -129,6 +129,55 @@ impl HashMapBackend {
     fn page_data_mut(&mut self, page_key: u64) -> Option<&mut [u8; PAGE_SIZE_USIZE]> {
         self.pages.get_mut(&page_key).map(|p| p.data.as_mut())
     }
+
+    /// Clear radix leaf for `page_key` (set null).
+    fn clear_pt(&mut self, page_key: u64) {
+        let [i0, i1, i2, i3] = Self::indices(page_key);
+        let Some(l0_slot) = self.l0.get_mut(i0) else {
+            return;
+        };
+        let Some(l1) = l0_slot.as_mut() else {
+            return;
+        };
+        let Some(l1_slot) = l1.entries.get_mut(i1) else {
+            return;
+        };
+        let Some(l2) = l1_slot.as_mut() else {
+            return;
+        };
+        let Some(l2_slot) = l2.entries.get_mut(i2) else {
+            return;
+        };
+        let Some(l3) = l2_slot.as_mut() else {
+            return;
+        };
+        if let Some(leaf) = l3.entries.get_mut(i3) {
+            *leaf = std::ptr::null_mut();
+        }
+    }
+
+    /// Drop host pages in `[address, address+size)` (RELEASE / DECOMMIT on hash).
+    pub(super) fn unmap_range(&mut self, address: u64, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let Ok((address, end)) = check_map_args(address, size) else {
+            return;
+        };
+        let mut page_va = address;
+        while page_va < end {
+            let key = page_key(page_va);
+            self.pages.remove(&key);
+            self.clear_pt(key);
+            page_va = page_va.saturating_add(PAGE_SIZE);
+        }
+    }
+
+    /// Zero pages in range if present; leave mapping (unused for hash — DECOMMIT drops).
+    pub(super) fn discard_range(&mut self, address: u64, size: usize) {
+        // Hash backend: DECOMMIT releases the Box; zero is implicit on drop.
+        self.unmap_range(address, size);
+    }
 }
 
 impl GuestMemBackend for HashMapBackend {

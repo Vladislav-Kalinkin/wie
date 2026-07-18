@@ -17,15 +17,28 @@ mod regs;
 pub use iced_cpu::IcedCpu;
 pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
 pub use mem::{
-    GuestMemBackend, GuestRegion, HashMapBackend, HybridBackend, MmapArenaBackend, RegionKind,
-    RegionTable, PAGE_SIZE, PAGE_SIZE_USIZE,
+    align_down, align_up, win32_from_cpu_error, GuestMemBackend, GuestRegion, HashMapBackend,
+    HybridBackend, MemType, MmapArenaBackend, PageMap, PageRun, PageState, RegionKind, RegionTable,
+    VadNode, VadTable, GUEST_ALLOC_GRANULARITY, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE, MEM_IMAGE,
+    MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, PAGE_SIZE, PAGE_SIZE_USIZE, ERROR_INVALID_ADDRESS,
+    ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
 };
+/// Windows `PAGE_*` constants and software access checks (Phase 3).
+pub use mem::protect;
 pub use regs::RegFile;
 
-/// Memory protection flags for [`CpuEngine::mem_map`] (r/w/x combined).
+/// Memory protection flags for [`CpuEngine::mem_map`] (Unicorn-compatible r/w/x bits).
+///
+/// Convert to Windows `PAGE_*` via [`mem::protect::page_protect_from_rwx`].
 pub mod perm {
+    /// Read bit.
+    pub const READ: u32 = 1;
+    /// Write bit.
+    pub const WRITE: u32 = 2;
+    /// Execute bit.
+    pub const EXEC: u32 = 4;
     /// Read + write + execute.
-    pub const ALL: u32 = 7;
+    pub const ALL: u32 = READ | WRITE | EXEC;
 }
 
 /// Re-export for call sites that used the old Unicorn-shaped name.
@@ -133,6 +146,37 @@ pub trait CpuEngine {
         None
     }
 
+    /// `VirtualAlloc` — reserve and/or commit private guest pages.
+    ///
+    /// # Errors
+    /// Invalid flags/address or out of guest VA (`CpuError` carries `win32(N):` prefix).
+    fn virtual_alloc(
+        &mut self,
+        _addr: u64,
+        _size: usize,
+        _alloc_type: u32,
+        _protect: u32,
+    ) -> Result<u64, CpuError> {
+        Err(CpuError::Message(
+            "win32(120): VirtualAlloc not implemented".into(),
+        ))
+    }
+
+    /// `VirtualFree` — decommit or release.
+    ///
+    /// # Errors
+    /// Invalid free type / address.
+    fn virtual_free(
+        &mut self,
+        _addr: u64,
+        _size: usize,
+        _free_type: u32,
+    ) -> Result<(), CpuError> {
+        Err(CpuError::Message(
+            "win32(120): VirtualFree not implemented".into(),
+        ))
+    }
+
     /// Run until a stop-bitmap hit, invalid memory, or instruction budget.
     ///
     /// # Errors
@@ -196,6 +240,23 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         (**self).mem_read(address, bytes)
+    }
+    fn virtual_alloc(
+        &mut self,
+        addr: u64,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> Result<u64, CpuError> {
+        (**self).virtual_alloc(addr, size, alloc_type, protect)
+    }
+    fn virtual_free(
+        &mut self,
+        addr: u64,
+        size: usize,
+        free_type: u32,
+    ) -> Result<(), CpuError> {
+        (**self).virtual_free(addr, size, free_type)
     }
     fn install_runtime_hooks(
         &mut self,
