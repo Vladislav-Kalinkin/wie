@@ -6,13 +6,6 @@
 //! - [`RegionTable`] — named layout ranges
 //! - [`GuestMemory`] — facade used by iced/JIT (identical API to pre-split)
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::indexing_slicing,
-    unsafe_code
-)]
-
 mod backend;
 mod hashmap;
 mod region;
@@ -22,7 +15,7 @@ mod mmap_page;
 #[cfg(test)]
 mod oracle;
 
-pub use backend::{GuestMemBackend, PAGE_SIZE};
+pub use backend::{GuestMemBackend, PAGE_SIZE, PAGE_SIZE_USIZE};
 pub use hashmap::HashMapBackend;
 pub use region::{GuestRegion, RegionKind, RegionTable};
 

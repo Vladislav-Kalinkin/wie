@@ -1,13 +1,10 @@
 //! `HashMap`-backed guest page storage + 4-level radix page table (default backend).
+//!
+//! Intermediate radix levels are owned `Box` trees (no raw ownership). Leaf slots
+//! store host pointers into page `Box` data for the JIT TLB; interpreter read/write
+//! always goes through the `HashMap` (fully safe).
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    clippy::indexing_slicing, // fixed-size PT_SIZE arrays, masked indices
-    unsafe_code // page-table raw pointers for Drop + install
-)]
-
-use super::backend::{GuestMemBackend, PAGE_SIZE, check_map_args, page_key};
+use super::backend::{GuestMemBackend, PAGE_SIZE, PAGE_SIZE_USIZE, check_map_args, page_key};
 use crate::CpuError;
 use std::collections::HashMap;
 
@@ -16,24 +13,24 @@ pub(crate) const PT_BITS: u32 = 9;
 /// Entries per level table.
 pub(crate) const PT_SIZE: usize = 1 << PT_BITS; // 512
 /// Mask for one level index.
-pub(crate) const PT_MASK: u64 = (PT_SIZE as u64) - 1;
+pub(crate) const PT_MASK: u64 = (1_u64 << PT_BITS) - 1;
 
 /// Level-3 leaf: host pointers to 4 KiB page data (`null` = unmapped).
-#[repr(C)]
+///
+/// Pointers alias `Page::data` owned by [`HashMapBackend::pages`]. They are only
+/// returned to the JIT (`page_data_ptr*`); interpreter paths use the HashMap.
 struct PtL3 {
     entries: [*mut u8; PT_SIZE],
 }
 
-/// Level-2: pointers to L3 leaves.
-#[repr(C)]
+/// Level-2: owned L3 leaves.
 struct PtL2 {
-    entries: [*mut PtL3; PT_SIZE],
+    entries: [Option<Box<PtL3>>; PT_SIZE],
 }
 
-/// Level-1: pointers to L2 tables.
-#[repr(C)]
+/// Level-1: owned L2 tables.
 struct PtL1 {
-    entries: [*mut PtL2; PT_SIZE],
+    entries: [Option<Box<PtL2>>; PT_SIZE],
 }
 
 impl PtL3 {
@@ -46,14 +43,14 @@ impl PtL3 {
 impl PtL2 {
     fn new() -> Self {
         Self {
-            entries: [std::ptr::null_mut(); PT_SIZE],
+            entries: std::array::from_fn(|_| None),
         }
     }
 }
 impl PtL1 {
     fn new() -> Self {
         Self {
-            entries: [std::ptr::null_mut(); PT_SIZE],
+            entries: std::array::from_fn(|_| None),
         }
     }
 }
@@ -61,49 +58,18 @@ impl PtL1 {
 /// Sparse page map + JIT-friendly radix page table (`WIE_MEM=hash` default).
 pub struct HashMapBackend {
     pages: HashMap<u64, Page>,
-    /// L0 directory: 512 pointers to L1 (null until first use).
-    l0: Box<[*mut PtL1; PT_SIZE]>,
+    /// L0 directory: 512 optional L1 tables.
+    l0: Box<[Option<Box<PtL1>>; PT_SIZE]>,
 }
 
-#[derive(Debug, Clone)]
 struct Page {
-    data: Box<[u8; PAGE_SIZE as usize]>,
+    data: Box<[u8; PAGE_SIZE_USIZE]>,
     perms: u32,
 }
 
 impl Default for HashMapBackend {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for HashMapBackend {
-    fn drop(&mut self) {
-        for i0 in 0..PT_SIZE {
-            let l1p = self.l0[i0];
-            if l1p.is_null() {
-                continue;
-            }
-            // SAFETY: L1 from Box::into_raw in install_pt.
-            let l1 = unsafe { Box::from_raw(l1p) };
-            for i1 in 0..PT_SIZE {
-                let l2p = l1.entries[i1];
-                if l2p.is_null() {
-                    continue;
-                }
-                // SAFETY: L2 from Box::into_raw.
-                let l2 = unsafe { Box::from_raw(l2p) };
-                for i2 in 0..PT_SIZE {
-                    let l3p = l2.entries[i2];
-                    if !l3p.is_null() {
-                        // SAFETY: L3 from Box::into_raw.
-                        unsafe {
-                            drop(Box::from_raw(l3p));
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -120,7 +86,7 @@ impl HashMapBackend {
     pub fn new() -> Self {
         Self {
             pages: HashMap::new(),
-            l0: Box::new([std::ptr::null_mut(); PT_SIZE]),
+            l0: Box::new(std::array::from_fn(|_| None)),
         }
     }
 
@@ -135,38 +101,33 @@ impl HashMapBackend {
         ]
     }
 
-    /// Install `data_ptr` for `page_key` into the radix tree.
+    /// Install `data_ptr` for `page_key` into the radix tree (safe `Box` ownership).
     fn install_pt(&mut self, page_key: u64, data_ptr: *mut u8) {
         let [i0, i1, i2, i3] = Self::indices(page_key);
 
-        if self.l0[i0].is_null() {
-            self.l0[i0] = Box::into_raw(Box::new(PtL1::new()));
+        let Some(l0_slot) = self.l0.get_mut(i0) else {
+            return;
+        };
+        let l1 = l0_slot.get_or_insert_with(|| Box::new(PtL1::new()));
+        let Some(l1_slot) = l1.entries.get_mut(i1) else {
+            return;
+        };
+        let l2 = l1_slot.get_or_insert_with(|| Box::new(PtL2::new()));
+        let Some(l2_slot) = l2.entries.get_mut(i2) else {
+            return;
+        };
+        let l3 = l2_slot.get_or_insert_with(|| Box::new(PtL3::new()));
+        if let Some(leaf) = l3.entries.get_mut(i3) {
+            *leaf = data_ptr;
         }
-        // SAFETY: L1 installed by us.
-        let l1 = unsafe { &mut *self.l0[i0] };
-        if l1.entries[i1].is_null() {
-            l1.entries[i1] = Box::into_raw(Box::new(PtL2::new()));
-        }
-        // SAFETY: L2 installed by us.
-        let l2 = unsafe { &mut *l1.entries[i1] };
-        if l2.entries[i2].is_null() {
-            l2.entries[i2] = Box::into_raw(Box::new(PtL3::new()));
-        }
-        // SAFETY: L3 installed by us.
-        let l3 = unsafe { &mut *l2.entries[i2] };
-        l3.entries[i3] = data_ptr;
     }
 
-    fn page_data_ref(&self, page_key: u64) -> Option<&[u8; PAGE_SIZE as usize]> {
-        let ptr = self.page_data_ptr_walk(page_key)?;
-        // SAFETY: `ptr` was installed by `install_pt` from a `Box<[u8; PAGE_SIZE]>`.
-        Some(unsafe { &*ptr.cast::<[u8; PAGE_SIZE as usize]>() })
+    fn page_data_ref(&self, page_key: u64) -> Option<&[u8; PAGE_SIZE_USIZE]> {
+        self.pages.get(&page_key).map(|p| p.data.as_ref())
     }
 
-    fn page_data_mut(&mut self, page_key: u64) -> Option<&mut [u8; PAGE_SIZE as usize]> {
-        let ptr = self.page_data_ptr_walk(page_key)?;
-        // SAFETY: same as `page_data_ref`, and `&mut self` guarantees unique access.
-        Some(unsafe { &mut *ptr.cast::<[u8; PAGE_SIZE as usize]>() })
+    fn page_data_mut(&mut self, page_key: u64) -> Option<&mut [u8; PAGE_SIZE_USIZE]> {
+        self.pages.get_mut(&page_key).map(|p| p.data.as_mut())
     }
 }
 
@@ -180,7 +141,7 @@ impl GuestMemBackend for HashMapBackend {
         while page_va < end {
             let key = page_key(page_va);
             self.pages.entry(key).or_insert_with(|| Page {
-                data: Box::new([0_u8; PAGE_SIZE as usize]),
+                data: Box::new([0_u8; PAGE_SIZE_USIZE]),
                 perms,
             });
             let ptr = {
@@ -210,13 +171,16 @@ impl GuestMemBackend for HashMapBackend {
             let page = self
                 .page_data_mut(pkey)
                 .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
-            let room = (PAGE_SIZE as usize).saturating_sub(page_off);
+            let room = PAGE_SIZE_USIZE.saturating_sub(page_off);
             let remaining = bytes.len().saturating_sub(offset);
             let chunk = room.min(remaining);
             let src = bytes
                 .get(offset..offset.saturating_add(chunk))
                 .ok_or_else(|| CpuError::Message("mem_write slice OOB".into()))?;
-            page[page_off..page_off.saturating_add(chunk)].copy_from_slice(src);
+            let dst = page
+                .get_mut(page_off..page_off.saturating_add(chunk))
+                .ok_or_else(|| CpuError::Message("mem_write page OOB".into()))?;
+            dst.copy_from_slice(src);
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
         }
@@ -236,13 +200,16 @@ impl GuestMemBackend for HashMapBackend {
             let page = self
                 .page_data_ref(pkey)
                 .ok_or_else(|| CpuError::Message(format!("mem_read unmapped {va:#x}")))?;
-            let room = (PAGE_SIZE as usize).saturating_sub(page_off);
+            let room = PAGE_SIZE_USIZE.saturating_sub(page_off);
             let remaining = bytes.len().saturating_sub(offset);
             let chunk = room.min(remaining);
             let dst = bytes
                 .get_mut(offset..offset.saturating_add(chunk))
                 .ok_or_else(|| CpuError::Message("mem_read slice OOB".into()))?;
-            dst.copy_from_slice(&page[page_off..page_off.saturating_add(chunk)]);
+            let src = page
+                .get(page_off..page_off.saturating_add(chunk))
+                .ok_or_else(|| CpuError::Message("mem_read page OOB".into()))?;
+            dst.copy_from_slice(src);
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
         }
@@ -263,25 +230,10 @@ impl GuestMemBackend for HashMapBackend {
 
     fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
         let [i0, i1, i2, i3] = Self::indices(page_key);
-        let l1p = self.l0[i0];
-        if l1p.is_null() {
-            return None;
-        }
-        // SAFETY: non-null L1 installed by us.
-        let l1 = unsafe { &*l1p };
-        let l2p = l1.entries[i1];
-        if l2p.is_null() {
-            return None;
-        }
-        // SAFETY: non-null L2.
-        let l2 = unsafe { &*l2p };
-        let l3p = l2.entries[i2];
-        if l3p.is_null() {
-            return None;
-        }
-        // SAFETY: non-null L3.
-        let l3 = unsafe { &*l3p };
-        let p = l3.entries[i3];
+        let l1 = self.l0.get(i0)?.as_ref()?;
+        let l2 = l1.entries.get(i1)?.as_ref()?;
+        let l3 = l2.entries.get(i2)?.as_ref()?;
+        let p = *l3.entries.get(i3)?;
         if p.is_null() { None } else { Some(p) }
     }
 
@@ -289,5 +241,3 @@ impl GuestMemBackend for HashMapBackend {
         "hash"
     }
 }
-
-

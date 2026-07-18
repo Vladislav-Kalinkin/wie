@@ -44,9 +44,21 @@ impl XorShift64 {
 
 #[derive(Clone, Copy)]
 enum Op {
-    Map { page: u32, pages: u32 },
-    Write { page: u32, off: u16, len: u16, fill: u8 },
-    Read { page: u32, off: u16, len: u16 },
+    Map {
+        page: u32,
+        pages: u32,
+    },
+    Write {
+        page: u32,
+        off: u16,
+        len: u16,
+        fill: u8,
+    },
+    Read {
+        page: u32,
+        off: u16,
+        len: u16,
+    },
 }
 
 fn apply(backend: &mut dyn GuestMemBackend, op: Op) -> Result<Option<Vec<u8>>, String> {
@@ -135,10 +147,7 @@ fn run_oracle(seed: u64, n_ops: usize) {
         let rb = apply(&mut b, op);
         match (ra, rb) {
             (Ok(Some(va)), Ok(Some(vb))) => {
-                assert_eq!(
-                    va, vb,
-                    "seed={seed} op#{i} read mismatch hash vs mmap_page"
-                );
+                assert_eq!(va, vb, "seed={seed} op#{i} read mismatch hash vs mmap_page");
             }
             // Both succeeded with no payload, or both failed (e.g. unmapped read).
             (Ok(None), Ok(None)) | (Err(_), Err(_)) => {}

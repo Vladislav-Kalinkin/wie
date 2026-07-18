@@ -1,10 +1,5 @@
 //! x86-64 GPRs + RFLAGS for the iced interpreter.
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation // GPR width narrowing (u64 → u8/u16/u32)
-)]
-
 use crate::CpuError;
 use iced_x86::Register;
 
@@ -277,7 +272,7 @@ pub(crate) fn set_logic_flags(regs: &mut RegFile, result: u64, size: usize) {
     regs.set_flag(rflags::ZF, v == 0);
     let sign_bit = 1_u64 << ((size.saturating_mul(8)).saturating_sub(1));
     regs.set_flag(rflags::SF, (v & sign_bit) != 0);
-    regs.set_flag(rflags::PF, parity_even(v as u8));
+    regs.set_flag(rflags::PF, parity_even(low_byte(v)));
     regs.set_flag(rflags::CF, false);
     regs.set_flag(rflags::OF, false);
     // AF undefined for logic; leave unchanged.
@@ -296,7 +291,7 @@ pub(crate) fn set_add_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     regs.set_flag(rflags::CF, wide > u128::from(mask));
     regs.set_flag(rflags::ZF, r == 0);
     regs.set_flag(rflags::SF, (r & sign) != 0);
-    regs.set_flag(rflags::PF, parity_even(r as u8));
+    regs.set_flag(rflags::PF, parity_even(low_byte(r)));
     // OF: same sign operands, result different sign
     let of = ((d ^ r) & (s ^ r) & sign) != 0;
     regs.set_flag(rflags::OF, of);
@@ -315,7 +310,7 @@ pub(crate) fn set_sub_flags(regs: &mut RegFile, dst: u64, src: u64, result: u64,
     regs.set_flag(rflags::CF, d < s);
     regs.set_flag(rflags::ZF, r == 0);
     regs.set_flag(rflags::SF, (r & sign) != 0);
-    regs.set_flag(rflags::PF, parity_even(r as u8));
+    regs.set_flag(rflags::PF, parity_even(low_byte(r)));
     // OF: different sign operands, result sign != dst sign
     let of = ((d ^ s) & (d ^ r) & sign) != 0;
     regs.set_flag(rflags::OF, of);
@@ -330,6 +325,13 @@ pub(crate) fn size_mask(size: usize) -> u64 {
         4 => 0xffff_ffff,
         _ => u64::MAX,
     }
+}
+
+/// Low 8 bits of `v` without `as` casts (always fits in `u8`).
+#[inline]
+#[must_use]
+fn low_byte(v: u64) -> u8 {
+    u8::try_from(v & 0xff).unwrap_or(0)
 }
 
 #[must_use]

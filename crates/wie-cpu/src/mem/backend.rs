@@ -8,6 +8,8 @@ use crate::CpuError;
 
 /// Page size used by all guest memory backends (4 KiB).
 pub const PAGE_SIZE: u64 = 0x1000;
+/// Same as [`PAGE_SIZE`] as `usize` (avoids `as` conversions at call sites).
+pub const PAGE_SIZE_USIZE: usize = 0x1000;
 /// `log2(PAGE_SIZE)` — prefer shifts over division for page keys.
 pub(crate) const PAGE_SHIFT: u32 = 12;
 
@@ -46,7 +48,10 @@ pub trait GuestMemBackend {
         }
         let mut len = want;
         while len > 0 {
-            if self.read(address, &mut out[..len]).is_ok() {
+            let Some(dst) = out.get_mut(..len) else {
+                break;
+            };
+            if self.read(address, dst).is_ok() {
                 return Ok(len);
             }
             len = len.saturating_sub(1);
@@ -77,8 +82,8 @@ pub(crate) fn check_map_args(address: u64, size: usize) -> Result<(u64, u64), Cp
             "mem_map size {size:#x} not page-aligned"
         )));
     }
-    let end = address.checked_add(size_u64).ok_or_else(|| {
-        CpuError::Message(format!("mem_map overflow at {address:#x}+{size:#x}"))
-    })?;
+    let end = address
+        .checked_add(size_u64)
+        .ok_or_else(|| CpuError::Message(format!("mem_map overflow at {address:#x}+{size:#x}")))?;
     Ok((address, end))
 }

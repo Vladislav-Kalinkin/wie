@@ -16,7 +16,10 @@ mod regs;
 
 pub use iced_cpu::IcedCpu;
 pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
-pub use mem::{GuestMemBackend, GuestRegion, HashMapBackend, RegionKind, RegionTable, PAGE_SIZE};
+pub use mem::{
+    GuestMemBackend, GuestRegion, HashMapBackend, RegionKind, RegionTable, PAGE_SIZE,
+    PAGE_SIZE_USIZE,
+};
 pub use regs::RegFile;
 
 /// Memory protection flags for [`CpuEngine::mem_map`] (r/w/x combined).

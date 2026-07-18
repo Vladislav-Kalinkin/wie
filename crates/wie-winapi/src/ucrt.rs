@@ -6,11 +6,6 @@
 //! API set DLLs (`api-ms-win-crt-stdio-l1-1-0.dll`, …) are Windows forwarders to
 //! `ucrtbase.dll`; we treat them as one dispatch namespace by export name.
 
-#![allow(
-    clippy::as_conversions,
-    clippy::cast_sign_loss // libc / CRT status values i32 → u64
-)]
-
 use crate::{WinApiEnvironment, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -88,6 +83,13 @@ fn ret(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerR
     })
 }
 
+/// Bitcast a CRT `int` status into RAX without `as` (sign-preserving via `i64`).
+#[inline]
+fn i32_status_to_u64(v: i32) -> u64 {
+    // i32 → i64 sign-extends; `from_ne_bytes` reinterprets bits (same as `as u64` on two's complement).
+    u64::from_ne_bytes(i64::from(v).to_ne_bytes())
+}
+
 /// `__acrt_iob_func(ix)` → `FILE*` for stdin/stdout/stderr.
 fn handle_acrt_iob_func(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let ix = engine.read_rcx()? & 0xffff_ffff;
@@ -119,7 +121,7 @@ fn handle_fwrite(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     }
 
     // Host stdout/stderr for console programs (independent CRT expects console I/O).
-    // Fast-path: direct libc::write — skips Rust stdio mutex (matches JIT helper).
+    // Fast-path: direct `libc::write` — skips Rust stdio mutex (matches JIT helper).
     if stream == FILE_STDOUT || stream == FILE_STDERR {
         write_host_console(stream, &bytes);
     }
@@ -133,7 +135,7 @@ fn handle_fflush(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, 0)
 }
 
-/// Host console write without `std::io::{stdout,stderr}` lock.
+/// Host console write without `std::io::{stdout,stderr}` lock (hot CRT path).
 #[cfg(unix)]
 fn write_host_console(stream: u64, bytes: &[u8]) {
     let fd = if stream == FILE_STDOUT {
@@ -154,6 +156,7 @@ fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
             break;
         };
         // SAFETY: `chunk` is a valid contiguous slice; write does not retain the pointer.
+        // Hot path: avoid `std::io` mutex on every guest `fwrite` to stdout/stderr.
         #[expect(unsafe_code)]
         let n = unsafe { libc::write(fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
         if n < 0 {
@@ -345,7 +348,7 @@ fn handle_strncmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRe
             break;
         }
     }
-    ret(engine, result as u64)
+    ret(engine, i32_status_to_u64(result))
 }
 
 /// `_initterm(first, last)` — call void (*)() for each non-null entry in [first, last).

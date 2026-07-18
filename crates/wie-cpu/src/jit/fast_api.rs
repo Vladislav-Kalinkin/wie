@@ -350,7 +350,7 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
         ctx.fault_access = 0;
         return 0;
     }
-    // Fast-path: direct libc::write for stdout/stderr — skips Rust stdio mutex.
+    // Fast-path: direct `libc::write` for stdout/stderr — skips Rust stdio mutex.
     if stream == FILE_STDOUT || stream == FILE_STDERR {
         write_host_console(stream, &bytes);
     }
@@ -365,7 +365,7 @@ pub(super) extern "C" fn wie_ucrt_fflush(_stream: u64) -> u64 {
     0
 }
 
-/// Host console write without `std::io::{stdout,stderr}` lock.
+/// Host console write without `std::io::{stdout,stderr}` lock (hot JIT path).
 #[cfg(unix)]
 fn write_host_console(stream: u64, bytes: &[u8]) {
     let fd = if stream == FILE_STDOUT {
@@ -385,8 +385,8 @@ fn write_all_fd(fd: libc::c_int, bytes: &[u8]) {
         let Some(chunk) = bytes.get(offset..) else {
             break;
         };
-        // SAFETY: `chunk` is a valid contiguous slice; write does not retain the pointer.
-        // SAFETY: `fd` is a host stdout/stderr descriptor; `chunk` is a live buffer.
+        // SAFETY: `fd` is host stdout/stderr; `chunk` is a live contiguous buffer;
+        // write does not retain the pointer. Skips `std::io` mutex on every fwrite.
         let n = unsafe { libc::write(fd, chunk.as_ptr().cast::<libc::c_void>(), chunk.len()) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
