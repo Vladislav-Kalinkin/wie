@@ -82,7 +82,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 | Variable | Effect |
 | -------- | ------ |
 | `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**) |
-| `WIE_RUNTIME_PROFILE=1` | Host stop timing / API counts |
+| `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT load/store counts, mem backend |
 | `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs |
 | `WIE_ROOT` / `--root` | Bottle root for file APIs |
 | `WIE_GUEST_HEAP=1` | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code |
@@ -105,6 +105,8 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 | `entry-trace` | First N host API stops |
 
 ## Performance notes (CPU / wall)
+
+Phase 0 baselines (wall/CPU%, host stops, JIT load/store): see [`docs/phase0-baseline.md`](docs/phase0-baseline.md). Optimisation plan: [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
 What actually burns CPU today:
 

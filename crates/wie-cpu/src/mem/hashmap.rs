@@ -1,8 +1,4 @@
-//! Guest virtual memory for the iced interpreter (x86-64 only).
-//!
-//! Storage: `HashMap` owns page boxes (perms + data). A **4-level radix page
-//! table** (9 bits × 4 of `page_key` = 36 bits → full 48-bit VA) mirrors host
-//! data pointers so JIT can walk pages with plain loads.
+//! `HashMap`-backed guest page storage + 4-level radix page table (default backend).
 
 #![allow(
     clippy::as_conversions,
@@ -11,18 +7,9 @@
     unsafe_code // page-table raw pointers for Drop + install
 )]
 
+use super::backend::{GuestMemBackend, PAGE_SIZE, check_map_args, page_key};
 use crate::CpuError;
 use std::collections::HashMap;
-
-/// Page size used by the interpreter (4 KiB).
-pub(crate) const PAGE_SIZE: u64 = 0x1000;
-/// `log2(PAGE_SIZE)` — prefer shifts over division for page keys.
-pub(crate) const PAGE_SHIFT: u32 = 12;
-
-#[inline]
-fn page_key(va: u64) -> u64 {
-    va >> PAGE_SHIFT
-}
 
 /// Bits per radix level (512-way).
 pub(crate) const PT_BITS: u32 = 9;
@@ -30,6 +17,7 @@ pub(crate) const PT_BITS: u32 = 9;
 pub(crate) const PT_SIZE: usize = 1 << PT_BITS; // 512
 /// Mask for one level index.
 pub(crate) const PT_MASK: u64 = (PT_SIZE as u64) - 1;
+
 /// Level-3 leaf: host pointers to 4 KiB page data (`null` = unmapped).
 #[repr(C)]
 struct PtL3 {
@@ -70,8 +58,8 @@ impl PtL1 {
     }
 }
 
-/// Guest memory: sparse page map + JIT-friendly radix page table.
-pub(crate) struct GuestMemory {
+/// Sparse page map + JIT-friendly radix page table (`WIE_MEM=hash` default).
+pub struct HashMapBackend {
     pages: HashMap<u64, Page>,
     /// L0 directory: 512 pointers to L1 (null until first use).
     l0: Box<[*mut PtL1; PT_SIZE]>,
@@ -83,13 +71,13 @@ struct Page {
     perms: u32,
 }
 
-impl Default for GuestMemory {
+impl Default for HashMapBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Drop for GuestMemory {
+impl Drop for HashMapBackend {
     fn drop(&mut self) {
         for i0 in 0..PT_SIZE {
             let l1p = self.l0[i0];
@@ -119,17 +107,17 @@ impl Drop for GuestMemory {
     }
 }
 
-impl std::fmt::Debug for GuestMemory {
+impl std::fmt::Debug for HashMapBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GuestMemory")
+        f.debug_struct("HashMapBackend")
             .field("pages", &self.pages.len())
             .finish_non_exhaustive()
     }
 }
 
-impl GuestMemory {
+impl HashMapBackend {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             pages: HashMap::new(),
             l0: Box::new([std::ptr::null_mut(); PT_SIZE]),
@@ -169,26 +157,25 @@ impl GuestMemory {
         l3.entries[i3] = data_ptr;
     }
 
-    /// Map `[address, address+size)` with `perms` (Unicorn-compatible `PROT_*`).
-    pub(crate) fn map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        if size == 0 {
+    fn page_data_ref(&self, page_key: u64) -> Option<&[u8; PAGE_SIZE as usize]> {
+        let ptr = self.page_data_ptr_walk(page_key)?;
+        // SAFETY: `ptr` was installed by `install_pt` from a `Box<[u8; PAGE_SIZE]>`.
+        Some(unsafe { &*ptr.cast::<[u8; PAGE_SIZE as usize]>() })
+    }
+
+    fn page_data_mut(&mut self, page_key: u64) -> Option<&mut [u8; PAGE_SIZE as usize]> {
+        let ptr = self.page_data_ptr_walk(page_key)?;
+        // SAFETY: same as `page_data_ref`, and `&mut self` guarantees unique access.
+        Some(unsafe { &mut *ptr.cast::<[u8; PAGE_SIZE as usize]>() })
+    }
+}
+
+impl GuestMemBackend for HashMapBackend {
+    fn map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
+        let (address, end) = check_map_args(address, size)?;
+        if address == end {
             return Ok(());
         }
-        if !address.is_multiple_of(PAGE_SIZE) {
-            return Err(CpuError::Message(format!(
-                "mem_map address {address:#x} not page-aligned"
-            )));
-        }
-        let size_u64 = u64::try_from(size)
-            .map_err(|_| CpuError::Message(format!("mem_map size {size} does not fit u64")))?;
-        if !size_u64.is_multiple_of(PAGE_SIZE) {
-            return Err(CpuError::Message(format!(
-                "mem_map size {size:#x} not page-aligned"
-            )));
-        }
-        let end = address.checked_add(size_u64).ok_or_else(|| {
-            CpuError::Message(format!("mem_map overflow at {address:#x}+{size:#x}"))
-        })?;
         let mut page_va = address;
         while page_va < end {
             let key = page_key(page_va);
@@ -210,8 +197,7 @@ impl GuestMemory {
         Ok(())
     }
 
-    /// Write `bytes` at guest `address`.
-    pub(crate) fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
+    fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -233,13 +219,11 @@ impl GuestMemory {
             page[page_off..page_off.saturating_add(chunk)].copy_from_slice(src);
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
-            // PT already points at page data (Box heap ptr is stable across HashMap moves).
         }
         Ok(())
     }
 
-    /// Read into `bytes` from guest `address`.
-    pub(crate) fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
+    fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -265,10 +249,7 @@ impl GuestMemory {
         Ok(())
     }
 
-    /// Host pointer to a mapped page's data (JIT TLB). `page_key = va / PAGE_SIZE`.
-    #[must_use]
-    pub(crate) fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
-        // Prefer dense walk (O(1) levels); install only if missing.
+    fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
         if let Some(p) = self.page_data_ptr_walk(page_key) {
             return Some(p);
         }
@@ -280,28 +261,7 @@ impl GuestMemory {
         Some(ptr)
     }
 
-    /// Shared reference to a mapped page's data via radix-page-table walk
-    /// (4 pointer loads, no HashMap).  Safe wrapper around [`page_data_ptr_walk`].
-    fn page_data_ref(&self, page_key: u64) -> Option<&[u8; PAGE_SIZE as usize]> {
-        let ptr = self.page_data_ptr_walk(page_key)?;
-        // SAFETY: `ptr` was installed by `install_pt` from a `Box<[u8; PAGE_SIZE]>`.
-        // It remains valid for the lifetime of `self` because `GuestMemory` owns
-        // the backing `pages` HashMap and never deallocates individual pages.
-        // There is no mutable aliasing through `&self`.
-        Some(unsafe { &*ptr.cast::<[u8; PAGE_SIZE as usize]>() })
-    }
-
-    /// Mutable reference to a mapped page's data via radix-page-table walk
-    /// (4 pointer loads, no HashMap).  Safe wrapper around [`page_data_ptr_walk`].
-    fn page_data_mut(&mut self, page_key: u64) -> Option<&mut [u8; PAGE_SIZE as usize]> {
-        let ptr = self.page_data_ptr_walk(page_key)?;
-        // SAFETY: same as `page_data_ref`, and `&mut self` guarantees unique access.
-        Some(unsafe { &mut *ptr.cast::<[u8; PAGE_SIZE as usize]>() })
-    }
-
-    /// Fast page-table walk (no HashMap). Used by JIT host helper and tests.
-    #[must_use]
-    pub(crate) fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
+    fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
         let [i0, i1, i2, i3] = Self::indices(page_key);
         let l1p = self.l0[i0];
         if l1p.is_null() {
@@ -325,52 +285,9 @@ impl GuestMemory {
         if p.is_null() { None } else { Some(p) }
     }
 
-    /// Fill `out` (≤15 bytes) from guest `address` for instruction fetch.
-    /// Returns the number of valid bytes written, or an error if nothing is mapped.
-    ///
-    /// Hot path: stack buffer only (no heap) — iced steps this on every insn.
-    pub(crate) fn fetch_into(&self, address: u64, out: &mut [u8]) -> Result<usize, CpuError> {
-        let want = out.len().min(15);
-        if want == 0 {
-            return Ok(0);
-        }
-        let mut len = want;
-        while len > 0 {
-            if self.read(address, &mut out[..len]).is_ok() {
-                return Ok(len);
-            }
-            len = len.saturating_sub(1);
-        }
-        Err(CpuError::Message(format!(
-            "instruction fetch unmapped {address:#x}"
-        )))
+    fn name(&self) -> &'static str {
+        "hash"
     }
 }
 
-#[cfg(test)]
-#[expect(clippy::expect_used)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn page_table_walk_matches_map() {
-        let mut mem = GuestMemory::new();
-        mem.map(0x10_0000, 0x2000, 7).expect("map");
-        let k = page_key(0x10_0000);
-        let p = mem.page_data_ptr_walk(k).expect("walk");
-        assert!(!p.is_null());
-        let p2 = mem.page_data_ptr(k).expect("hash");
-        assert_eq!(p, p2);
-        assert!(mem.page_data_ptr_walk(k + 100).is_none());
-    }
-
-    #[test]
-    fn page_table_high_va() {
-        // Typical user stack-ish high canonical address.
-        let mut mem = GuestMemory::new();
-        let base = 0x0000_7fff_0000_0000_u64;
-        mem.map(base, 0x1000, 7).expect("map high");
-        let k = page_key(base);
-        assert!(mem.page_data_ptr_walk(k).is_some());
-    }
-}

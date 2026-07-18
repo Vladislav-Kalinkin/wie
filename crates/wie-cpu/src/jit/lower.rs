@@ -72,6 +72,10 @@ pub(super) struct JitCtx {
     /// Hand-written trampolines OR their bits; Cranelift leaves 0 → host syncs all 16.
     /// Set to `0xffff` before late-bound chain so a subsequent Cranelift block is covered.
     pub gpr_dirty_bits: u64,
+    /// Phase 0: host load helper invocations during this `run_compiled` (appended; IR-stable).
+    pub load_calls: u64,
+    /// Phase 0: host store helper invocations during this `run_compiled`.
+    pub store_calls: u64,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
@@ -240,6 +244,7 @@ pub(super) unsafe extern "C" fn wie_jit_load(
 ) -> u64 {
     // SAFETY: caller passes a live `JitCtx` for the duration of the block.
     let ctx = unsafe { &mut *ctx };
+    ctx.load_calls = ctx.load_calls.saturating_add(1);
     if ctx.fault != 0 {
         return 0;
     }
@@ -291,6 +296,7 @@ pub(super) unsafe extern "C" fn wie_jit_store(
 ) {
     // SAFETY: caller passes a live `JitCtx` for the duration of the block.
     let ctx = unsafe { &mut *ctx };
+    ctx.store_calls = ctx.store_calls.saturating_add(1);
     if ctx.fault != 0 {
         return;
     }

@@ -40,7 +40,7 @@ pub struct RuntimeProfile {
     pub handler_ns: u128,
     /// Wall time spent resolving hook VA → fake API entry.
     pub resolve_ns: u128,
-    /// Number of times Unicorn stopped on a fake-API hook (host entry points).
+    /// Number of times the CPU stopped on a fake-API hook (host entry points).
     pub host_stops: u64,
     /// Noisy API calls (not charged to max_api).
     pub noisy_calls: u64,
@@ -48,6 +48,16 @@ pub struct RuntimeProfile {
     pub charged_calls: u64,
     /// Per-export counts and handler time (library!name → (count, handler_ns)).
     pub by_export: HashMap<String, (u64, u128)>,
+    /// End-to-end wall time for the run (set by CLI / micro runner when available).
+    pub wall_ns: u128,
+    /// Process user CPU microseconds (delta over the run, when available).
+    pub cpu_user_us: u64,
+    /// Process system CPU microseconds (delta over the run, when available).
+    pub cpu_sys_us: u64,
+    /// JIT / interpreter diagnostics snapshot at end of run.
+    pub jit: Option<wie_cpu::JitStats>,
+    /// Active memory backend name (`hash`, …).
+    pub mem_backend: String,
 }
 
 impl RuntimeProfile {
@@ -67,10 +77,29 @@ impl RuntimeProfile {
         };
         let mut lines = Vec::new();
         lines.push("=== WIE_RUNTIME_PROFILE ===".to_owned());
+        if !self.mem_backend.is_empty() {
+            lines.push(format!("mem_backend={}", self.mem_backend));
+        }
         lines.push(format!(
             "host_stops={} noisy={} charged={}",
             self.host_stops, self.noisy_calls, self.charged_calls
         ));
+        if self.wall_ns > 0 || self.cpu_user_us > 0 || self.cpu_sys_us > 0 {
+            let wall_ms = self.wall_ns as f64 / 1e6;
+            let cpu_ms = (self.cpu_user_us.saturating_add(self.cpu_sys_us)) as f64 / 1e3;
+            let cpu_pct = if wall_ms > 0.0 {
+                (cpu_ms / wall_ms) * 100.0
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "wall_ms={:.2}  cpu_user_ms={:.2}  cpu_sys_ms={:.2}  cpu%≈{:.1}",
+                wall_ms,
+                self.cpu_user_us as f64 / 1e3,
+                self.cpu_sys_us as f64 / 1e3,
+                cpu_pct
+            ));
+        }
         lines.push(format!(
             "emu_ms={:.2} ({:.1}%)  handler_ms={:.2} ({:.1}%)  resolve_ms={:.2} ({:.1}%)  total_accounted_ms={:.2}  init_ms={:.2}",
             self.emu_ns as f64 / 1e6,
@@ -82,6 +111,18 @@ impl RuntimeProfile {
             total as f64 / 1e6,
             self.init_ns as f64 / 1e6,
         ));
+        if let Some(j) = self.jit {
+            lines.push(format!(
+                "jit: insns={} iced={} compiles={} skip={} cache_hits={} load={} store={}",
+                j.jit_insns,
+                j.iced_insns,
+                j.compiles,
+                j.compile_skip,
+                j.cache_hits,
+                j.load_calls,
+                j.store_calls
+            ));
+        }
         let mut ranked: Vec<_> = self.by_export.iter().collect();
         ranked.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(b.1.0.cmp(&a.1.0)));
         lines.push("top exports by handler time:".to_owned());
@@ -104,9 +145,131 @@ impl RuntimeProfile {
     }
 }
 
+/// Register default layout ranges into the CPU region table (Phase 1.2).
+fn register_layout_regions(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    layout: &RuntimeMemoryLayout,
+    image_base: u64,
+    image_size: usize,
+) {
+    use wie_cpu::{GuestRegion, RegionKind};
+
+    let regs: [GuestRegion; 16] = [
+        GuestRegion::new("image", RegionKind::Image, image_base, image_size, wie_cpu::perm::ALL),
+        GuestRegion::new(
+            "stack",
+            RegionKind::Stack,
+            layout.stack_base,
+            layout.stack_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "process_heap",
+            RegionKind::Heap,
+            layout.process_heap_base,
+            layout.process_heap_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "process_heap_shadow",
+            RegionKind::Heap,
+            layout.process_heap_shadow_base(),
+            layout.process_heap_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "fake_api",
+            RegionKind::FakeApi,
+            layout.fake_api_base,
+            layout.fake_api_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "teb",
+            RegionKind::Teb,
+            layout.teb_low_base,
+            layout.teb_low_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "env",
+            RegionKind::Env,
+            layout.env_data_base,
+            layout.env_data_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "resource",
+            RegionKind::Resource,
+            layout.resource_data_base,
+            layout.resource_data_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_io_code",
+            RegionKind::GuestCode,
+            layout.guest_io_code_base,
+            layout.guest_io_code_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_io_table",
+            RegionKind::GuestIo,
+            layout.guest_io_table_base,
+            layout.guest_io_table_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_file_data",
+            RegionKind::GuestIo,
+            layout.guest_file_data_base,
+            layout.guest_file_data_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_fls",
+            RegionKind::Other,
+            layout.guest_fls_table_base,
+            layout.guest_fls_table_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_heap_ctrl",
+            RegionKind::Heap,
+            layout.guest_heap_ctrl_base,
+            layout.guest_heap_ctrl_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_heap_code",
+            RegionKind::GuestCode,
+            layout.guest_heap_code_base,
+            layout.guest_heap_code_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "guest_mbwc_code",
+            RegionKind::GuestCode,
+            layout.guest_mbwc_code_base,
+            layout.guest_mbwc_code_size,
+            wie_cpu::perm::ALL,
+        ),
+        GuestRegion::new(
+            "fast_api_stub",
+            RegionKind::GuestCode,
+            layout.fast_api_stub_base,
+            layout.fast_api_stub_size,
+            wie_cpu::perm::ALL,
+        ),
+    ];
+    for region in regs {
+        engine.register_region(region);
+    }
+}
+
 /// Long-lived executable runtime session.
 ///
-/// The session owns the Unicorn engine, guest memory, WinAPI state and
+/// The session owns the CPU engine, guest memory, WinAPI state and
 /// dispatcher metadata so execution can yield and later resume.
 pub struct RuntimeSession {
     engine: Box<dyn wie_cpu::CpuEngine>,
@@ -501,6 +664,14 @@ impl RuntimeSession {
             )
             .context("failed to map fake resource memory")?;
 
+        // Phase 1.2: register named layout ranges for region-table lookups.
+        register_layout_regions(
+            engine.as_mut(),
+            &layout,
+            image_summary.image_base,
+            image_summary.image_size,
+        );
+
         let environment = default_winapi_environment(
             &layout,
             image_summary.image_base,
@@ -540,8 +711,24 @@ impl RuntimeSession {
         });
         if session.profile_enabled {
             session.profile.init_ns = t_init.elapsed().as_nanos();
+            session.profile.mem_backend = session.engine.mem_backend_name().to_owned();
+            session.profile.jit = session.engine.cpu_stats();
         }
         Ok(session)
+    }
+
+    /// Snapshot JIT/CPU stats + optional wall/CPU deltas into the profile.
+    ///
+    /// Called by micro runners after `run_until_stop` when profiling is enabled.
+    pub fn finalize_profile(&mut self, wall_ns: u128, cpu_user_us: u64, cpu_sys_us: u64) {
+        if !self.profile_enabled {
+            return;
+        }
+        self.profile.wall_ns = wall_ns;
+        self.profile.cpu_user_us = cpu_user_us;
+        self.profile.cpu_sys_us = cpu_sys_us;
+        self.profile.jit = self.engine.cpu_stats();
+        self.profile.mem_backend = self.engine.mem_backend_name().to_owned();
     }
 
     /// Returns the PE entry-point address associated with this session.

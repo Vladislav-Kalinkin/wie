@@ -16,6 +16,7 @@ mod regs;
 
 pub use iced_cpu::IcedCpu;
 pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
+pub use mem::{GuestMemBackend, GuestRegion, HashMapBackend, RegionKind, RegionTable, PAGE_SIZE};
 pub use regs::RegFile;
 
 /// Memory protection flags for [`CpuEngine::mem_map`] (r/w/x combined).
@@ -110,6 +111,25 @@ pub trait CpuEngine {
     /// No-op for non-JIT backends or when the block is not compilable.
     fn precompile_at(&mut self, _address: u64) {}
 
+    /// Snapshot of CPU/JIT diagnostics (empty for non-JIT backends).
+    fn cpu_stats(&self) -> Option<JitStats> {
+        None
+    }
+
+    /// Active guest memory storage backend name (`hash`, `mmap_page`, …).
+    fn mem_backend_name(&self) -> &'static str {
+        "hash"
+    }
+
+    /// Register a named guest VA region (stack, heap, image, …).
+    /// Used by the region table (Phase 1); no-op if the backend ignores it.
+    fn register_region(&mut self, _region: mem::GuestRegion) {}
+
+    /// Look up the named region containing `va`, if any.
+    fn find_region(&self, _va: u64) -> Option<mem::GuestRegion> {
+        None
+    }
+
     /// Run until a stop-bitmap hit, invalid memory, or instruction budget.
     ///
     /// # Errors
@@ -187,6 +207,18 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn precompile_at(&mut self, address: u64) {
         (**self).precompile_at(address);
+    }
+    fn cpu_stats(&self) -> Option<JitStats> {
+        (**self).cpu_stats()
+    }
+    fn mem_backend_name(&self) -> &'static str {
+        (**self).mem_backend_name()
+    }
+    fn register_region(&mut self, region: mem::GuestRegion) {
+        (**self).register_region(region);
+    }
+    fn find_region(&self, va: u64) -> Option<mem::GuestRegion> {
+        (**self).find_region(va)
     }
     fn run_until_stop(
         &mut self,

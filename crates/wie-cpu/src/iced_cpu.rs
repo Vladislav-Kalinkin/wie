@@ -2,7 +2,7 @@
 
 use crate::exec::{self, HookWindow, StepResult};
 // Re-export for JIT host-stop checks.
-use crate::mem::GuestMemory;
+use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
@@ -23,6 +23,8 @@ pub struct IcedCpu {
     rip_trace: [u64; RIP_TRACE_CAP],
     rip_trace_i: usize,
     rip_trace_n: usize,
+    /// Instructions retired via interpreter (Phase 0 baselines).
+    iced_steps: u64,
 }
 
 impl IcedCpu {
@@ -36,7 +38,14 @@ impl IcedCpu {
             rip_trace: [0; RIP_TRACE_CAP],
             rip_trace_i: 0,
             rip_trace_n: 0,
+            iced_steps: 0,
         }
+    }
+
+    /// Interpreter step counter (also used when JIT falls back to iced).
+    #[must_use]
+    pub fn iced_steps(&self) -> u64 {
+        self.iced_steps
     }
 
     fn push_rip_trace(&mut self, rip: u64) {
@@ -96,7 +105,11 @@ impl IcedCpu {
     pub(crate) fn step_once_result(&mut self) -> Result<StepResult, CpuError> {
         self.push_rip_trace(self.regs.rip);
         let hook = self.hooks.as_ref();
-        exec::step(&mut self.mem, &mut self.regs, hook)
+        let result = exec::step(&mut self.mem, &mut self.regs, hook)?;
+        if matches!(result, StepResult::Continue) {
+            self.iced_steps = self.iced_steps.saturating_add(1);
+        }
+        Ok(result)
     }
 
     /// Execute a single instruction at the current `RIP`.
@@ -128,6 +141,26 @@ impl CpuEngine for IcedCpu {
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         self.mem.read(address, bytes)
+    }
+
+    fn register_region(&mut self, region: GuestRegion) {
+        self.mem.register_region(region);
+    }
+
+    fn find_region(&self, va: u64) -> Option<GuestRegion> {
+        self.mem.find_region(va).cloned()
+    }
+
+    fn cpu_stats(&self) -> Option<crate::JitStats> {
+        // Pure iced backend: report step count in the shared stats shape.
+        Some(crate::JitStats {
+            iced_insns: self.iced_steps,
+            ..crate::JitStats::default()
+        })
+    }
+
+    fn mem_backend_name(&self) -> &'static str {
+        self.mem.backend_name()
     }
 
     fn install_runtime_hooks(
@@ -186,6 +219,7 @@ impl CpuEngine for IcedCpu {
             match exec::step(&mut self.mem, &mut self.regs, hook_ref) {
                 Ok(StepResult::Continue) => {
                     executed = executed.saturating_add(1);
+                    self.iced_steps = self.iced_steps.saturating_add(1);
                 }
                 Ok(StepResult::HostStop { address, size }) => {
                     return Ok(RunUntilHook {

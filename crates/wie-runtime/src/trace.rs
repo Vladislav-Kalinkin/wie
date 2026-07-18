@@ -166,11 +166,20 @@ pub fn run_micro_exe_with_root(
     max_api: usize,
     bottle_root: Option<std::path::PathBuf>,
 ) -> Result<MicroRunSummary> {
+    let wall_t0 = std::time::Instant::now();
+    let (cpu0_user, cpu0_sys) = wie_cpu::process_cpu_times_us();
     let mut session = RuntimeSession::new(path, wie_winapi::MessageQueueIdlePolicy::ExitOnIdle)?;
     session.set_bottle_root(bottle_root);
     let entry_point_va = session.entry_point_va();
     let initial_rsp = session.initial_rsp();
     let run = session.run_until_stop(max_api)?;
+    let wall_ns = wall_t0.elapsed().as_nanos();
+    let (cpu1_user, cpu1_sys) = wie_cpu::process_cpu_times_us();
+    let cpu_user_us = cpu1_user.saturating_sub(cpu0_user);
+    let cpu_sys_us = cpu1_sys.saturating_sub(cpu0_sys);
+    if session.profile_enabled() {
+        session.finalize_profile(wall_ns, cpu_user_us, cpu_sys_us);
+    }
     let profile = if session.profile_enabled() {
         Some(session.profile().clone())
     } else {

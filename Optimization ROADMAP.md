@@ -14,7 +14,7 @@ This roadmap outlines the planned evolution of WIE’s memory management, JIT op
 
 ---
 
-## Phase 0 – Baseline Measurement
+## Phase 0 – Baseline Measurement ✅
 
 **Goal:** Establish a performance baseline before any memory‑backend changes.
 
@@ -24,29 +24,38 @@ This roadmap outlines the planned evolution of WIE’s memory management, JIT op
 
 **DoD:** A documented table with per‑test numbers, highlighting how much CPU is theoretically addressable by each optimisation track.
 
+**Status (2026-07-18):** Done. Full tables and A–D attribution live in [`docs/phase0-baseline.md`](docs/phase0-baseline.md).  
+Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot finish it within the slice budget. Memory-helper call counts on current micros are tiny — Phase 2/4 memory work targets future memory-heavy guests, not pure loops. API-heavy micros spend wall in (C)/(D-init).
+
 ---
 
-## Phase 1 – Memory Abstraction
+## Phase 1 – Memory Abstraction ✅
 
-### 1.1 `GuestMemBackend` Trait
+### 1.1 `GuestMemBackend` Trait ✅
 
 - Split `crates/wie-cpu/src/mem.rs` into a backend trait and the existing `HashMap` implementation.
 - Keep behaviour **identical**; no functional changes.
 
 **DoD:** All tests pass; performance stays within noise.
 
-### 1.2 Region Registry
+**Status:** `GuestMemBackend` + `HashMapBackend` in `crates/wie-cpu/src/mem/`; `GuestMemory` facade unchanged for iced/JIT call sites.
+
+### 1.2 Region Registry ✅
 
 - Introduce a software `RegionTable` that tracks named ranges (stack, heap, image, fake API, TEB, etc.) with perms and optional host base.
 - This will be used by both `HashMap` and `mmap` backends.
 
 **DoD:** Layout ranges are registered at session start; `find_region(va)` returns the correct entry.
 
-### 1.3 Oracle Tests
+**Status:** `RegionTable` / `GuestRegion` / `RegionKind`; session `register_layout_regions` at init; `CpuEngine::{register_region, find_region}`.
+
+### 1.3 Oracle Tests ✅
 
 - Property‑based tests that compare `HashMap` vs. `mmap` backends byte‑for‑byte under random map/write/read operations.
 
 **DoD:** A test harness that can be run in CI (time‑budgeted).
+
+**Status:** `mem/oracle.rs` + test-only per-page `MmapPageBackend` (not Phase 2 arenas). Seeds: 2k ops + alt seeds; CI-friendly.
 
 ---
 

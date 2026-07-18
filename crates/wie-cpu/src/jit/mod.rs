@@ -142,7 +142,7 @@ impl UcrtImportIds {
     }
 }
 
-/// Lightweight counters for `WIE_CPU=jit` diagnostics.
+/// Lightweight counters for `WIE_CPU=jit` diagnostics / Phase 0 baselines.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JitStats {
     /// Instructions retired via native blocks.
@@ -155,6 +155,10 @@ pub struct JitStats {
     pub compile_skip: u64,
     /// Cache hits (native run).
     pub cache_hits: u64,
+    /// Calls into host `wie_jit_load` (TLB hit or miss).
+    pub load_calls: u64,
+    /// Calls into host `wie_jit_store` (TLB hit or miss).
+    pub store_calls: u64,
 }
 
 impl JitCpu {
@@ -190,6 +194,12 @@ impl JitCpu {
             shadow_sp: 0,
             shadow_ret: [0; lower::SHADOW_DEPTH],
         }
+    }
+
+    /// Snapshot of JIT diagnostics counters (Phase 0 baselines).
+    #[must_use]
+    pub fn stats(&self) -> JitStats {
+        self.stats
     }
 
     /// Install UCRT/heap fast-path config (called once after fake-API table build).
@@ -492,11 +502,15 @@ impl JitCpu {
             // 0 = Cranelift path (host falls back to full writeback);
             // trampolines OR their dirty bits; chain sets 0xffff.
             gpr_dirty_bits: 0,
+            load_calls: 0,
+            store_calls: 0,
         };
         // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
         unsafe {
             (meta.func)(std::ptr::from_mut(&mut ctx));
         }
+        self.stats.load_calls = self.stats.load_calls.saturating_add(ctx.load_calls);
+        self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
         // Persist multi-way TLB + sticky hot page + shadow stack across chained blocks.
         self.tlb_page = ctx.tlb_page;
         self.tlb_ptr = ctx.tlb_ptr;
@@ -828,6 +842,22 @@ impl CpuEngine for JitCpu {
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         self.iced.mem_read(address, bytes)
+    }
+
+    fn cpu_stats(&self) -> Option<crate::JitStats> {
+        Some(self.stats)
+    }
+
+    fn mem_backend_name(&self) -> &'static str {
+        self.iced.mem_backend_name()
+    }
+
+    fn register_region(&mut self, region: crate::mem::GuestRegion) {
+        self.iced.register_region(region);
+    }
+
+    fn find_region(&self, va: u64) -> Option<crate::mem::GuestRegion> {
+        self.iced.find_region(va)
     }
 
     fn install_runtime_hooks(
