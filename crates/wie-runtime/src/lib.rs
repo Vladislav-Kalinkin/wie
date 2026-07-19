@@ -10,6 +10,7 @@ mod guest_rewire;
 mod guest_stubs;
 mod hooks;
 mod memory;
+mod mt_runtime;
 mod session;
 mod trace;
 

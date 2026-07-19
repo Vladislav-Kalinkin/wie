@@ -15,6 +15,10 @@ const RIP_TRACE_MASK: usize = RIP_TRACE_CAP - 1;
 ///
 /// Universal PE64 backend — no app-specific shortcuts. Completeness grows with
 /// the implemented mnemonic set in [`crate::exec`].
+///
+/// # Safety / `Send`
+/// Guest memory arenas are process-private; MT.2 serializes access with a
+/// process mutex before moving the engine across host threads.
 pub struct IcedCpu {
     mem: GuestMemory,
     regs: RegFile,
@@ -146,6 +150,14 @@ impl CpuEngine for IcedCpu {
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         self.mem.read(address, bytes)
+    }
+
+    fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
+        self.mem.host_span(address, len, write)
+    }
+
+    fn mem_generation(&self) -> u64 {
+        self.mem.generation()
     }
 
     fn virtual_alloc(
@@ -404,5 +416,17 @@ impl CpuEngine for IcedCpu {
     }
     fn read_r12(&mut self) -> Result<u64, CpuError> {
         Ok(self.regs.gpr(12))
+    }
+
+    fn snapshot_thread_context(&mut self) -> crate::ThreadContext {
+        self.regs.snapshot()
+    }
+
+    fn restore_thread_context(&mut self, ctx: &crate::ThreadContext) {
+        self.regs.restore(ctx);
+    }
+
+    fn on_thread_switch(&mut self) {
+        // Interpreter has no sticky TLB/pins.
     }
 }

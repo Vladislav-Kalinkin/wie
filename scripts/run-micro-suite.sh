@@ -26,6 +26,18 @@ run_one() {
 
 # N1 — no bottle required
 run_one "$ROOT/micro-exes/out/process_ids.exe"
+run_one "$ROOT/micro-exes/out/tls_basic.exe"
+run_one "$ROOT/micro-exes/out/cs_reenter.exe"
+run_one "$ROOT/micro-exes/out/thread_create_join.exe"
+run_one "$ROOT/micro-exes/out/cs_two_threads.exe"
+run_one "$ROOT/micro-exes/out/event_handshake.exe"
+run_one "$ROOT/micro-exes/out/interlocked_basic.exe"
+# MT stress (Interlocked + CS + heap); gated so WIE_MT=0 still runs the rest.
+if [[ "${WIE_MT:-1}" != "0" ]]; then
+  run_one "$ROOT/micro-exes/out/mt_stress.exe"
+else
+  echo "--- skip mt_stress (WIE_MT=0) ---"
+fi
 run_one "$ROOT/micro-exes/out/heap_alloc.exe"
 run_one "$ROOT/micro-exes/out/heap_core.exe"
 run_one "$ROOT/micro-exes/out/winapi_heap.exe"

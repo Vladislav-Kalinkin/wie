@@ -1318,7 +1318,9 @@ pub fn dispatch_winapi_id(
             kernel32::handle_get_system_time_as_file_time(engine)
         }
         WinApiId::Kernel32Getcurrentprocessid => kernel32::handle_get_current_process_id(engine),
-        WinApiId::Kernel32Getcurrentthreadid => kernel32::handle_get_current_thread_id(engine),
+        WinApiId::Kernel32Getcurrentthreadid => {
+            kernel32::handle_get_current_thread_id(engine, state)
+        }
         WinApiId::Kernel32Gettickcount => kernel32::handle_get_tick_count(engine),
         WinApiId::Kernel32Queryperformancecounter => {
             kernel32::handle_query_performance_counter(engine)
@@ -1333,8 +1335,12 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Initializecriticalsection => {
             kernel32::handle_initialize_critical_section(engine)
         }
-        WinApiId::Kernel32Entercriticalsection => kernel32::handle_enter_critical_section(engine),
-        WinApiId::Kernel32Leavecriticalsection => kernel32::handle_leave_critical_section(engine),
+        WinApiId::Kernel32Entercriticalsection => {
+            kernel32::handle_enter_critical_section(engine, state)
+        }
+        WinApiId::Kernel32Leavecriticalsection => {
+            kernel32::handle_leave_critical_section(engine, state)
+        }
         WinApiId::Kernel32Deletecriticalsection => kernel32::handle_delete_critical_section(engine),
         WinApiId::Kernel32Flsalloc => kernel32::handle_fls_alloc(engine, state),
         WinApiId::Kernel32Flsfree => kernel32::handle_fls_free(engine, state),
@@ -1770,11 +1776,10 @@ impl WinApiId {
     #[must_use]
     pub const fn traits(self) -> WinApiTraits {
         match self {
+            // CS must hit host handlers (owner/recursion). No in-guest VoidRet
+            // and no fast_void_sync — those made Enter/Leave no-ops (MT.1).
             Self::Kernel32Entercriticalsection | Self::Kernel32Leavecriticalsection => {
-                WinApiTraits::EMPTY
-                    .with_noisy()
-                    .with_fast_void_sync()
-                    .with_guest_stub()
+                WinApiTraits::EMPTY.with_noisy()
             }
             // In-guest stubs / guest-accelerated (may still hit host fallback VAs).
             // Only APIs whose guest body matches Microsoft Learn + fixed WIE environment.

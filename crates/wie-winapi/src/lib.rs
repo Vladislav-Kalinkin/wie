@@ -9,6 +9,7 @@ pub mod comctl32;
 pub mod comdlg32;
 pub mod d3d9;
 pub mod dynamic_apis;
+pub use dynamic_apis::{DYNAMIC_FAKE_APIS, PREPLANTED_SOFT_APIS, resolve_get_proc_address};
 pub mod fake_va;
 pub mod gdi32;
 pub mod guest_heap;
@@ -17,11 +18,18 @@ mod guest_memory;
 mod guest_string;
 pub mod idle;
 pub mod kernel32;
+pub mod sync_obj;
+pub mod thread;
 pub mod ucrt;
 pub mod user32;
 pub mod uxtheme;
 pub mod winmm;
 pub use bottle::{bottle_root_from_env, guest_path_to_host};
+pub use sync_obj::{
+    CsWaitQueue, INFINITE, KernelObject, PendingSpawn, STILL_ACTIVE, SyncState, WAIT_FAILED,
+    WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
+};
+// HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
     COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
     SPECIAL_CALLBACK_RETURN, callback_return_trampoline_va, decode as decode_fake_va,
@@ -30,6 +38,7 @@ pub use fake_va::{
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};
 pub use kernel32::WinApiHandlerResult;
+pub use thread::{FIRST_WORKER_TID, GuestThread, PRIMARY_THREAD_ID, ThreadState};
 
 /// Runtime environment values visible to WinAPI handlers.
 #[derive(Debug, Clone, Copy)]
@@ -94,8 +103,15 @@ pub struct WinApiState {
     /// Guest full path of the main PE (`C:\App\…`).
     pub main_module_path: String,
 
-    /// Process TLS slots for `TlsAlloc` / `TlsGetValue` / `TlsSetValue`.
-    pub tls_slots: Vec<u64>,
+    /// Guest thread table + active TLS/TID (MT.0 / MT.1).
+    ///
+    /// TLS **indices** are process-wide; **values** live on
+    /// [`ThreadState::active`]. Prefer helpers on this field over ad-hoc TID
+    /// constants.
+    pub threads: ThreadState,
+
+    /// Kernel objects, CS wait queues, pending `CreateThread` spawns (MT.2/3).
+    pub sync: SyncState,
 
     /// Optional bottle root: guest `C:\…` maps to `{root}/drive_c/…` on the host.
     ///
@@ -659,6 +675,37 @@ pub enum WinApiControlSignal {
         /// Description of the pending guest callback.
         request: GuestCallbackRequest,
     },
+
+    /// Host thread must park (drop CPU lock) then retry / continue (MT.2/3).
+    #[error("host park: {reason:?}")]
+    HostPark {
+        /// Why the host thread is parking.
+        reason: HostParkReason,
+    },
+
+    /// Guest `ExitThread` — worker run loop should terminate this host thread.
+    #[error("exit thread code={code}")]
+    ExitThread {
+        /// Thread exit code.
+        code: u32,
+    },
+}
+
+/// Reason for [`WinApiControlSignal::HostPark`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostParkReason {
+    /// Waiting to enter critical section at guest VA.
+    CriticalSection {
+        /// Guest `RTL_CRITICAL_SECTION*`.
+        cs: u64,
+    },
+    /// `WaitForSingleObject` (or similar) on a kernel handle.
+    WaitObject {
+        /// Kernel handle.
+        handle: u64,
+        /// Timeout in ms (`INFINITE` = forever).
+        timeout_ms: u32,
+    },
 }
 
 mod dispatch_table;
@@ -699,6 +746,27 @@ mod tests {
         cpu.write_rsp(if rsp == 0 { STACK_TOP } else { rsp }).ok();
     }
 
+    fn default_env() -> WinApiEnvironment {
+        WinApiEnvironment {
+            image_base: 0x0000_0000_1400_0000,
+            command_line_a_ptr: 0,
+            command_line_w_ptr: 0,
+            environment_strings_w_ptr: 0,
+            module_file_name_a_ptr: 0,
+            module_file_name_w_ptr: 0,
+            process_heap_handle: 1,
+        }
+    }
+
+    /// Low 32 bits of RAX as signed LONG (Win64 return convention for Interlocked*).
+    fn rax_low_i32(rax: u64) -> i32 {
+        i32::from_le_bytes(
+            u32::try_from(rax & 0xffff_ffff)
+                .unwrap_or(0)
+                .to_le_bytes(),
+        )
+    }
+
     fn default_winapi_state() -> WinApiState {
         // Simplified default with a bump heap covering [0x2000, 0x10000).
         let mut heap = GuestHeap::new(0x2000, 0x10000);
@@ -725,7 +793,8 @@ mod tests {
             executable_file_bytes: Vec::new(),
             main_module_file_name: String::new(),
             main_module_path: String::new(),
-            tls_slots: Vec::new(),
+            threads: ThreadState::primary(),
+            sync: SyncState::new(),
             bottle_root: None,
             executable_file_cursor: 0,
             host_file_mounts: Vec::new(),
@@ -799,6 +868,108 @@ mod tests {
     }
 
     // --- Kernel32 ---
+
+    #[test]
+    fn test_critical_section_reenter_single_thread() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        // `test_engine` maps [0x1000, 0x101000); place CS there.
+        let cs = 0x3000_u64;
+        write_regs(&mut engine, cs, 0, 0, 0, 0);
+        kernel32::handle_initialize_critical_section(&mut engine).expect("init");
+        write_regs(&mut engine, cs, 0, 0, 0, 0);
+        kernel32::handle_enter_critical_section(&mut engine, &state).expect("enter1");
+        write_regs(&mut engine, cs, 0, 0, 0, 0);
+        kernel32::handle_enter_critical_section(&mut engine, &state).expect("enter2");
+        let mut rec = [0_u8; 4];
+        engine.mem_read(cs + 12, &mut rec).expect("read recursion");
+        assert_eq!(u32::from_le_bytes(rec), 2);
+        let mut owner = [0_u8; 8];
+        engine.mem_read(cs + 16, &mut owner).expect("read owner");
+        assert_eq!(u64::from_le_bytes(owner), u64::from(PRIMARY_THREAD_ID));
+        write_regs(&mut engine, cs, 0, 0, 0, 0);
+        kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave1");
+        write_regs(&mut engine, cs, 0, 0, 0, 0);
+        kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave2");
+        engine.mem_read(cs + 16, &mut owner).expect("read owner unlocked");
+        assert_eq!(u64::from_le_bytes(owner), 0);
+        assert_eq!(state.threads.current_tid(), PRIMARY_THREAD_ID);
+    }
+
+    #[test]
+    fn test_interlocked_ops_host_atomics() {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        let cell = 0x4000_u64;
+        // Zero cell.
+        engine.mem_write(cell, &0_i32.to_le_bytes()).expect("zero");
+
+        // Increment → 1
+        write_regs(&mut engine, cell, 0, 0, 0, 0);
+        let r = kernel32::dispatch_kernel32_extra(
+            &mut engine,
+            default_env(),
+            &mut state,
+            "InterlockedIncrement",
+        )
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(rax_low_i32(r.return_value), 1);
+
+        // ExchangeAdd(+5) returns previous 1, cell becomes 6
+        write_regs(&mut engine, cell, 5, 0, 0, 0);
+        let r = kernel32::dispatch_kernel32_extra(
+            &mut engine,
+            default_env(),
+            &mut state,
+            "InterlockedExchangeAdd",
+        )
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(rax_low_i32(r.return_value), 1);
+
+        // CompareExchange success 6→99
+        write_regs(&mut engine, cell, 99, 6, 0, 0);
+        let r = kernel32::dispatch_kernel32_extra(
+            &mut engine,
+            default_env(),
+            &mut state,
+            "InterlockedCompareExchange",
+        )
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(rax_low_i32(r.return_value), 6);
+
+        // CompareExchange fail (expect 6, still 99)
+        write_regs(&mut engine, cell, 1, 6, 0, 0);
+        let r = kernel32::dispatch_kernel32_extra(
+            &mut engine,
+            default_env(),
+            &mut state,
+            "InterlockedCompareExchange",
+        )
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(rax_low_i32(r.return_value), 99);
+
+        let mut bytes = [0_u8; 4];
+        engine.mem_read(cell, &mut bytes).expect("read");
+        assert_eq!(i32::from_le_bytes(bytes), 99);
+
+        // 64-bit Increment64
+        let cell64 = 0x4010_u64;
+        engine.mem_write(cell64, &10_i64.to_le_bytes()).expect("zero64");
+        write_regs(&mut engine, cell64, 0, 0, 0, 0);
+        let r = kernel32::dispatch_kernel32_extra(
+            &mut engine,
+            default_env(),
+            &mut state,
+            "InterlockedIncrement64",
+        )
+        .expect("dispatch")
+        .expect("handled");
+        assert_eq!(i64::from_le_bytes(r.return_value.to_le_bytes()), 11);
+    }
 
     #[test]
     fn test_free_library_valid_handle() {

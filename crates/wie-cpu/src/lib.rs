@@ -25,7 +25,7 @@ pub use mem::{
     MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun, PageState, RegionKind,
     RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
-pub use regs::RegFile;
+pub use regs::{RegFile, ThreadContext};
 
 /// Memory protection flags for [`CpuEngine::mem_map`] (Unicorn-compatible r/w/x bits).
 ///
@@ -90,7 +90,10 @@ pub struct RunUntilHook {
 /// Minimal CPU + guest memory surface used by WIE runtime and WinAPI.
 ///
 /// Object-safe so the session can hold `Box<dyn CpuEngine>`.
-pub trait CpuEngine {
+///
+/// `Send` is required so MT.2 can move a shared engine behind `Mutex` onto
+/// worker host threads (access is still serialized by that mutex).
+pub trait CpuEngine: Send {
     /// Map a guest VA range.
     ///
     /// # Errors
@@ -108,6 +111,22 @@ pub trait CpuEngine {
     /// # Errors
     /// Unmapped / backend read failure.
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError>;
+
+    /// Soft-translate a contiguous guest range to a host data pointer (MT.4).
+    ///
+    /// Used by `Interlocked*` (aligned host atomics) and bulk helpers. Returns
+    /// `None` when the range is unmapped, SPC denies the access, multi-arena,
+    /// or (for `write`) the span is executable (must go through store+SMC).
+    ///
+    /// Default: no host span (callers fall back to `mem_read` / `mem_write`).
+    fn host_span(&mut self, _address: u64, _len: usize, _write: bool) -> Option<*mut u8> {
+        None
+    }
+
+    /// Guest memory generation epoch (TLB / pin invalidation). Default `0`.
+    fn mem_generation(&self) -> u64 {
+        0
+    }
 
     /// Install persistent code + invalid-memory hooks for the fake-API range.
     ///
@@ -277,6 +296,23 @@ pub trait CpuEngine {
     fn read_rbx(&mut self) -> Result<u64, CpuError>;
     /// # Errors
     fn read_r12(&mut self) -> Result<u64, CpuError>;
+
+    /// Snapshot GPRs + XMM + RIP + RFLAGS for guest thread switch (MT.2).
+    ///
+    /// Default: empty context (backends that own a [`RegFile`] override).
+    fn snapshot_thread_context(&mut self) -> ThreadContext {
+        ThreadContext::new()
+    }
+
+    /// Restore a prior [`Self::snapshot_thread_context`] (MT.2).
+    fn restore_thread_context(&mut self, ctx: &ThreadContext) {
+        let _ = ctx;
+    }
+
+    /// Flush per-thread caches (JIT TLB / pins / shadow) after a context switch.
+    ///
+    /// No-op for pure interpreter backends.
+    fn on_thread_switch(&mut self) {}
 }
 
 impl CpuEngine for Box<dyn CpuEngine> {
@@ -288,6 +324,12 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         (**self).mem_read(address, bytes)
+    }
+    fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
+        (**self).host_span(address, len, write)
+    }
+    fn mem_generation(&self) -> u64 {
+        (**self).mem_generation()
     }
     fn virtual_alloc(
         &mut self,
@@ -405,6 +447,15 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn read_r12(&mut self) -> Result<u64, CpuError> {
         (**self).read_r12()
+    }
+    fn snapshot_thread_context(&mut self) -> ThreadContext {
+        (**self).snapshot_thread_context()
+    }
+    fn restore_thread_context(&mut self, ctx: &ThreadContext) {
+        (**self).restore_thread_context(ctx);
+    }
+    fn on_thread_switch(&mut self) {
+        (**self).on_thread_switch();
     }
 }
 

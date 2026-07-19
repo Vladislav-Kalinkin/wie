@@ -107,6 +107,10 @@ fn jit_chain_enabled() -> bool {
 }
 
 /// Hybrid CPU: Cranelift for hot pure-GPR blocks, iced for everything else.
+///
+/// Contains raw host pointers (TLB / pins) that are only valid while the
+/// process map is live. MT.2 moves the engine across host threads under a
+/// process mutex and calls [`CpuEngine::on_thread_switch`] on each switch.
 pub struct JitCpu {
     iced: IcedCpu,
     /// `None` if host ISA / JIT module failed to open (always fall back to iced).
@@ -143,6 +147,12 @@ pub struct JitCpu {
     /// Refcount = number of Ready blocks spanning that page (overlapping blocks).
     code_pages: HashMap<u64, u32>,
 }
+
+// SAFETY: TLB/pin raw pointers are non-owning views of guest mmap arenas.
+// WIE serializes all engine use with a process mutex under MT; thread switch
+// invalidates sticky translations via `on_thread_switch`.
+#[expect(unsafe_code)]
+unsafe impl Send for JitCpu {}
 
 enum CacheEntry {
     /// Native block ready to run.
@@ -1197,6 +1207,14 @@ impl CpuEngine for JitCpu {
         self.iced.mem_read(address, bytes)
     }
 
+    fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
+        self.iced.host_span(address, len, write)
+    }
+
+    fn mem_generation(&self) -> u64 {
+        self.iced.mem_generation()
+    }
+
     fn virtual_alloc(
         &mut self,
         addr: u64,
@@ -1506,6 +1524,20 @@ impl CpuEngine for JitCpu {
     }
     fn read_r12(&mut self) -> Result<u64, CpuError> {
         self.iced.read_r12()
+    }
+
+    fn snapshot_thread_context(&mut self) -> crate::ThreadContext {
+        self.iced.snapshot_thread_context()
+    }
+
+    fn restore_thread_context(&mut self, ctx: &crate::ThreadContext) {
+        self.iced.restore_thread_context(ctx);
+    }
+
+    fn on_thread_switch(&mut self) {
+        // Drop sticky translations that may reference another thread's stack pin.
+        self.invalidate_tlb();
+        self.invalidate_chain_and_shadow();
     }
 }
 

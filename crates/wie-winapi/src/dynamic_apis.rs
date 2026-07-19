@@ -15,6 +15,56 @@ pub struct DynamicFakeApi {
     pub name: &'static str,
 }
 
+/// Soft slots planted **first** into the runtime soft table (stable indices 0..N).
+///
+/// Used for exports that live only in `dispatch_kernel32_extra` (no dense
+/// `WinApiId`) so `GetProcAddress` can return a resolvable soft VA. Session
+/// bootstrap must [`crate`]-side intern these before PE IAT imports.
+///
+/// Order is ABI for `GetProcAddress` soft encoding — append only.
+pub const PREPLANTED_SOFT_APIS: &[DynamicFakeApi] = &[
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedIncrement",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedDecrement",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedExchange",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedCompareExchange",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedExchangeAdd",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedIncrement64",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedDecrement64",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedExchange64",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedCompareExchange64",
+    },
+    DynamicFakeApi {
+        library: "KERNEL32.dll",
+        name: "InterlockedExchangeAdd64",
+    },
+];
+
 /// Dynamic exports resolvable via `GetProcAddress` (generic PE64 + legacy apps).
 ///
 /// Order is stable; lookup is by `name` (case-insensitive).
@@ -141,6 +191,23 @@ pub fn resolve_get_proc_address(proc_name: &str) -> Option<u64> {
 
     if NULL_GET_PROC_NAMES.contains(&lower.as_str()) {
         return Some(0);
+    }
+
+    // Dense id exports first (EncodePointer, …).
+    if let Some(id) = resolve_winapi_id("KERNEL32.dll", proc_name) {
+        return Some(encode_export(id));
+    }
+    if let Some(id) = resolve_winapi_id("USER32.dll", proc_name) {
+        return Some(encode_export(id));
+    }
+
+    // Preplanted soft extras (Interlocked*, …) — indices match session plant order.
+    if let Some(idx) = PREPLANTED_SOFT_APIS
+        .iter()
+        .position(|e| e.name.eq_ignore_ascii_case(proc_name))
+    {
+        let idx_u16 = u16::try_from(idx).ok()?;
+        return Some(encode_unresolved(idx_u16));
     }
 
     DYNAMIC_FAKE_APIS

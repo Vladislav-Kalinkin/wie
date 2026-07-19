@@ -12,7 +12,6 @@ use std::path::Path;
 
 const FIXED_SYSTEM_FILETIME: u64 = 133_485_408_000_000_000;
 const FAKE_CURRENT_PROCESS_ID: u64 = 0x1234;
-const FAKE_CURRENT_THREAD_ID: u64 = 0x5678;
 const FIXED_TICK_COUNT: u64 = 12_345;
 const FIXED_PERFORMANCE_COUNTER: u64 = 1_000_000;
 const FLS_OUT_OF_INDEXES: u64 = 0xffff_ffff;
@@ -1121,16 +1120,21 @@ pub fn handle_get_current_process_id(
 }
 
 /// Handles `KERNEL32.dll!GetCurrentThreadId`.
+///
+/// Returns the active guest TID from [`crate::ThreadState`] (primary `0x5678`
+/// until MT.2 spawns workers).
 pub fn handle_get_current_thread_id(
     engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    let tid = u64::from(state.threads.current_tid());
     let return_address = engine
-        .return_from_win64_api(FAKE_CURRENT_THREAD_ID)
+        .return_from_win64_api(tid)
         .context("failed to return from GetCurrentThreadId")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: FAKE_CURRENT_THREAD_ID,
+        return_value: tid,
     })
 }
 
@@ -1345,13 +1349,32 @@ pub fn handle_initialize_critical_section(
     })
 }
 
-/// Handles `KERNEL32.dll!EnterCriticalSection`.
+/// Handles `KERNEL32.dll!EnterCriticalSection` (reentrant; blocks when needed).
+///
+/// Guest `RTL_CRITICAL_SECTION` layout (Win64) written by Initialize*:
+/// `LockCount` (-1 unlocked), `RecursionCount`, `OwningThread` (guest TID).
+///
+/// Contended path: returns [`crate::WinApiControlSignal::HostPark`] so the
+/// session drops the shared CPU lock and waits on the CS condvar (MT.3).
 pub fn handle_enter_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _critical_section_ptr = engine
+    let cs = engine
         .read_rcx()
         .context("failed to read RCX for EnterCriticalSection")?;
+
+    if cs != 0 {
+        match try_enter_critical_section_guest(engine, cs, state.threads.current_tid())? {
+            EnterCsResult::Acquired => {}
+            EnterCsResult::NeedPark => {
+                return Err(crate::WinApiControlSignal::HostPark {
+                    reason: crate::HostParkReason::CriticalSection { cs },
+                }
+                .into());
+            }
+        }
+    }
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -1366,10 +1389,21 @@ pub fn handle_enter_critical_section(
 /// Handles `KERNEL32.dll!LeaveCriticalSection`.
 pub fn handle_leave_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _critical_section_ptr = engine
+    let cs = engine
         .read_rcx()
         .context("failed to read RCX for LeaveCriticalSection")?;
+
+    if cs != 0 {
+        let unlocked = leave_critical_section_guest(engine, cs, state.threads.current_tid())?;
+        if unlocked {
+            // Wake one host waiter (if any) parked on this CS.
+            if let Some(q) = state.sync.cs_waiters.get(&cs) {
+                q.notify_one();
+            }
+        }
+    }
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -1382,12 +1416,19 @@ pub fn handle_leave_critical_section(
 }
 
 /// Handles `KERNEL32.dll!DeleteCriticalSection`.
+///
+/// Zeros the CS fields. Calling Delete while owned is undefined on Windows;
+/// we still clear so a subsequent Initialize can reuse the memory.
 pub fn handle_delete_critical_section(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
-    let _critical_section_ptr = engine
+    let cs = engine
         .read_rcx()
         .context("failed to read RCX for DeleteCriticalSection")?;
+
+    if cs != 0 {
+        write_critical_section_unlocked(engine, cs, 0)?;
+    }
 
     let return_address = engine
         .return_from_win64_api(0)
@@ -1397,6 +1438,88 @@ pub fn handle_delete_critical_section(
         return_address,
         return_value: 0,
     })
+}
+
+/// Result of a non-blocking CS enter attempt.
+enum EnterCsResult {
+    Acquired,
+    NeedPark,
+}
+
+/// Try enter (or re-enter) a guest critical section for `owner_tid`.
+fn try_enter_critical_section_guest(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    cs: u64,
+    owner_tid: u32,
+) -> Result<EnterCsResult> {
+    let lock_va = checked_field_address(cs, 8, "LockCount")?;
+    let recursion_va = checked_field_address(cs, 12, "RecursionCount")?;
+    let owner_va = checked_field_address(cs, 16, "OwningThread")?;
+
+    let owning = read_guest_u64(engine, owner_va).unwrap_or(0);
+    let me = u64::from(owner_tid);
+
+    // Unlocked or recursive re-enter by owner.
+    if owning == 0 || owning == me {
+        let recursion = if owning == 0 {
+            1_u32
+        } else {
+            let prev = read_guest_u32_cs(engine, recursion_va).unwrap_or(0);
+            prev.saturating_add(1)
+        };
+        let lock_count = if owning == 0 {
+            0_u32
+        } else {
+            let prev = read_guest_u32_cs(engine, lock_va).unwrap_or(0);
+            prev.saturating_add(1)
+        };
+        write_guest_u32(engine, lock_va, lock_count)?;
+        write_guest_u32(engine, recursion_va, recursion)?;
+        write_guest_u64(engine, owner_va, me)?;
+        return Ok(EnterCsResult::Acquired);
+    }
+
+    // Contended: park host (session waits on CS queue, then retries Enter).
+    Ok(EnterCsResult::NeedPark)
+}
+
+/// Leave a guest critical section owned by `owner_tid`.
+///
+/// Returns `true` if the CS became fully unlocked (wake one waiter).
+fn leave_critical_section_guest(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    cs: u64,
+    owner_tid: u32,
+) -> Result<bool> {
+    let lock_va = checked_field_address(cs, 8, "LockCount")?;
+    let recursion_va = checked_field_address(cs, 12, "RecursionCount")?;
+    let owner_va = checked_field_address(cs, 16, "OwningThread")?;
+
+    let owning = read_guest_u64(engine, owner_va).unwrap_or(0);
+    let me = u64::from(owner_tid);
+    if owning != me {
+        // Windows: leaving a CS you do not own is undefined; ignore.
+        return Ok(false);
+    }
+
+    let recursion = read_guest_u32_cs(engine, recursion_va).unwrap_or(1);
+    if recursion <= 1 {
+        write_guest_u32(engine, lock_va, u32::MAX)?; // -1 unlocked
+        write_guest_u32(engine, recursion_va, 0)?;
+        write_guest_u64(engine, owner_va, 0)?;
+        Ok(true)
+    } else {
+        let lock = read_guest_u32_cs(engine, lock_va).unwrap_or(1);
+        write_guest_u32(engine, lock_va, lock.saturating_sub(1))?;
+        write_guest_u32(engine, recursion_va, recursion.saturating_sub(1))?;
+        Ok(false)
+    }
+}
+
+fn read_guest_u32_cs(engine: &mut dyn wie_cpu::CpuEngine, va: u64) -> Option<u32> {
+    let mut b = [0_u8; 4];
+    engine.mem_read(va, &mut b).ok()?;
+    Some(u32::from_le_bytes(b))
 }
 
 /// Publish one FLS slot into the guest table used by in-guest `FlsGetValue`.
@@ -3006,6 +3129,10 @@ pub fn handle_close_handle(
         state.open_files.remove(&handle);
         state.last_error = 0;
         1
+    } else if state.sync.objects.remove(&handle).is_some() {
+        // Thread / event kernel handles (object may still be live via Arc).
+        state.last_error = 0;
+        1
     } else {
         // Console / module / other fake kernel objects: accept and no-op so
         // CRT and UI stubs that close non-file handles keep working.
@@ -4405,8 +4532,790 @@ pub fn dispatch_kernel32_extra(
         "tlssetvalue" => Ok(Some(handle_tls_set_value(engine, state)?)),
         "tlsalloc" => Ok(Some(handle_tls_alloc(engine, state)?)),
         "tlsfree" => Ok(Some(handle_tls_free(engine, state)?)),
+        // MT.2 / MT.3
+        "createthread" => Ok(Some(handle_create_thread(engine, state)?)),
+        "exitthread" => Ok(Some(handle_exit_thread(engine, state)?)),
+        "getexitcodethread" => Ok(Some(handle_get_exit_code_thread(engine, state)?)),
+        "waitforsingleobject" => Ok(Some(handle_wait_for_single_object(engine, state)?)),
+        "createeventa" | "createeventw" => Ok(Some(handle_create_event(engine, state)?)),
+        "setevent" => Ok(Some(handle_set_event(engine, state)?)),
+        "resetevent" => Ok(Some(handle_reset_event(engine, state)?)),
+        "getcurrentthread" => Ok(Some(handle_get_current_thread(engine)?)),
+        // MT.4 Interlocked* (host atomics on soft-translated guest memory)
+        "interlockedincrement" => Ok(Some(handle_interlocked_increment(engine)?)),
+        "interlockeddecrement" => Ok(Some(handle_interlocked_decrement(engine)?)),
+        "interlockedexchange" => Ok(Some(handle_interlocked_exchange(engine)?)),
+        "interlockedcompareexchange" => Ok(Some(handle_interlocked_compare_exchange(engine)?)),
+        "interlockedexchangeadd" => Ok(Some(handle_interlocked_exchange_add(engine)?)),
+        "interlockedincrement64" => Ok(Some(handle_interlocked_increment64(engine)?)),
+        "interlockeddecrement64" => Ok(Some(handle_interlocked_decrement64(engine)?)),
+        "interlockedexchange64" => Ok(Some(handle_interlocked_exchange64(engine)?)),
+        "interlockedcompareexchange64" => {
+            Ok(Some(handle_interlocked_compare_exchange64(engine)?))
+        }
+        "interlockedexchangeadd64" => Ok(Some(handle_interlocked_exchange_add64(engine)?)),
         _ => Ok(None),
     }
+}
+
+/// Default worker stack size (64 KiB) when `dwStackSize == 0`.
+const DEFAULT_WORKER_STACK: usize = 0x1_0000;
+/// Guest VA region for worker stacks (distinct from primary stack at 0x2000_0000).
+const WORKER_STACK_REGION_BASE: u64 = 0x0000_0000_2200_0000;
+const WORKER_STACK_STRIDE: u64 = 0x0000_0000_0020_0000;
+
+const CREATE_SUSPENDED: u32 = 0x4;
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const PAGE_READWRITE: u32 = 0x04;
+
+/// Default max guest worker threads (`CreateThread`), overridable by env.
+const DEFAULT_MT_MAX_THREADS: u32 = 64;
+
+/// `WIE_MT=0` kills multi-thread spawn (ST-only). Unset / other = enabled.
+fn mt_create_thread_enabled() -> bool {
+    !matches!(
+        std::env::var("WIE_MT"),
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+    )
+}
+
+/// Cap on live + pending worker TIDs (`WIE_MT_MAX_THREADS`, default 64).
+fn mt_max_worker_threads() -> u32 {
+    std::env::var("WIE_MT_MAX_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MT_MAX_THREADS)
+}
+
+// ─── MT.4 Interlocked* (host atomics on soft-translated memory) ─────────────
+
+/// Truncate a Win64 register operand to signed LONG (low 32 bits).
+#[inline]
+fn trunc_i32(reg: u64) -> i32 {
+    i32::from_le_bytes(u32::try_from(reg & 0xffff_ffff).unwrap_or(0).to_le_bytes())
+}
+
+/// Sign-extend LONG result into RAX (Windows x64 calling convention for LONG).
+#[inline]
+fn i32_to_rax(v: i32) -> u64 {
+    // Preserve full sign-extended bit pattern in the 64-bit register.
+    u64::from_le_bytes(i64::from(v).to_le_bytes())
+}
+
+/// Bitcast i64 result into RAX.
+#[inline]
+fn i64_to_rax(v: i64) -> u64 {
+    u64::from_le_bytes(v.to_le_bytes())
+}
+
+/// Perform an aligned `i32` RMW via host `AtomicI32` when soft-translate works;
+/// otherwise fall back to non-atomic mem_read/mem_write (correct under process
+/// engine lock; still used for unaligned / non-span cases).
+fn interlocked_i32(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    addr: u64,
+    op: impl FnOnce(&std::sync::atomic::AtomicI32) -> i32,
+    slow: impl FnOnce(i32) -> i32,
+) -> Result<i32> {
+    if addr == 0 {
+        anyhow::bail!("Interlocked* null destination");
+    }
+    // Fast path: 4-byte aligned host span → true host atomic (ARM LDXR/STXR).
+    if addr.is_multiple_of(4)
+        && let Some(host) = engine.host_span(addr, 4, true)
+    {
+        // SAFETY: host_span checked SPC+arena; guest VA alignment implies host
+        // alignment for soft-translate (offset preserved). Pointer lives while
+        // GuestMemory (engine) is borrowed exclusively here.
+        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI32>()) };
+        return Ok(op(atom));
+    }
+    // Slow path: emulate via ordinary guest load/store.
+    let mut bytes = [0_u8; 4];
+    engine
+        .mem_read(addr, &mut bytes)
+        .context("Interlocked* slow-path read")?;
+    let old = i32::from_le_bytes(bytes);
+    let new = slow(old);
+    engine
+        .mem_write(addr, &new.to_le_bytes())
+        .context("Interlocked* slow-path write")?;
+    Ok(new)
+}
+
+/// Like [`interlocked_i32`] but the return value may be the *previous* value
+/// (Exchange / ExchangeAdd / CompareExchange).
+fn interlocked_i32_prev(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    addr: u64,
+    op: impl FnOnce(&std::sync::atomic::AtomicI32) -> i32,
+    slow: impl FnOnce(i32) -> (i32 /*prev*/, i32 /*new*/),
+) -> Result<i32> {
+    if addr == 0 {
+        anyhow::bail!("Interlocked* null destination");
+    }
+    if addr.is_multiple_of(4)
+        && let Some(host) = engine.host_span(addr, 4, true)
+    {
+        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI32>()) };
+        return Ok(op(atom));
+    }
+    let mut bytes = [0_u8; 4];
+    engine
+        .mem_read(addr, &mut bytes)
+        .context("Interlocked* slow-path read")?;
+    let old = i32::from_le_bytes(bytes);
+    let (prev, new) = slow(old);
+    engine
+        .mem_write(addr, &new.to_le_bytes())
+        .context("Interlocked* slow-path write")?;
+    Ok(prev)
+}
+
+fn interlocked_i64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    addr: u64,
+    op: impl FnOnce(&std::sync::atomic::AtomicI64) -> i64,
+    slow: impl FnOnce(i64) -> i64,
+) -> Result<i64> {
+    if addr == 0 {
+        anyhow::bail!("Interlocked*64 null destination");
+    }
+    if addr.is_multiple_of(8)
+        && let Some(host) = engine.host_span(addr, 8, true)
+    {
+        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI64>()) };
+        return Ok(op(atom));
+    }
+    let mut bytes = [0_u8; 8];
+    engine
+        .mem_read(addr, &mut bytes)
+        .context("Interlocked*64 slow-path read")?;
+    let old = i64::from_le_bytes(bytes);
+    let new = slow(old);
+    engine
+        .mem_write(addr, &new.to_le_bytes())
+        .context("Interlocked*64 slow-path write")?;
+    Ok(new)
+}
+
+fn interlocked_i64_prev(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    addr: u64,
+    op: impl FnOnce(&std::sync::atomic::AtomicI64) -> i64,
+    slow: impl FnOnce(i64) -> (i64, i64),
+) -> Result<i64> {
+    if addr == 0 {
+        anyhow::bail!("Interlocked*64 null destination");
+    }
+    if addr.is_multiple_of(8)
+        && let Some(host) = engine.host_span(addr, 8, true)
+    {
+        #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+        let atom = unsafe { &*(host.cast::<std::sync::atomic::AtomicI64>()) };
+        return Ok(op(atom));
+    }
+    let mut bytes = [0_u8; 8];
+    engine
+        .mem_read(addr, &mut bytes)
+        .context("Interlocked*64 slow-path read")?;
+    let old = i64::from_le_bytes(bytes);
+    let (prev, new) = slow(old);
+    engine
+        .mem_write(addr, &new.to_le_bytes())
+        .context("Interlocked*64 slow-path write")?;
+    Ok(prev)
+}
+
+/// `InterlockedIncrement` — returns **new** value (Microsoft Learn).
+fn handle_interlocked_increment(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx().context("InterlockedIncrement RCX")?;
+    let new = interlocked_i32(
+        engine,
+        addr,
+        |a| a.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
+        |old| old.wrapping_add(1),
+    )?;
+    let return_address = engine.return_from_win64_api(i32_to_rax(new))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i32_to_rax(new),
+    })
+}
+
+/// `InterlockedDecrement` — returns **new** value.
+fn handle_interlocked_decrement(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx().context("InterlockedDecrement RCX")?;
+    let new = interlocked_i32(
+        engine,
+        addr,
+        |a| a.fetch_sub(1, Ordering::SeqCst).wrapping_sub(1),
+        |old| old.wrapping_sub(1),
+    )?;
+    let return_address = engine.return_from_win64_api(i32_to_rax(new))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i32_to_rax(new),
+    })
+}
+
+/// `InterlockedExchange` — returns **previous** value.
+fn handle_interlocked_exchange(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx().context("InterlockedExchange RCX")?;
+    // RDX carries the new LONG (low 32 bits).
+    let value = trunc_i32(engine.read_rdx()?);
+    let prev = interlocked_i32_prev(
+        engine,
+        addr,
+        |a| a.swap(value, Ordering::SeqCst),
+        |old| (old, value),
+    )?;
+    let return_address = engine.return_from_win64_api(i32_to_rax(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i32_to_rax(prev),
+    })
+}
+
+/// `InterlockedCompareExchange(dest, exchange, comparand)` — returns previous.
+///
+/// Win64: RCX=dest, RDX=exchange, R8=comparand.
+fn handle_interlocked_compare_exchange(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let exchange = trunc_i32(engine.read_rdx()?);
+    let comparand = trunc_i32(engine.read_r8()?);
+    let prev = interlocked_i32_prev(
+        engine,
+        addr,
+        |a| match a.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(v) | Err(v) => v,
+        },
+        |old| {
+            if old == comparand {
+                (old, exchange)
+            } else {
+                (old, old)
+            }
+        },
+    )?;
+    let return_address = engine.return_from_win64_api(i32_to_rax(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i32_to_rax(prev),
+    })
+}
+
+/// `InterlockedExchangeAdd` — returns **previous** value.
+fn handle_interlocked_exchange_add(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let addend = trunc_i32(engine.read_rdx()?);
+    let prev = interlocked_i32_prev(
+        engine,
+        addr,
+        |a| a.fetch_add(addend, Ordering::SeqCst),
+        |old| (old, old.wrapping_add(addend)),
+    )?;
+    let return_address = engine.return_from_win64_api(i32_to_rax(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i32_to_rax(prev),
+    })
+}
+
+fn handle_interlocked_increment64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let new = interlocked_i64(
+        engine,
+        addr,
+        |a| a.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
+        |old| old.wrapping_add(1),
+    )?;
+    let return_address = engine.return_from_win64_api(i64_to_rax(new))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i64_to_rax(new),
+    })
+}
+
+fn handle_interlocked_decrement64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let new = interlocked_i64(
+        engine,
+        addr,
+        |a| a.fetch_sub(1, Ordering::SeqCst).wrapping_sub(1),
+        |old| old.wrapping_sub(1),
+    )?;
+    let return_address = engine.return_from_win64_api(i64_to_rax(new))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i64_to_rax(new),
+    })
+}
+
+fn handle_interlocked_exchange64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let value = i64::from_le_bytes(engine.read_rdx()?.to_le_bytes());
+    let prev = interlocked_i64_prev(
+        engine,
+        addr,
+        |a| a.swap(value, Ordering::SeqCst),
+        |old| (old, value),
+    )?;
+    let return_address = engine.return_from_win64_api(i64_to_rax(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i64_to_rax(prev),
+    })
+}
+
+/// `InterlockedCompareExchange64(dest, exchange, comparand)`.
+///
+/// Win64: RCX=dest, RDX=exchange, R8=comparand (all 64-bit).
+fn handle_interlocked_compare_exchange64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let exchange = i64::from_le_bytes(engine.read_rdx()?.to_le_bytes());
+    let comparand = i64::from_le_bytes(engine.read_r8()?.to_le_bytes());
+    let prev = interlocked_i64_prev(
+        engine,
+        addr,
+        |a| match a.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(v) | Err(v) => v,
+        },
+        |old| {
+            if old == comparand {
+                (old, exchange)
+            } else {
+                (old, old)
+            }
+        },
+    )?;
+    let return_address = engine.return_from_win64_api(i64_to_rax(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i64_to_rax(prev),
+    })
+}
+
+fn handle_interlocked_exchange_add64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    use std::sync::atomic::Ordering;
+    let addr = engine.read_rcx()?;
+    let addend = i64::from_le_bytes(engine.read_rdx()?.to_le_bytes());
+    let prev = interlocked_i64_prev(
+        engine,
+        addr,
+        |a| a.fetch_add(addend, Ordering::SeqCst),
+        |old| (old, old.wrapping_add(addend)),
+    )?;
+    let return_address = engine.return_from_win64_api(i64_to_rax(prev))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: i64_to_rax(prev),
+    })
+}
+
+/// `CreateThread` — allocate stack/TID/handle and queue a host spawn (MT.2).
+fn handle_create_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _security = engine.read_rcx()?;
+    let stack_size_raw = engine.read_rdx()?;
+    let start = engine.read_r8()?;
+    let param = engine.read_r9()?;
+    let flags = read_create_file_stack_u32(engine, 0x28).unwrap_or(0);
+    let tid_out = read_stack_u64(engine, 0x30).unwrap_or(0);
+
+    if !mt_create_thread_enabled() {
+        state.last_error = ERROR_NOT_SUPPORTED_MT;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    if start == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // Cap workers: by_tid includes primary, so workers = len - 1 + pending.
+    let live_workers = state
+        .threads
+        .by_tid
+        .len()
+        .saturating_sub(1)
+        .saturating_add(state.sync.pending_spawns.len());
+    let max = usize::try_from(mt_max_worker_threads()).unwrap_or(64);
+    if live_workers >= max {
+        state.last_error = ERROR_NOT_ENOUGH_MEMORY;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    if (flags & CREATE_SUSPENDED) != 0 {
+        // Suspended create not required for MT.2 micros; refuse cleanly.
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    let stack_size = if stack_size_raw == 0 {
+        DEFAULT_WORKER_STACK
+    } else {
+        usize::try_from(stack_size_raw).unwrap_or(DEFAULT_WORKER_STACK)
+    };
+    // Align up to page.
+    let stack_size = stack_size.saturating_add(0xfff) & !0xfff;
+    let stack_size = stack_size.max(0x1000);
+
+    let slot = state.sync.next_stack_slot;
+    state.sync.next_stack_slot = slot.saturating_add(1);
+    let stack_base = WORKER_STACK_REGION_BASE
+        .saturating_add(u64::from(slot).saturating_mul(WORKER_STACK_STRIDE));
+
+    let alloc = engine.virtual_alloc(
+        stack_base,
+        stack_size,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+    );
+    let stack_base = if let Ok(va) = alloc {
+        va
+    } else {
+        // Fallback: map with mem_map if VirtualAlloc path rejects fixed VA.
+        if engine
+            .mem_map(
+                stack_base,
+                stack_size,
+                wie_cpu::perm::READ | wie_cpu::perm::WRITE,
+            )
+            .is_err()
+        {
+            state.last_error = ERROR_NOT_ENOUGH_MEMORY;
+            let return_address = engine.return_from_win64_api(0)?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            });
+        }
+        stack_base
+    };
+
+    let stack_top = stack_base.saturating_add(u64::try_from(stack_size).unwrap_or(0));
+    let aligned_top = stack_top & !0xF_u64;
+    // At ThreadProc entry: [RSP]=retaddr, RSP%16==8 (as after CALL).
+    let entry_rsp = aligned_top.saturating_sub(8);
+    // Dummy return address (worker must ExitThread; returning faults).
+    drop(engine.mem_write(entry_rsp, &0_u64.to_le_bytes()));
+
+    let tid = state.threads.alloc_worker();
+    let mut ctx = wie_cpu::ThreadContext::new();
+    // RCX = lpParameter, RSP = entry, RIP = start
+    if let Some(slot) = ctx.gpr.get_mut(1) {
+        *slot = param;
+    }
+    if let Some(slot) = ctx.gpr.get_mut(4) {
+        *slot = entry_rsp;
+    }
+    ctx.rip = start;
+
+    let (handle, _obj) = state.sync.register_thread(tid, ctx);
+    state.sync.pending_spawns.push(crate::PendingSpawn {
+        tid,
+        handle,
+        start_address: start,
+        parameter: param,
+        stack_base,
+        stack_size,
+    });
+
+    if tid_out != 0 {
+        drop(engine.mem_write(tid_out, &tid.to_le_bytes()));
+    }
+
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+/// `ERROR_NOT_SUPPORTED` — used when `WIE_MT=0` refuses `CreateThread`.
+const ERROR_NOT_SUPPORTED_MT: u32 = 50;
+
+fn read_stack_u64(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Result<u64> {
+    let rsp = engine.read_rsp()?;
+    let address = rsp
+        .checked_add(offset)
+        .context("stack arg address overflow")?;
+    let mut bytes = [0_u8; 8];
+    engine.mem_read(address, &mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// `ExitThread` — mark thread finished and signal worker loop to stop.
+fn handle_exit_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let code_raw = engine.read_rcx()?;
+    let code = u32::try_from(code_raw & u64::from(u32::MAX)).unwrap_or(0);
+    let tid = state.threads.current_tid();
+    // Find thread object by tid.
+    for obj in state.sync.objects.values() {
+        if let crate::KernelObject::Thread(t) = obj
+            && t.tid == tid
+        {
+            t.finish(code);
+            break;
+        }
+    }
+    // Primary ExitThread: treat as process exit of this code for simplicity.
+    if tid == crate::PRIMARY_THREAD_ID {
+        // Still return control signal so runtime can tear down.
+        return Err(crate::WinApiControlSignal::ExitThread { code }.into());
+    }
+    Err(crate::WinApiControlSignal::ExitThread { code }.into())
+}
+
+/// `GetExitCodeThread`.
+fn handle_get_exit_code_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let out_ptr = engine.read_rdx()?;
+    let code = if let Some(t) = state.sync.thread_by_handle(handle) {
+        t.exit_code
+            .load(std::sync::atomic::Ordering::Acquire)
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    };
+    if out_ptr != 0 {
+        drop(engine.mem_write(out_ptr, &code.to_le_bytes()));
+    }
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// `WaitForSingleObject` — thread or event (MT.2/3).
+fn handle_wait_for_single_object(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let timeout_raw = engine.read_rdx()?;
+    let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
+
+    // Fast path: already signaled — no park.
+    match state.sync.object(handle) {
+        Some(crate::KernelObject::Thread(t)) => {
+            if t.is_finished() {
+                state.last_error = 0;
+                let return_address =
+                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: u64::from(crate::WAIT_OBJECT_0),
+                });
+            }
+        }
+        Some(crate::KernelObject::Event(e)) => {
+            // Non-blocking check
+            if e.wait(0) {
+                state.last_error = 0;
+                let return_address =
+                    engine.return_from_win64_api(u64::from(crate::WAIT_OBJECT_0))?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: u64::from(crate::WAIT_OBJECT_0),
+                });
+            }
+        }
+        None => {
+            state.last_error = ERROR_INVALID_HANDLE;
+            let return_address = engine.return_from_win64_api(u64::from(crate::WAIT_FAILED))?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: u64::from(crate::WAIT_FAILED),
+            });
+        }
+    }
+
+    // Need to park host (drop CPU) then wait.
+    Err(crate::WinApiControlSignal::HostPark {
+        reason: crate::HostParkReason::WaitObject {
+            handle,
+            timeout_ms,
+        },
+    }
+    .into())
+}
+
+/// Resolve a waitable handle to a detachable target (wait **outside** process locks).
+pub fn resolve_wait_target(
+    state: &WinApiState,
+    handle: u64,
+) -> Option<crate::sync_obj::WaitTarget> {
+    state.sync.wait_target(handle)
+}
+
+/// Clone the CS wait queue for parking **outside** process locks.
+pub fn resolve_cs_queue(
+    state: &mut WinApiState,
+    cs: u64,
+) -> std::sync::Arc<crate::sync_obj::CsWaitQueue> {
+    state.sync.cs_queue(cs)
+}
+
+/// `CreateEventA/W`.
+fn handle_create_event(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _security = engine.read_rcx()?;
+    let manual = engine.read_rdx()? != 0;
+    let initial = engine.read_r8()? != 0;
+    let _name = engine.read_r9()?; // named events: ignore (anonymous only)
+
+    let (handle, _) = state.sync.register_event(manual, initial);
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(handle)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: handle,
+    })
+}
+
+/// `SetEvent`.
+fn handle_set_event(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let ok = match state.sync.object(handle) {
+        Some(crate::KernelObject::Event(e)) => {
+            e.set();
+            true
+        }
+        _ => false,
+    };
+    if ok {
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        })
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        })
+    }
+}
+
+/// `ResetEvent`.
+fn handle_reset_event(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let ok = match state.sync.object(handle) {
+        Some(crate::KernelObject::Event(e)) => {
+            e.reset();
+            true
+        }
+        _ => false,
+    };
+    if ok {
+        state.last_error = 0;
+        let return_address = engine.return_from_win64_api(1)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 1,
+        })
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        })
+    }
+}
+
+/// `GetCurrentThread` — pseudo-handle `-2` (Microsoft Learn).
+fn handle_get_current_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    // CURRENT_THREAD_PSEUDO_HANDLE = (HANDLE)-2
+    let return_value = u64::MAX - 1;
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
 }
 
 /// `FlushInstructionCache(hProcess, lpBaseAddress, dwSize)`.
@@ -4614,9 +5523,23 @@ fn handle_tls_get_value(
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let index = engine.read_rcx()? & 0xffff_ffff;
+    let idx = usize::try_from(index).unwrap_or(usize::MAX);
+    // Microsoft: invalid index → 0 and last-error ERROR_INVALID_PARAMETER (87).
+    let allocated = usize::try_from(state.threads.tls_index_count).unwrap_or(0);
+    if idx >= allocated {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+    state.threads.grow_active_tls_to_process_count();
     let value = state
-        .tls_slots
-        .get(usize::try_from(index).unwrap_or(usize::MAX))
+        .threads
+        .active
+        .tls_values
+        .get(idx)
         .copied()
         .unwrap_or(0);
     state.last_error = 0;
@@ -4634,10 +5557,17 @@ fn handle_tls_set_value(
     let index = engine.read_rcx()? & 0xffff_ffff;
     let value = engine.read_rdx()?;
     let idx = usize::try_from(index).unwrap_or(usize::MAX);
-    if idx >= state.tls_slots.len() {
-        state.tls_slots.resize(idx.saturating_add(1), 0);
+    let allocated = usize::try_from(state.threads.tls_index_count).unwrap_or(0);
+    if idx >= allocated {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
     }
-    if let Some(slot) = state.tls_slots.get_mut(idx) {
+    state.threads.grow_active_tls_to_process_count();
+    if let Some(slot) = state.threads.active.tls_values.get_mut(idx) {
         *slot = value;
         state.last_error = 0;
         let return_address = engine.return_from_win64_api(1)?;
@@ -4658,8 +5588,10 @@ fn handle_tls_alloc(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let index = u64::try_from(state.tls_slots.len()).unwrap_or(u64::MAX);
-    state.tls_slots.push(0);
+    // Process-wide index space; value storage is per active guest thread.
+    let index = u64::from(state.threads.tls_index_count);
+    state.threads.tls_index_count = state.threads.tls_index_count.saturating_add(1);
+    state.threads.grow_active_tls_to_process_count();
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(index)?;
     Ok(WinApiHandlerResult {
@@ -4674,7 +5606,9 @@ fn handle_tls_free(
 ) -> Result<WinApiHandlerResult> {
     let index_raw = engine.read_rcx()?;
     let index = usize::try_from(index_raw).unwrap_or(usize::MAX);
-    if let Some(slot) = state.tls_slots.get_mut(index) {
+    // Clear active thread value; index remains allocated (Windows does not reuse
+    // TLS indices after TlsFree in a way micros depend on — zero is enough).
+    if let Some(slot) = state.threads.active.tls_values.get_mut(index) {
         *slot = 0;
     }
     state.last_error = 0;

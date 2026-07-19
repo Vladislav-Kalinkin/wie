@@ -25,12 +25,15 @@ One-page playbook for regressions after Phases 0–7 and the **great cleanup** (
 | TLB Neon issues on aarch64 | `WIE_TLB_NEON=0` |
 | Host mprotect noise / faults | `WIE_MPROTECT=0` (SPC still enforces) |
 | Heap freelist suspicion | `WIE_GUEST_HEAP=0` (host freelist only; default) |
+| Hang on Wait / CS under MT | See [`mt-threads.md`](mt-threads.md); `ExitProcess` wakes waiters; check peer never signals |
+| `CreateThread` fails | Unset `WIE_MT=0`; raise `WIE_MT_MAX_THREADS` (default 64) |
+| Interlocked wrong | Expect host atomics via soft-translate; try `WIE_CPU=iced` |
 
 ## Regression matrix
 
 ```bash
 cargo build -p wie-cli --release
-./scripts/run-micro-suite.sh                 # mmap + jit
+./scripts/run-micro-suite.sh                 # mmap + jit (+ MT micros)
 WIE_CPU=iced   ./scripts/run-micro-suite.sh
 WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
 WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh
@@ -52,6 +55,7 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/long_loop.exe
 | Code invalidation | [`phase4-code-invalidation.md`](phase4-code-invalidation.md) |
 | Memory backends (historical) | [`phase2-mmap-backend.md`](phase2-mmap-backend.md) |
 | Full roadmap | [`../Optimization ROADMAP.md`](../Optimization%20ROADMAP.md) |
+| Multithreading | [`mt-threads.md`](mt-threads.md) |
 
 ## Non-goals of this sheet
 

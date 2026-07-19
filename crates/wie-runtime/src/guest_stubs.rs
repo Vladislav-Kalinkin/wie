@@ -403,12 +403,7 @@ pub(crate) fn classify_guest_stub(
     if n.eq_ignore_ascii_case("EncodePointer") || n.eq_ignore_ascii_case("DecodePointer") {
         return Some(GuestStubKind::IdentityRcxToRax);
     }
-    if n.eq_ignore_ascii_case("EnterCriticalSection")
-        || n.eq_ignore_ascii_case("LeaveCriticalSection")
-        || n.eq_ignore_ascii_case("DeleteCriticalSection")
-    {
-        return Some(GuestStubKind::VoidRet);
-    }
+    // Enter/Leave/DeleteCriticalSection: host only (MT.1 real owner/recursion).
     // InitializeCriticalSection* stays on host (writes RTL_CRITICAL_SECTION).
     if n.eq_ignore_ascii_case("GetLastError") {
         return Some(GuestStubKind::LoadZx32FromVa(TEB_LAST_ERROR_VA));
@@ -441,8 +436,10 @@ pub(crate) fn classify_guest_stub(
     if n.eq_ignore_ascii_case("GetCurrentProcessId") {
         return Some(GuestStubKind::ReturnImm32(0x1234));
     }
+    // Primary TID is fixed (`PRIMARY_THREAD_ID` / 0x5678). Host path reads
+    // ThreadState when the stub is not planted (workers in MT.2).
     if n.eq_ignore_ascii_case("GetCurrentThreadId") {
-        return Some(GuestStubKind::ReturnImm32(0x5678));
+        return Some(GuestStubKind::ReturnImm32(wie_winapi::PRIMARY_THREAD_ID));
     }
     if n.eq_ignore_ascii_case("IsDebuggerPresent") {
         return Some(GuestStubKind::ReturnZero);
@@ -695,5 +692,9 @@ mod tests {
         assert!(classify_guest_stub("KERNEL32.dll", "VirtualProtect", &cfg).is_none());
         assert!(classify_guest_stub("KERNEL32.dll", "VirtualQuery", &cfg).is_none());
         assert!(classify_guest_stub("KERNEL32.dll", "LocalAlloc", &cfg).is_none());
+        // MT.1: CS must not be VoidRet guest stubs.
+        assert!(classify_guest_stub("KERNEL32.dll", "EnterCriticalSection", &cfg).is_none());
+        assert!(classify_guest_stub("KERNEL32.dll", "LeaveCriticalSection", &cfg).is_none());
+        assert!(classify_guest_stub("KERNEL32.dll", "DeleteCriticalSection", &cfg).is_none());
     }
 }

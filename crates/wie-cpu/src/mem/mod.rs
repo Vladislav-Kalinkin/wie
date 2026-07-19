@@ -8,6 +8,8 @@
 //! - [`PageMap`] / [`protect`] — Windows page state + software permission checks
 //! - [`GuestMemory`] — facade used by iced/JIT (SPC on read/write/fetch)
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 mod arena;
 mod backend;
 mod mmap_arena;
@@ -106,7 +108,10 @@ pub(crate) struct GuestMemory {
     pages: PageMap,
     vad: VadTable,
     /// Bumped when protect/commit/release change; JIT flushes TLB on change (Phase 3+).
-    generation: u64,
+    ///
+    /// `AtomicU64` so concurrent readers (MT.4 prep) can observe generation with
+    /// acquire loads while structural writers bump under the process map lock.
+    generation: AtomicU64,
     /// Guest **page keys** (`va >> 12`) touched by successful stores this slice.
     ///
     /// Phase 4.x: drained by `JitCpu` at safe points. Must **not** be a single
@@ -130,7 +135,10 @@ impl std::fmt::Debug for GuestMemory {
             .field("regions", &self.regions.len())
             .field("page_runs", &self.pages.run_count())
             .field("vad", &self.vad.len())
-            .field("generation", &self.generation)
+            .field(
+                "generation",
+                &self.generation.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -144,7 +152,7 @@ impl GuestMemory {
             regions: RegionTable::new(),
             pages: PageMap::new(),
             vad: VadTable::new(),
-            generation: 0,
+            generation: AtomicU64::new(0),
             pending_write_pages: Vec::new(),
             pending_write_overflow: false,
         }
@@ -154,13 +162,26 @@ impl GuestMemory {
         self.backend.name()
     }
 
-    /// Monotonic generation for TLB / pin invalidation (Phase 4).
+    /// Monotonic generation for TLB / pin invalidation (Phase 4 / MT.4).
     ///
-    /// Bumped on map / protect / commit / decommit / release. JIT TLB and future
+    /// Bumped on map / protect / commit / decommit / release. JIT TLB and
     /// region pins store this value at install time and miss when it diverges.
+    /// Acquire load pairs with release bumps so concurrent threads see a
+    /// consistent metadata epoch (even while guest execute is still process-locked).
     #[must_use]
     pub(crate) fn generation(&self) -> u64 {
-        self.generation
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Bump the memory generation (release store for MT.4 visibility).
+    #[inline]
+    fn bump_generation(&self) {
+        // Saturating add without wrapping forever in pathological cases.
+        let _ = self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+                Some(g.saturating_add(1))
+            });
     }
 
     /// Full VAD allocation span when `addr` is an allocation base (`MEM_RELEASE`).
@@ -255,7 +276,7 @@ impl GuestMemory {
             host_base,
             allow_r,
             allow_w,
-            generation: self.generation,
+            generation: self.generation(),
         })
     }
 
@@ -323,7 +344,7 @@ impl GuestMemory {
                 owns_host: true,
             })?;
         }
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         // Backfill host_base for regions already registered that this map covers.
         if let Some(hb) = self.backend.arena_host_base_for_va(address) {
             self.regions.set_host_base_if_covers(address, hb);
@@ -411,7 +432,7 @@ impl GuestMemory {
 
         self.pages
             .set_range(page_base, size_usize, PageState::Committed, new_protect)?;
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         self.sync_host_protect(page_base, size_usize);
         Ok(old_protect)
     }
@@ -734,7 +755,7 @@ impl GuestMemory {
             mem_type: MemType::Private,
             owns_host: true,
         })?;
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         Ok(base)
     }
 
@@ -760,7 +781,7 @@ impl GuestMemory {
             mem_type: MemType::Private,
             owns_host: true,
         })?;
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         Ok(base)
     }
 
@@ -837,7 +858,7 @@ impl GuestMemory {
         }
         self.pages
             .set_range(page_base, size_usize, PageState::Committed, protect)?;
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         Ok(page_base)
     }
 
@@ -901,7 +922,7 @@ impl GuestMemory {
             PageState::Reserved,
             protect::PAGE_NOACCESS,
         )?;
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         Ok(())
     }
 
@@ -917,7 +938,7 @@ impl GuestMemory {
             .set_range(node.allocation_base, size_usize, PageState::Free, 0)?;
         let _ = self.vad.remove_base(addr);
         self.backend.unmap_range(node.allocation_base, size_usize);
-        self.generation = self.generation.saturating_add(1);
+        self.bump_generation();
         Ok(())
     }
 
@@ -1163,7 +1184,7 @@ impl GuestMemory {
             host,
             allow_r: meta.allow_r,
             allow_w: meta.allow_w,
-            generation: self.generation,
+            generation: self.generation(),
         })
     }
 
@@ -1176,7 +1197,7 @@ impl GuestMemory {
             host,
             allow_r: meta.allow_r,
             allow_w: meta.allow_w,
-            generation: self.generation,
+            generation: self.generation(),
         })
     }
 

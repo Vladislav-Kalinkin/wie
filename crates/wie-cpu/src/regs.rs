@@ -19,6 +19,41 @@ pub(crate) mod rflags {
     pub(crate) const DEFAULT: u64 = ALWAYS1 | IF;
 }
 
+/// Portable snapshot of architectural CPU state for guest thread switch (MT.2).
+///
+/// Used when multiple host threads serialize on one shared [`crate::CpuEngine`]:
+/// each guest thread parks its regs here while another runs.
+#[derive(Debug, Clone)]
+pub struct ThreadContext {
+    /// RAX..R15.
+    pub gpr: [u64; 16],
+    /// XMM0..XMM15.
+    pub xmm: [u128; 16],
+    /// Instruction pointer.
+    pub rip: u64,
+    /// RFLAGS (includes reserved bit 1).
+    pub rflags: u64,
+}
+
+impl Default for ThreadContext {
+    fn default() -> Self {
+        Self {
+            gpr: [0; 16],
+            xmm: [0; 16],
+            rip: 0,
+            rflags: rflags::DEFAULT,
+        }
+    }
+}
+
+impl ThreadContext {
+    /// Fresh context with default RFLAGS (IF + reserved bit 1).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// General-purpose register file + XMM + RIP + RFLAGS (64-bit mode only).
 #[derive(Debug, Clone)]
 pub struct RegFile {
@@ -47,6 +82,25 @@ impl RegFile {
         Self::default()
     }
 
+    /// Export a full architectural snapshot (MT thread switch).
+    #[must_use]
+    pub fn snapshot(&self) -> ThreadContext {
+        ThreadContext {
+            gpr: self.gpr,
+            xmm: self.xmm,
+            rip: self.rip,
+            rflags: self.rflags,
+        }
+    }
+
+    /// Restore a full architectural snapshot (MT thread switch).
+    pub fn restore(&mut self, ctx: &ThreadContext) {
+        self.gpr = ctx.gpr;
+        self.xmm = ctx.xmm;
+        self.rip = ctx.rip;
+        self.rflags = ctx.rflags;
+    }
+
     #[must_use]
     pub fn gpr(&self, idx: usize) -> u64 {
         self.gpr.get(idx).copied().unwrap_or(0)
@@ -56,6 +110,11 @@ impl RegFile {
         if let Some(slot) = self.gpr.get_mut(idx) {
             *slot = value;
         }
+    }
+
+    /// Public GPR write for MT bootstrap (thread start RCX/RSP/…).
+    pub fn set_gpr_public(&mut self, idx: usize, value: u64) {
+        self.set_gpr(idx, value);
     }
 
     #[must_use]

@@ -10,9 +10,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -31,6 +31,13 @@ cpu_string: $(OUT)/cpu_string.exe
 cpu_fp: $(OUT)/cpu_fp.exe
 winapi_heap: $(OUT)/winapi_heap.exe
 cli_args: $(OUT)/cli_args.exe
+tls_basic: $(OUT)/tls_basic.exe
+cs_reenter: $(OUT)/cs_reenter.exe
+thread_create_join: $(OUT)/thread_create_join.exe
+cs_two_threads: $(OUT)/cs_two_threads.exe
+event_handshake: $(OUT)/event_handshake.exe
+interlocked_basic: $(OUT)/interlocked_basic.exe
+mt_stress: $(OUT)/mt_stress.exe
 
 $(OUT)/heap_alloc.exe: heap_alloc/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
@@ -88,6 +95,34 @@ $(OUT)/winapi_heap.exe: winapi_heap/main.c | $(OUT)
 
 $(OUT)/cli_args.exe: cli_args/main.c cli_args/parse.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ cli_args/main.c cli_args/parse.c -lkernel32
+	@echo "built $@"
+
+$(OUT)/tls_basic.exe: tls_basic/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/cs_reenter.exe: cs_reenter/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/thread_create_join.exe: thread_create_join/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/cs_two_threads.exe: cs_two_threads/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/event_handshake.exe: event_handshake/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/interlocked_basic.exe: interlocked_basic/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/mt_stress.exe: mt_stress/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
 clean:
