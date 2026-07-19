@@ -19,6 +19,8 @@ The WinAPI surface is intentionally incomplete: many handlers are stubs sufficie
 
 **Status (post great cleanup):** Soft-translate guest memory is **mmap-only** (no hash/hybrid fallback). Software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`. CLI compressed to `inspect` / `run` / `trace`. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
+**Real console 7-Zip (`7za`):** WIE runs the **Windows PE64** standalone console from 7-Zip Extra (not macOS `7za`, not GUI). The PE is **not** committed (`/real_exes` is gitignored) — download once, then create/list/extract `.7z` under JIT or iced. See [7-Zip console status](#7-zip-console-status-7za).
+
 ## Examples of launch
 
 ```bash
@@ -51,7 +53,7 @@ mkdir -p "$BOTTLE/drive_c/App"
 ./target/release/wie-cli run micro-exes/out/write_file.exe --root "$BOTTLE"
 
 # Optional host bridge: guest D:\… → host path (WIE_DRIVE_D / --drive-d)
-# ./target/release/wie-cli run real_exes/7z.exe --root "$BOTTLE" --drive-d "$PWD/data" -- a C:\App\out.7z D:\sample.txt
+# ./target/release/wie-cli run --root "$BOTTLE" --drive-d "$PWD/data" real_exes/7za.exe -- a C:\App\out.7z D:\sample.txt
 ```
 
 ```bash
@@ -66,11 +68,151 @@ WIE_JIT_CHAIN=0  ./scripts/run-micro-suite.sh
 WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 ```
 
+## 7-Zip console status (`7za`)
+
+WIE emulates a **Windows PE64** standalone console 7-Zip (`7za.exe` from the official **7-Zip Extra** package). That is **not** a native macOS `7za`/`7z` binary and **not** the GUI (`7zFM` / full installer).
+
+- **`/real_exes` is gitignored** — do not expect `7za.exe` in a clean clone; obtain the Windows PE yourself (steps below).
+- Guest files use a **bottle**: host `{root}/drive_c/...` ↔ guest `C:\...` (`--root` / `WIE_ROOT`).
+
+### What works (verified with 7-Zip Extra **26.02** `x64/7za.exe`)
+
+| Guest command        | Meaning                    | Default JIT | `WIE_CPU=iced`          |
+| -------------------- | -------------------------- | ----------- | ----------------------- |
+| `--help` / `help`    | Usage                      | OK `exit=0` | OK                      |
+| `i`                  | Formats / codecs / hashers | OK          | OK                      |
+| `a -mmt1 -bd …`      | Create `.7z` (LZMA2)       | OK          | OK                      |
+| `l …`                | List archive               | OK          | OK                      |
+| `x -mmt1 -bd -y -o…` | Extract                    | OK          | OK (SHA matches source) |
+
+Recommended flags: **`-mmt1`** (one compression thread), **`-bd`** (no progress), **`-y`** on extract. Raise **`--max-api`** for real tools (`200000`–`500000`); micros keep the low default.
+
+### Obtain Windows `7za.exe` (any Mac)
+
+WIE needs the **x64 PE** from **7-Zip Extra** (standalone console). Root `7za.exe` in that package is **32-bit** — use **`x64/7za.exe`**.
+
+| Path in Extra archive | Arch              | Use with WIE?                  |
+| --------------------- | ----------------- | ------------------------------ |
+| `7za.exe`             | Windows **x86**   | No                             |
+| `x64/7za.exe`         | Windows **x64**   | **Yes** (this is what we run)  |
+| `arm64/7za.exe`       | Windows **ARM64** | No (WIE is x86-64 guest today) |
+
+**One-time setup** (run from the WIE repo root). Homebrew `p7zip` is only a **bootstrap** to unpack the Extra archive; the guest under WIE is still the **Windows** PE.
+
+```bash
+brew install p7zip
+
+VER=26.02
+VER_COMPACT=2602
+mkdir -p real_exes /tmp/7z-extra-$$
+curl -fL -o /tmp/7z-extra-$$/extra.7z \
+  "https://github.com/ip7z/7zip/releases/download/${VER}/7z${VER_COMPACT}-extra.7z"
+7za x -y -o/tmp/7z-extra-$$/out /tmp/7z-extra-$$/extra.7z
+
+cp -f /tmp/7z-extra-$$/out/x64/7za.exe  real_exes/
+cp -f /tmp/7z-extra-$$/out/x64/7za.dll  real_exes/
+cp -f /tmp/7z-extra-$$/out/x64/7zxa.dll real_exes/
+file real_exes/7za.exe
+rm -rf /tmp/7z-extra-$$
+```
+
+Without Homebrew: open `7z*-extra.7z` anywhere you can, then copy **`x64/7za.exe`** into this repo’s `real_exes/` (still gitignored).
+
+### Universal test payloads
+
+Generate inputs on the fly (no personal `Downloads/` files, works in CI):
+
+| Payload                | How                        | Purpose                      |
+| ---------------------- | -------------------------- | ---------------------------- |
+| Tiny text              | `echo '…' > hello.txt`     | Fast create / list / extract |
+| Binary blob (~256 KiB) | Python deterministic bytes | LZMA2 + SHA-256 roundtrip    |
+| Optional extra         | `cp /any/local/file …`     | Stress only; not required    |
+
+### Reproduce (after `real_exes/7za.exe` is present)
+
+```bash
+cargo build -p wie-cli --release
+CLI=./target/release/wie-cli
+PE=real_exes/7za.exe
+test -f "$PE" || { echo "missing $PE — install Windows x64 7za (see above)"; exit 1; }
+
+BOTTLE="${TMPDIR:-/tmp}/wie-7za-bottle-$$"
+APP="$BOTTLE/drive_c/App"
+mkdir -p "$APP"
+cp -f "$PE" "$APP/7za.exe"
+
+echo 'hello from wie bottle' > "$APP/hello.txt"
+python3 -c "
+from pathlib import Path
+app = Path(r'''$APP''')
+data = bytes((i * 17 + 31) & 0xFF for i in range(256 * 1024))
+(app / 'blob.bin').write_bytes(data)
+print('blob.bin', len(data))
+"
+
+$CLI run --root "$BOTTLE" --max-api 100000 "$PE" -- --help
+$CLI run --root "$BOTTLE" --max-api 100000 "$PE" -- i
+
+$CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
+  a -mmt1 -bd 'C:\App\hello.7z' 'C:\App\hello.txt'
+$CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
+  a -mmt1 -bd 'C:\App\blob.7z' 'C:\App\blob.bin'
+
+$CLI run --root "$BOTTLE" --max-api 100000 "$PE" -- l 'C:\App\blob.7z'
+
+rm -rf "$APP/out" && mkdir -p "$APP/out"
+$CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
+  x -mmt1 -bd -y -o'C:\App\out' 'C:\App\blob.7z'
+SRC=$(shasum -a 256 "$APP/blob.bin" | awk '{print $1}')
+OUT=$(shasum -a 256 "$APP/out/blob.bin" | awk '{print $1}')
+echo "src=$SRC out=$OUT"
+test "$SRC" = "$OUT" && echo "ROUNDTRIP OK" || { echo "ROUNDTRIP FAIL"; exit 1; }
+
+WIE_CPU=iced $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
+  a -mmt1 -bd 'C:\App\blob_iced.7z' 'C:\App\blob.bin'
+WIE_CPU=jit  $CLI run --root "$BOTTLE" --max-api 500000 "$PE" -- \
+  a -mmt1 -bd 'C:\App\blob_jit.7z'  'C:\App\blob.bin'
+```
+
+**CLI shape:**
+
+```text
+wie-cli run --root <bottle> --max-api N real_exes/7za.exe -- <7za-args...>
+```
+
+**Minimal smoke (text only):**
+
+```bash
+cargo build -p wie-cli --release
+test -f real_exes/7za.exe || { echo "install x64 7za.exe first"; exit 1; }
+B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
+  cp real_exes/7za.exe "$B/drive_c/App/" && \
+  echo hi > "$B/drive_c/App/hello.txt" && \
+  ./target/release/wie-cli run --root "$B" --max-api 200000 real_exes/7za.exe -- \
+    a -mmt1 -bd 'C:\App\h.7z' 'C:\App\hello.txt' && \
+  ./target/release/wie-cli run --root "$B" --max-api 200000 real_exes/7za.exe -- \
+    x -mmt1 -bd -y -o'C:\App\out' 'C:\App\h.7z' && \
+  cat "$B/drive_c/App/out/hello.txt" && rm -rf "$B"
+```
+
+### Implementation notes (why create works)
+
+1. **`SBB` flags** — MSVC COM `QueryInterface` uses `cmp` + `sbb r,r` + `sbb r,-1`. Wrong CF when `src+CF` overflowed the operand width picked the wrong interface → null call.
+2. **`VirtualAlloc(NULL, size, MEM_COMMIT)`** — treated as **RESERVE|COMMIT** (Windows/Wine-compatible) for LZMA2 buffers.
+3. **JIT dual_super GPR writeback** — only store live GPRs on block exit (do not zero callee-saved).
+4. **Default `WIE_JIT_SUPER=loop`** — non-loop stack super can host-fault on some real tools (`7za a`); self-loop super keeps `long_loop` fast. Opt in with `WIE_JIT_SUPER=all` only when bisecting.
+
+### Not claimed yet
+
+- GUI 7-Zip / `7zFM` / full installer PE.
+- Multi-thread compression (`-mmt` &gt; 1) as a supported matrix.
+- Password / crypto, solid multi-file update, or every format beyond default `.7z` LZMA2.
+
 ## Core Components
 
 | Crate             | Role                                                                                                                                                                                                                             |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`wie-cpu`**     | CPU + guest memory: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 (`WIE_CPU=iced`). Memory: **mmap arenas only**, RegionTable, PageMap/VAD/SPC, JIT TLB + pins.      |
+| **`wie-cpu`**     | CPU + guest memory: **`JitCpu`** (default) — Cranelift x86-64→ARM64 block JIT + iced fallback; **`IcedCpu`** — pure iced-x86 (`WIE_CPU=iced`). Memory: **mmap arenas only**, RegionTable, PageMap/VAD/SPC, JIT TLB + pins.       |
 | **`wie-winapi`**  | KERNEL32 / UCRT / USER32 / GDI32 / … handlers. Dense `WinApiId` dispatch (no string compares on the hot path). Guest heap: 24 size classes + bump + optional shared control block. Real `VirtualAlloc`/`Free`/`Protect`/`Query`. |
 | **`wie-runtime`** | Session: PE load, layout regions, fake-API hooks, guest accelerators (stubs / heap / I/O / MBWC), run loop, TEB last-error, bottles (`WIE_ROOT`). Profile via `WIE_RUNTIME_PROFILE`.                                             |
 | **`wie-pe`**      | PE64 parse, section map plan, import/IAT patch with fake VAs, COFF → `PAGE_*` protects.                                                                                                                                          |
@@ -96,7 +238,7 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 - **Hotness**: compile after **100** visits (tests: 0; pure self-loops: **16**; UCRT call sites: 2).
 - **Chaining**: self-loops become IR back-edges; open-addressing chain table + monomorphic **edge IC** + shadow stack for call/ret. Kill-switch: `WIE_JIT_CHAIN=0`.
 - **Memory lower** (`WIE_JIT_MEM`):
-  - **`sticky` (default)** — sticky multi-way TLB with SPC R/W bits + `mem_gen`; **stack `MemPin`** + block-wide super path when all memops are same stack base + const disp.
+  - **`sticky` (default)** — sticky multi-way TLB with SPC R/W bits + `mem_gen`; **stack `MemPin`**; block-wide super path on **self-loops** by default (`WIE_JIT_SUPER=all` opts into non-loop super).
   - **`pin`** — sticky + stack pin + **heap** region pin IR.
   - **`slow`** — helper-only `wie_jit_load` / `wie_jit_store` (oracle / bisect).
 - **SSE2**: common XMM moves / bitwise / scalar+packed FP lowered with Cranelift SIMD (`I8X16`/`F32X4`/…) → host Neon when `WIE_JIT_SIMD≠0`; pure GPR blocks **skip XMM bank**; live/dirty masks selective sync.
@@ -116,31 +258,32 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 ## Environment knobs
 
-| Variable                                | Effect                                                                                                |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `WIE_CPU=jit` \| `iced`                 | CPU backend (default **jit**)                                                                         |
-| `WIE_MPROTECT=0`                        | Disable optional host `mprotect` dual-protection on arenas (SPC remains on)                           |
-| `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower mode (default **sticky** = sticky TLB + stack pin)                                      |
-| `WIE_JIT_CHAIN=0`                       | Disable FuncRef chaining / chain table / edge IC                                                      |
-| `WIE_STRING_BULK=0`                     | Disable host-span bulk REP MOVS/STOS                                                                  |
-| `WIE_STRING_INLINE=0`                   | Disable inline 16–64 B REP Neon path (Phase 5.5)                                                      |
-| `WIE_JIT_SIMD=0`                        | Scalar lo/hi XMM lowering (no CLIF SIMD / Neon)                                                       |
-| `WIE_TLB_NEON=0`                        | Scalar 4-way TLB tag scan (no Neon compare)                                                           |
+| Variable                                  | Effect                                                                                              |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `WIE_CPU=jit` \| `iced`                   | CPU backend (default **jit**)                                                                       |
+| `WIE_MPROTECT=0`                          | Disable optional host `mprotect` dual-protection on arenas (SPC remains on)                         |
+| `WIE_JIT_MEM=sticky` \| `pin` \| `slow`   | JIT mem lower mode (default **sticky** = sticky TLB + stack pin)                                    |
+| `WIE_JIT_SUPER=loop` \| `0` \| `all`      | Block-wide stack super path: default **loop** (self-loops only); `0` off; `all` experimental        |
+| `WIE_JIT_CHAIN=0`                         | Disable FuncRef chaining / chain table / edge IC                                                    |
+| `WIE_STRING_BULK=0`                       | Disable host-span bulk REP MOVS/STOS                                                                |
+| `WIE_STRING_INLINE=0`                     | Disable inline 16–64 B REP Neon path (Phase 5.5)                                                    |
+| `WIE_JIT_SIMD=0`                          | Scalar lo/hi XMM lowering (no CLIF SIMD / Neon)                                                     |
+| `WIE_TLB_NEON=0`                          | Scalar 4-way TLB tag scan (no Neon compare)                                                         |
 | `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**)                                                             |
-| `WIE_JIT_VERIFY=1`                      | Enable Cranelift IR verifier outside tests                                                            |
-| `WIE_RUNTIME_PROFILE=1`                 | Wall/CPU%, host stops, JIT load/store counts, `mem_backend`                                           |
-| `WIE_API_JOURNAL=path`                  | Per-API journal for backend A/B diffs                                                                 |
-| `WIE_ROOT` / `--root`                   | Bottle root for guest `C:\` file APIs                                                                 |
-| `WIE_DRIVE_D` / `--drive-d`             | Host root for guest `D:\` bridge (`auto` = host cwd); unset = no D:                                   |
-| `WIE_GUEST_HEAP=1`                      | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code                                              |
-| `WIE_GUEST_IO=0` \| `all`               | I/O accelerator: default seeks/size in-guest; `all` also guest Read (large → host); `0` = all host    |
-| `WIE_GUEST_MBWC=1`                      | Guest MultiByte↔WideChar helpers                                                                      |
-| `WIE_IDLE=busy\|yield\|park`            | Host idle policy (Phase 6): micros default **yield**; interactive `run` default **park** when unset   |
-| `WIE_IDLE_CAP_MS`                       | Max single `Sleep` park (default 60000)                                                               |
-| `WIE_IDLE_PARK_MS`                      | Empty-`GetMessage` park quantum ms (default 25)                                                       |
-| `WIE_IDLE_MAX_PARKS`                    | Max message park quanta before CLI yield (`0` = unlimited; default 40)                                |
-| `WIE_HOST_SLEEP=1`                      | **Legacy:** enable `Sleep(n>0)` park only (prefer `WIE_IDLE=park`)                                    |
-| `RUST_LOG`                              | tracing filter (CLI defaults to `warn`)                                                               |
+| `WIE_JIT_VERIFY=1`                        | Enable Cranelift IR verifier outside tests                                                          |
+| `WIE_RUNTIME_PROFILE=1`                   | Wall/CPU%, host stops, JIT load/store counts, `mem_backend`                                         |
+| `WIE_API_JOURNAL=path`                    | Per-API journal for backend A/B diffs                                                               |
+| `WIE_ROOT` / `--root`                     | Bottle root for guest `C:\` file APIs                                                               |
+| `WIE_DRIVE_D` / `--drive-d`               | Host root for guest `D:\` bridge (`auto` = host cwd); unset = no D:                                 |
+| `WIE_GUEST_HEAP=1`                        | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code                                            |
+| `WIE_GUEST_IO=0` \| `all`                 | I/O accelerator: default seeks/size in-guest; `all` also guest Read (large → host); `0` = all host  |
+| `WIE_GUEST_MBWC=1`                        | Guest MultiByte↔WideChar helpers                                                                    |
+| `WIE_IDLE=busy\|yield\|park`              | Host idle policy (Phase 6): micros default **yield**; interactive `run` default **park** when unset |
+| `WIE_IDLE_CAP_MS`                         | Max single `Sleep` park (default 60000)                                                             |
+| `WIE_IDLE_PARK_MS`                        | Empty-`GetMessage` park quantum ms (default 25)                                                     |
+| `WIE_IDLE_MAX_PARKS`                      | Max message park quanta before CLI yield (`0` = unlimited; default 40)                              |
+| `WIE_HOST_SLEEP=1`                        | **Legacy:** enable `Sleep(n>0)` park only (prefer `WIE_IDLE=park`)                                  |
+| `RUST_LOG`                                | tracing filter (CLI defaults to `warn`)                                                             |
 
 ## CLI
 
@@ -151,33 +294,33 @@ Three fundamental commands (`run-micro` / `entry-trace` remain as aliases):
 ./target/release/wie-cli run --help
 ```
 
-| Command | Role |
-| ------- | ---- |
-| `inspect <pe>` | PE metadata; flags: `--sections`, `--imports` / `--find`, `--image`, `--winapi-map` / `--out` |
-| `run <pe>` | **Primary** micro gate (`ExitProcess`); `--max-api` (256), `--expect-code`, `--root`, `--stdin`, guest argv after `--` |
-| `run <pe> --persistent` | Persistent loop until yield/exit (`--max-api` default 3400) |
-| `trace <pe>` | First N host API stops (`--max-api`, default 20) |
+| Command                 | Role                                                                                                                   |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `inspect <pe>`          | PE metadata; flags: `--sections`, `--imports` / `--find`, `--image`, `--winapi-map` / `--out`                          |
+| `run <pe>`              | **Primary** micro gate (`ExitProcess`); `--max-api` (256), `--expect-code`, `--root`, `--stdin`, guest argv after `--` |
+| `run <pe> --persistent` | Persistent loop until yield/exit (`--max-api` default 3400)                                                            |
+| `trace <pe>`            | First N host API stops (`--max-api`, default 20)                                                                       |
 
 ## Performance notes (CPU / wall)
 
 Phases 0–5 landed; baselines and design notes:
 
-| Doc                                                            | Topic                                   |
-| -------------------------------------------------------------- | --------------------------------------- |
-| [`docs/phase0-baseline.md`](docs/phase0-baseline.md)           | Wall/CPU%, host stops, JIT counters     |
-| [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md)   | Mmap arena storage (historical dual-backend notes) |
-| [`docs/phase3-permissions.md`](docs/phase3-permissions.md)     | SPC, PageMap/VAD, `Virtual*`            |
-| [`docs/phase4-foundation.md`](docs/phase4-foundation.md)       | Sticky TLB + kill-switches              |
-| [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md)     | Stack/heap pins + block-wide super path |
-| [`docs/phase4-jit-coherency.md`](docs/phase4-jit-coherency.md) | Chaining / edge IC / I$ policy          |
-| [`docs/phase4-string-bulk.md`](docs/phase4-string-bulk.md)     | REP MOVS/STOS host spans                |
-| [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md) | Selective JIT drop on X-loss / SMC / free |
-| [`docs/phase5-guest-stubs.md`](docs/phase5-guest-stubs.md)     | In-guest WinAPI stubs (Learn policy)    |
-| [`docs/phase5.5-neon-cranelift.md`](docs/phase5.5-neon-cranelift.md) | Neon SIMD, TLB, inline strings, Cranelift flags |
-| [`docs/phase6-idle.md`](docs/phase6-idle.md)                   | Host idle park (`Sleep` / empty GetMessage) |
-| [`docs/phase7-hardening.md`](docs/phase7-hardening.md)         | Stress, FIC stub, mmap default cutover  |
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md)                           | Symptom → kill-switch playbook          |
-| [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md)         | Full plan (Phases 0–7 complete)         |
+| Doc                                                                    | Topic                                              |
+| ---------------------------------------------------------------------- | -------------------------------------------------- |
+| [`docs/phase0-baseline.md`](docs/phase0-baseline.md)                   | Wall/CPU%, host stops, JIT counters                |
+| [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md)           | Mmap arena storage (historical dual-backend notes) |
+| [`docs/phase3-permissions.md`](docs/phase3-permissions.md)             | SPC, PageMap/VAD, `Virtual*`                       |
+| [`docs/phase4-foundation.md`](docs/phase4-foundation.md)               | Sticky TLB + kill-switches                         |
+| [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md)             | Stack/heap pins + block-wide super path            |
+| [`docs/phase4-jit-coherency.md`](docs/phase4-jit-coherency.md)         | Chaining / edge IC / I$ policy                     |
+| [`docs/phase4-string-bulk.md`](docs/phase4-string-bulk.md)             | REP MOVS/STOS host spans                           |
+| [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md) | Selective JIT drop on X-loss / SMC / free          |
+| [`docs/phase5-guest-stubs.md`](docs/phase5-guest-stubs.md)             | In-guest WinAPI stubs (Learn policy)               |
+| [`docs/phase5.5-neon-cranelift.md`](docs/phase5.5-neon-cranelift.md)   | Neon SIMD, TLB, inline strings, Cranelift flags    |
+| [`docs/phase6-idle.md`](docs/phase6-idle.md)                           | Host idle park (`Sleep` / empty GetMessage)        |
+| [`docs/phase7-hardening.md`](docs/phase7-hardening.md)                 | Stress, FIC stub, mmap default cutover             |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md)                                   | Symptom → kill-switch playbook                     |
+| [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md)                 | Full plan (Phases 0–7 complete)                    |
 
 Headline numbers on Apple Silicon release builds (order-of-magnitude; re-measure with `WIE_RUNTIME_PROFILE=1`):
 

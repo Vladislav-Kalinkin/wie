@@ -6378,6 +6378,14 @@ fn handle_virtual_alloc(
     match engine.virtual_alloc(addr, size_usize, alloc_type, protect) {
         Ok(base) => {
             state.last_error = 0;
+            tracing::debug!(
+                addr,
+                size,
+                alloc_type,
+                protect,
+                base,
+                "VirtualAlloc ok"
+            );
             let return_address = engine.return_from_win64_api(base)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -6386,6 +6394,15 @@ fn handle_virtual_alloc(
         }
         Err(e) => {
             state.last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            tracing::debug!(
+                addr,
+                size,
+                alloc_type,
+                protect,
+                error = %e,
+                last_error = state.last_error,
+                "VirtualAlloc failed"
+            );
             let return_address = engine.return_from_win64_api(0)?;
             Ok(WinApiHandlerResult {
                 return_address,

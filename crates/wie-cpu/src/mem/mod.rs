@@ -135,10 +135,7 @@ impl std::fmt::Debug for GuestMemory {
             .field("regions", &self.regions.len())
             .field("page_runs", &self.pages.run_count())
             .field("vad", &self.vad.len())
-            .field(
-                "generation",
-                &self.generation.load(Ordering::Relaxed),
-            )
+            .field("generation", &self.generation.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -669,8 +666,13 @@ impl GuestMemory {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, crate::CpuError> {
-        let do_reserve = (alloc_type & MEM_RESERVE) != 0;
+        let mut do_reserve = (alloc_type & MEM_RESERVE) != 0;
         let do_commit = (alloc_type & MEM_COMMIT) != 0;
+        // Windows / Wine: `VirtualAlloc(NULL, size, MEM_COMMIT, …)` without
+        // MEM_RESERVE is treated as RESERVE|COMMIT (7za LZMA dictionaries).
+        if do_commit && !do_reserve && addr == 0 {
+            do_reserve = true;
+        }
         if size == 0 || (!do_reserve && !do_commit) {
             return Err(va_error(
                 ERROR_INVALID_PARAMETER,
@@ -1655,6 +1657,19 @@ mod tests {
             )
             .expect_err("no reserve");
         assert_eq!(win32_from_cpu_error(&err), Some(ERROR_INVALID_ADDRESS));
+    }
+
+    #[test]
+    #[allow(clippy::unreadable_literal)]
+    fn virtual_alloc_commit_null_implies_reserve() {
+        // Win32/Wine: MEM_COMMIT with NULL address reserves+commits.
+        let mut mem = GuestMemory::new();
+        let base = mem
+            .virtual_alloc(0, 0x300000, MEM_COMMIT, protect::PAGE_READWRITE)
+            .expect("commit-only NULL");
+        assert_ne!(base, 0);
+        let mut b = [0_u8; 4];
+        mem.read(base, &mut b).expect("committed readable");
     }
 
     #[test]

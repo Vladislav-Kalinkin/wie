@@ -94,6 +94,43 @@ pub(super) fn jit_mem_pin_enabled() -> bool {
     matches!(jit_mem_mode(), JitMemMode::Pin)
 }
 
+/// Block-wide stack super path (`WIE_JIT_SUPER`).
+///
+/// - unset / `loop` — **default**: only self-loop blocks (safe; `long_loop`-style)
+/// - `0` / `off` / `false` — disabled (sticky/pin probes only)
+/// - `all` / `1` / `true` — all stack-pin-shaped blocks (experimental; can host-fault
+///   on non-loop super, e.g. `7za a` under default All previously)
+pub(super) fn jit_super_enabled(self_loop: bool) -> bool {
+    use std::sync::OnceLock;
+    #[derive(Clone, Copy)]
+    enum SuperMode {
+        Off,
+        LoopOnly,
+        All,
+    }
+    static MODE: OnceLock<SuperMode> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("WIE_JIT_SUPER") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("false") => {
+            SuperMode::Off
+        }
+        Ok(v)
+            if v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("all") =>
+        {
+            SuperMode::All
+        }
+        // unset, "loop", "selfloop", or any other value → self-loops only
+        _ => SuperMode::LoopOnly,
+    });
+    match mode {
+        SuperMode::Off => false,
+        SuperMode::LoopOnly => self_loop,
+        SuperMode::All => true,
+    }
+}
+
 /// Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
 fn jit_chain_enabled() -> bool {
     use std::sync::OnceLock;

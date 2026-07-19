@@ -797,6 +797,10 @@ pub(super) fn analyze_block_stack_pin(
 
 #[inline]
 fn is_stack_base_reg(r: Register) -> bool {
+    // Soft-translate is VA-based: any access whose effective address falls in the
+    // stack region is valid for the stack pin / super path, whether addressed via
+    // RSP or RBP. (RBP is not a reserved frame pointer on Win64, but the
+    // block-wide guard still requires `[base+disp…] ⊆ stack pin`.)
     matches!(
         r,
         Register::RSP | Register::ESP | Register::RBP | Register::EBP

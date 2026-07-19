@@ -1143,8 +1143,12 @@ pub(super) fn compile_block(
 
         // Dual path when the block is stack-pin-shaped: super (bare host mem) vs
         // normal (sticky/pin probes). One block-wide guard on entry.
-        let dual_super =
-            stack_plan.is_some() && stack_pin.is_some() && !has_string && call_fast.is_none();
+        // Default `WIE_JIT_SUPER` = self-loops only; `=all` opt-in; `=0` off.
+        let dual_super = stack_plan.is_some()
+            && stack_pin.is_some()
+            && !has_string
+            && call_fast.is_none()
+            && super::jit_super_enabled(self_loop);
 
         let mut headers_to_seal: Vec<Block> = Vec::new();
         // Tracks gpr_loaded for the exit store mask (union of paths; full when dual).
@@ -1387,9 +1391,14 @@ pub(super) fn compile_block(
             (g, exit_params[16])
         };
         for i in 0..16 {
-            // Fault/exit path: store loaded regs (may include partial helper progress).
-            // Dual super/normal: write all architectural GPRs (both paths may dirty).
-            if exit_gpr_loaded[i] || dual_super || self_loop {
+            // Fault/exit path: store only GPRs that were actually loaded/defined.
+            // Self-loops load the full set at entry (`live_eff.fill(true)`).
+            //
+            // Important: do **not** force all-16 stores for dual_super. Non-loop
+            // super blocks only load live-ins; unloaded slots are SSA `iconst 0`.
+            // Writing them back zeroed callee-saved regs (R12–R15, RBX, RBP, …)
+            // and corrupted guests such as 7za (`i` → null base → VA 0x1000).
+            if exit_gpr_loaded[i] || self_loop {
                 let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
                 let p = bcx.ins().iadd_imm(ctx_ptr, off);
                 bcx.ins().store(flags, exit_gpr[i], p, 0);
@@ -4747,13 +4756,43 @@ fn lower_arith(
         Arith::Add => flags_add(bcx, *rflags, a, b, res_m, bits),
         Arith::Adc => flags_adc(bcx, *rflags, a, b, cf_val, res_m, bits),
         Arith::Sub => flags_sub(bcx, *rflags, a, b, res_m, bits),
-        Arith::Sbb => {
-            let borrow = bcx.ins().iadd(b, cf_val);
-            let borrow_m = mask_width(bcx, borrow, bits);
-            flags_sub(bcx, *rflags, a, borrow_m, res_m, bits)
-        }
+        Arith::Sbb => flags_sbb(bcx, *rflags, a, b, cf_val, res_m, bits),
     };
     Ok(())
+}
+
+/// SBB flags: match iced full-width borrow CF (do not mask `s+cf` before CF test).
+fn flags_sbb(
+    bcx: &mut FunctionBuilder<'_>,
+    old: Value,
+    d: Value,
+    s: Value,
+    cf: Value,
+    result: Value,
+    bits: u32,
+) -> Value {
+    // Base ZF/SF/PF/AF/OF from (d - s) then correct CF/OF for carry-in.
+    let mut f = flags_sub(bcx, old, d, s, result, bits);
+    // CF = d < s + cf (full width; s+cf may exceed operand size).
+    let s_plus_cf = bcx.ins().iadd(s, cf);
+    let cf_b = if bits >= 64 {
+        // For 64-bit: overflow of s+cf means always borrow; else d < s+cf.
+        let c_ov = bcx.ins().icmp(IntCC::UnsignedLessThan, s_plus_cf, s); // s+cf wrapped
+        let c_lt = bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf);
+        let c_ovi = bool_to_i64(bcx, c_ov);
+        let c_lti = bool_to_i64(bcx, c_lt);
+        let any = bcx.ins().bor(c_ovi, c_lti);
+        let zero = iconst_u64(bcx, 0);
+        bcx.ins().icmp(IntCC::NotEqual, any, zero)
+    } else {
+        // `s`/`d` masked to operand width; `s+cf` may be 2^bits — then CF is always set.
+        bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf)
+    };
+    // For bits < 64, s_plus_cf may have bits above `bits` set (when s=mask and cf=1).
+    // `d` is masked so d < s_plus_cf is correct when s_plus_cf > mask.
+    let cf_on = select_flag(bcx, cf_b, rflags::CF);
+    f = replace_flag(bcx, f, rflags::CF, cf_on);
+    f
 }
 
 /// ADC flags: match iced `set_add_flags(d, s+cf, result)` then CF from wide add.

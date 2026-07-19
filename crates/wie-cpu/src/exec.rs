@@ -647,9 +647,21 @@ fn exec_arith(
             write_op(mem, regs, instr, 0, result & mask)?;
         }
         ArithOp::Sbb => {
-            let borrow = s.wrapping_add(cf);
-            regs::set_sub_flags(regs, d, borrow, result, size);
-            write_op(mem, regs, instr, 0, result & mask)?;
+            // CF/OF must use full-width borrow: when `s + CF` overflows the
+            // operand, masking `borrow` to `size` zeros it and wrongly clears CF
+            // (breaks MSVC `cmp; sbb r,r; sbb r,-1` equality idioms used in 7-Zip QI).
+            let wide_src = u128::from(s).wrapping_add(u128::from(cf));
+            let r = result & mask;
+            regs::set_sub_flags(regs, d, s, result, size);
+            regs.set_flag(rflags::CF, u128::from(d) < wide_src);
+            let d_s = i128::from(sign_extend(d, size));
+            let s_s = i128::from(sign_extend(s, size));
+            let expected = d_s
+                .wrapping_sub(s_s)
+                .wrapping_sub(i128::from(cf != 0));
+            let got = i128::from(sign_extend(r, size));
+            regs.set_flag(rflags::OF, expected != got);
+            write_op(mem, regs, instr, 0, r)?;
         }
         ArithOp::Cmp => {
             regs::set_sub_flags(regs, d, s, result, size);

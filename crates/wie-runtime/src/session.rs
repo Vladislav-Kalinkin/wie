@@ -1231,12 +1231,59 @@ impl RuntimeSession {
                     let rdx = engine.read_rdx().context("rdx after invalid mem")?;
                     let r8 = engine.read_r8().context("r8 after invalid mem")?;
                     let r9 = engine.read_r9().context("r9 after invalid mem")?;
+                    // Stack slots (return addr + shadow) and *this / vtable for null-call diagnosis.
+                    let mut stack_slots = String::new();
+                    for i in 0_u64..32 {
+                        let mut b = [0_u8; 8];
+                        let off = i.wrapping_mul(8);
+                        let va = rsp.wrapping_add(off);
+                        match engine.mem_read(va, &mut b) {
+                            Ok(()) => {
+                                let v = u64::from_le_bytes(b);
+                                stack_slots.push_str(&format!(" [rsp+{off:#x}]={v:#x}"));
+                            }
+                            Err(_) => stack_slots.push_str(&format!(" [rsp+{off:#x}]=?")),
+                        }
+                    }
+                    let mut this_info = String::new();
+                    if rcx != 0 {
+                        let mut b = [0_u8; 8];
+                        if engine.mem_read(rcx, &mut b).is_ok() {
+                            let vtbl = u64::from_le_bytes(b);
+                            this_info.push_str(&format!(" [rcx]={vtbl:#x}"));
+                            // Dump object body (stack COM objects often ~0x40–0x80 bytes).
+                            for i in 0_u64..12 {
+                                let mut e = [0_u8; 8];
+                                let ova = rcx.wrapping_add(i.wrapping_mul(8));
+                                if engine.mem_read(ova, &mut e).is_ok() {
+                                    this_info.push_str(&format!(
+                                        " obj[{i}]={:#x}",
+                                        u64::from_le_bytes(e)
+                                    ));
+                                }
+                            }
+                            if vtbl > 0x10000 {
+                                for i in 0_u64..8 {
+                                    let mut e = [0_u8; 8];
+                                    let eva = vtbl.wrapping_add(i.wrapping_mul(8));
+                                    if engine.mem_read(eva, &mut e).is_ok() {
+                                        this_info.push_str(&format!(
+                                            " vtbl[{i}]={:#x}",
+                                            u64::from_le_bytes(e)
+                                        ));
+                                    }
+                                }
+                            }
+                        } else {
+                            this_info.push_str(" [rcx]=unmapped");
+                        }
+                    }
                     break_term = Some(EntryTraceTermination::RuntimeStop(format!(
                         "invalid memory access before fake API hook: \
                          type={} address={:#018x} size={} value={} \
                          rip={rip:#018x}; rsp={rsp:#018x}; rax={rax:#018x}; \
                          rcx={rcx:#018x}; rdx={rdx:#018x}; \
-                         r8={r8:#018x}; r9={r9:#018x}",
+                         r8={r8:#018x}; r9={r9:#018x};{stack_slots};{this_info}",
                         invalid_memory.access_type,
                         invalid_memory.address,
                         invalid_memory.size,
