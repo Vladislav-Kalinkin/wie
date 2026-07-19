@@ -108,6 +108,10 @@ pub(crate) enum GuestStubKind {
     SysColorBrush { base: u64 },
     /// `GetCurrentDirectoryW` — Microsoft Learn buffer / return-value rules.
     GetCurrentDirectoryW { cwd_blob_va: u64 },
+    /// `_initterm(first, last)` — call each non-null `void (*)()` in `[first, last)`.
+    Initterm,
+    /// `_initterm_e(first, last)` — call each non-null `int (*)()`; stop on non-zero.
+    InittermE,
 }
 
 impl GuestStubKind {
@@ -169,6 +173,8 @@ impl GuestStubKind {
             Self::GetCurrentDirectoryW { cwd_blob_va } => {
                 encode_get_current_directory_w(cwd_blob_va)
             }
+            Self::Initterm => encode_initterm(false),
+            Self::InittermE => encode_initterm(true),
         }
     }
 
@@ -181,8 +187,82 @@ impl GuestStubKind {
                 | Self::FlsSetValue { .. }
                 | Self::LoadU32FromTable { .. }
                 | Self::GetCurrentDirectoryW { .. }
+                | Self::Initterm
+                | Self::InittermE
         )
     }
+}
+
+/// `_initterm` / `_initterm_e` body — iterate function-pointer range and call.
+///
+/// Win64: `RCX=first`, `RDX=last` (half-open). Each entry is `void (*)()` or
+/// `int (*)()`; NULL entries are skipped. For `_initterm_e`, a non-zero return
+/// aborts the loop and is returned to the caller.
+fn encode_initterm(check_status: bool) -> Vec<u8> {
+    // push rbx; push rsi
+    // mov rbx, rcx          ; cur
+    // mov rsi, rdx          ; end
+    // .loop:
+    //   cmp rbx, rsi
+    //   jae .done
+    //   mov rax, qword ptr [rbx]
+    //   add rbx, 8
+    //   test rax, rax
+    //   jz .loop
+    //   sub rsp, 0x28
+    //   call rax
+    //   add rsp, 0x28
+    //   ; if check_status: test eax,eax; jnz .fail_ret
+    //   jmp .loop
+    // .done:
+    //   xor eax, eax
+    //   pop rsi; pop rbx; ret
+    // .fail_ret: (initterm_e only)
+    //   pop rsi; pop rbx; ret   ; eax already holds status
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&[0x53, 0x56]); // push rbx; push rsi
+    buf.extend_from_slice(&[0x48, 0x89, 0xcb]); // mov rbx, rcx
+    buf.extend_from_slice(&[0x48, 0x89, 0xd6]); // mov rsi, rdx
+    let loop_at = buf.len();
+    buf.extend_from_slice(&[0x48, 0x39, 0xf3]); // cmp rbx, rsi
+    let jae_imm = buf.len() + 1;
+    buf.extend_from_slice(&[0x73, 0x00]); // jae .done (patch)
+    buf.extend_from_slice(&[0x48, 0x8b, 0x03]); // mov rax, [rbx]
+    buf.extend_from_slice(&[0x48, 0x83, 0xc3, 0x08]); // add rbx, 8
+    buf.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax, rax
+    let jz_imm = buf.len() + 1;
+    buf.extend_from_slice(&[0x74, 0x00]); // jz .loop (patch)
+    buf.extend_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp, 0x28
+    buf.extend_from_slice(&[0xff, 0xd0]); // call rax
+    buf.extend_from_slice(&[0x48, 0x83, 0xc4, 0x28]); // add rsp, 0x28
+    if check_status {
+        buf.extend_from_slice(&[0x85, 0xc0]); // test eax, eax
+        let jnz_imm = buf.len() + 1;
+        buf.extend_from_slice(&[0x75, 0x00]); // jnz .fail_ret (patch)
+        // jmp .loop
+        let jmp_imm = buf.len() + 1;
+        buf.extend_from_slice(&[0xeb, 0x00]);
+        let done_at = buf.len();
+        buf.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
+        buf.extend_from_slice(&[0x5e, 0x5b, 0xc3]); // pop rsi; pop rbx; ret
+        let fail_at = buf.len();
+        buf.extend_from_slice(&[0x5e, 0x5b, 0xc3]); // pop rsi; pop rbx; ret (keep eax)
+        patch_rel8(&mut buf, jae_imm, done_at);
+        patch_rel8(&mut buf, jz_imm, loop_at);
+        patch_rel8(&mut buf, jnz_imm, fail_at);
+        patch_rel8(&mut buf, jmp_imm, loop_at);
+    } else {
+        // jmp .loop
+        let jmp_imm = buf.len() + 1;
+        buf.extend_from_slice(&[0xeb, 0x00]);
+        let done_at = buf.len();
+        buf.extend_from_slice(&[0x31, 0xc0]); // xor eax, eax
+        buf.extend_from_slice(&[0x5e, 0x5b, 0xc3]); // pop rsi; pop rbx; ret
+        patch_rel8(&mut buf, jae_imm, done_at);
+        patch_rel8(&mut buf, jz_imm, loop_at);
+        patch_rel8(&mut buf, jmp_imm, loop_at);
+    }
+    buf
 }
 
 fn encode_fls_get(table_va: u64, max_slots: u32) -> Vec<u8> {
@@ -327,6 +407,13 @@ pub(crate) fn classify_guest_stub(
         if n.eq_ignore_ascii_case("__acrt_iob_func") {
             return Some(GuestStubKind::AcrtIobFunc);
         }
+        // `_initterm` / `_initterm_e` must invoke guest constructor tables.
+        if n.eq_ignore_ascii_case("_initterm") {
+            return Some(GuestStubKind::Initterm);
+        }
+        if n.eq_ignore_ascii_case("_initterm_e") {
+            return Some(GuestStubKind::InittermE);
+        }
         // No-op / fixed-success CRT init (host handlers only returned 0).
         if n.eq_ignore_ascii_case("fflush")
             || n.eq_ignore_ascii_case("setvbuf")
@@ -334,8 +421,6 @@ pub(crate) fn classify_guest_stub(
             || n.eq_ignore_ascii_case("_set_invalid_parameter_handler")
             || n.eq_ignore_ascii_case("_set_app_type")
             || n.eq_ignore_ascii_case("_set_new_mode")
-            || n.eq_ignore_ascii_case("_initterm")
-            || n.eq_ignore_ascii_case("_initterm_e")
             || n.eq_ignore_ascii_case("_configure_narrow_argv")
             || n.eq_ignore_ascii_case("_initialize_narrow_environment")
             || n.eq_ignore_ascii_case("__setusermatherr")

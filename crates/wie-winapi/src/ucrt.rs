@@ -38,6 +38,10 @@ pub fn crt_data_import_va(name: &str) -> Option<u64> {
         "_fmode" => Some(FMODE_SLOT),
         "_commode" => Some(COMMODE_SLOT),
         "_acmdln" => Some(ACMDLN_PTR_SLOT),
+        // Legacy msvcrt: `FILE _iob[]` / `char **__initenv`.
+        // Point `_iob` at stdin cookie; fputs/fputc treat nearby streams as console.
+        "_iob" => Some(FILE_STDIN),
+        "__initenv" => Some(ENVIRON_PTR_SLOT),
         _ => None,
     }
 }
@@ -68,9 +72,8 @@ pub fn dispatch_ucrt(
         "__p__fmode" => handle_p_fmode(engine),
         "_configthreadlocale" => handle_config_thread_locale(engine),
         "__setusermatherr" => handle_set_user_matherr(engine),
-        "__c_specific_handler" => handle_c_specific_handler(engine),
-        "memcpy" => handle_memcpy(engine),
-        "memmove" => handle_memmove(engine),
+        "__c_specific_handler" | "__cxxframehandler" => handle_c_specific_handler(engine),
+        "memcpy" | "memmove" => handle_memcpy(engine),
         "memcmp" => handle_memcmp(engine),
         "memset" => handle_memset(engine),
         "strlen" => handle_strlen(engine),
@@ -92,6 +95,23 @@ pub fn dispatch_ucrt(
         // in case traits path misses API-set library names.
         "exit" | "_exit" => handle_exit_like(engine, environment),
         "abort" => handle_abort(engine),
+        // Legacy msvcrt used heavily by standalone 7za / MSVC CRT apps.
+        "realloc" => handle_realloc(engine, state),
+        "_isatty" => handle_isatty(engine),
+        "_get_osfhandle" => handle_get_osfhandle(engine),
+        "fputc" => handle_fputc(engine),
+        "fputs" => handle_fputs(engine),
+        "fgetc" => handle_fgetc(engine),
+        "strcmp" => handle_strcmp(engine),
+        "wcscmp" => handle_wcscmp(engine),
+        "wcsstr" => handle_wcsstr(engine),
+        "_onexit" | "__dllonexit" => handle_onexit(engine),
+        "_beginthreadex" => handle_begin_thread_ex(engine, state),
+        "_purecall" => handle_purecall(engine),
+        // MSVC C++ mangled names (matched after to_ascii_lowercase).
+        "?terminate@@yaxxz" => handle_terminate_cxx(engine),
+        "??1type_info@@ueaa@xz" => handle_type_info_dtor(engine),
+        "_cxxthrowexception" => handle_cxx_throw_exception(engine),
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
@@ -329,12 +349,6 @@ fn handle_memcpy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
     ret(engine, dest)
 }
 
-/// `memmove` — like `memcpy` but correct for overlapping ranges (host-side buffer).
-fn handle_memmove(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    // Staging buffer already implements overlap-safe semantics.
-    handle_memcpy(engine)
-}
-
 fn handle_memcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
@@ -526,4 +540,285 @@ fn handle_exit_like(
 
 fn handle_abort(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     ret(engine, 3)
+}
+
+/// CRT `realloc(ptr, size)`.
+fn handle_realloc(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let ptr = engine.read_rcx()?;
+    let new_size = engine.read_rdx()?;
+    if ptr == 0 {
+        let p = if new_size == 0 {
+            0
+        } else {
+            state.heap.alloc_coherent(engine, new_size)
+        };
+        return ret(engine, p);
+    }
+    if new_size == 0 {
+        let _ = state.heap.free_coherent(engine, ptr);
+        return ret(engine, 0);
+    }
+    if let Some(same) = state.heap.try_realloc_in_place(ptr, new_size) {
+        return ret(engine, same);
+    }
+    let old_size = state
+        .heap
+        .size_of(ptr)
+        .or_else(|| {
+            let mut hb = [0_u8; 8];
+            engine
+                .mem_read(ptr.wrapping_sub(8), &mut hb)
+                .ok()
+                .map(|()| u64::from_le_bytes(hb))
+        })
+        .unwrap_or(0);
+    let new_addr = state.heap.alloc_coherent(engine, new_size);
+    if new_addr == 0 {
+        return ret(engine, 0);
+    }
+    let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
+    if copy_len > 0 {
+        let mut bytes = vec![0_u8; copy_len];
+        engine.mem_read(ptr, &mut bytes)?;
+        engine.mem_write(new_addr, &bytes)?;
+    }
+    let _ = state.heap.free_coherent(engine, ptr);
+    ret(engine, new_addr)
+}
+
+/// `_isatty(fd)` — treat 0/1/2 as console TTYs.
+fn handle_isatty(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let fd = engine.read_rcx()? & 0xffff_ffff;
+    let is_tty = (0..=2).contains(&fd);
+    ret(engine, u64::from(is_tty))
+}
+
+/// `_get_osfhandle(fd)` → fake console HANDLE for std streams.
+fn handle_get_osfhandle(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let fd = engine.read_rcx()? & 0xffff_ffff;
+    // Align with kernel32 fake std handles.
+    let handle = match fd {
+        0 => 0x0000_0000_6000_0001_u64, // stdin
+        1 => 0x0000_0000_6000_0002_u64, // stdout
+        2 => 0x0000_0000_6000_0003_u64, // stderr
+        _ => u64::MAX,                  // INVALID_HANDLE_VALUE
+    };
+    ret(engine, handle)
+}
+
+/// `fputc(c, stream)`.
+fn handle_fputc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let c = engine.read_rcx()? & 0xff;
+    let stream = engine.read_rdx()?;
+    let ch = u8::try_from(c).unwrap_or(0);
+    if stream == FILE_STDOUT || stream == FILE_STDERR {
+        write_host_console(stream, &[ch]);
+        return ret(engine, u64::from(ch));
+    }
+    if stream == FILE_STDIN {
+        return ret(engine, u64::from(u32::MAX)); // EOF
+    }
+    // Unknown FILE* — still echo to stdout (best-effort for &_iob[1] offsets).
+    write_host_console(FILE_STDOUT, &[ch]);
+    ret(engine, u64::from(ch))
+}
+
+/// `fputs(s, stream)`.
+fn handle_fputs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s = engine.read_rcx()?;
+    let stream = engine.read_rdx()?;
+    if s == 0 {
+        return ret(engine, u64::from(u32::MAX)); // EOF
+    }
+    let mut bytes = Vec::new();
+    let mut off = 0_u64;
+    loop {
+        let mut b = [0_u8; 1];
+        engine.mem_read(s.wrapping_add(off), &mut b)?;
+        if b[0] == 0 {
+            break;
+        }
+        bytes.push(b[0]);
+        off = off.saturating_add(1);
+        if off > 1_000_000 {
+            break;
+        }
+    }
+    let out = if stream == FILE_STDERR {
+        FILE_STDERR
+    } else {
+        FILE_STDOUT
+    };
+    write_host_console(out, &bytes);
+    ret(engine, 0) // non-negative = success
+}
+
+/// `fgetc(stream)` — EOF for empty stdin inject.
+fn handle_fgetc(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _stream = engine.read_rcx()?;
+    ret(engine, u64::from(u32::MAX)) // EOF
+}
+
+/// `strcmp(a, b)`.
+fn handle_strcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let a = engine.read_rcx()?;
+    let b = engine.read_rdx()?;
+    if a == 0 || b == 0 {
+        let r = match (a, b) {
+            (0, 0) => 0_i32,
+            (0, _) => -1,
+            _ => 1,
+        };
+        return ret(engine, i32_status_to_u64(r));
+    }
+    let mut i = 0_u64;
+    loop {
+        let mut ba = [0_u8; 1];
+        let mut bb = [0_u8; 1];
+        engine.mem_read(a.wrapping_add(i), &mut ba)?;
+        engine.mem_read(b.wrapping_add(i), &mut bb)?;
+        if ba[0] != bb[0] {
+            let r = i32::from(ba[0]).wrapping_sub(i32::from(bb[0]));
+            return ret(engine, i32_status_to_u64(r));
+        }
+        if ba[0] == 0 {
+            return ret(engine, 0);
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            return ret(engine, 0);
+        }
+    }
+}
+
+/// `wcscmp(a, b)`.
+fn handle_wcscmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let a = engine.read_rcx()?;
+    let b = engine.read_rdx()?;
+    if a == 0 || b == 0 {
+        let r = match (a, b) {
+            (0, 0) => 0_i32,
+            (0, _) => -1,
+            _ => 1,
+        };
+        return ret(engine, i32_status_to_u64(r));
+    }
+    let mut i = 0_u64;
+    loop {
+        let mut ba = [0_u8; 2];
+        let mut bb = [0_u8; 2];
+        let off = i.wrapping_mul(2);
+        engine.mem_read(a.wrapping_add(off), &mut ba)?;
+        engine.mem_read(b.wrapping_add(off), &mut bb)?;
+        let wa = u16::from_le_bytes(ba);
+        let wb = u16::from_le_bytes(bb);
+        if wa != wb {
+            let r = i32::from(wa).wrapping_sub(i32::from(wb));
+            return ret(engine, i32_status_to_u64(r));
+        }
+        if wa == 0 {
+            return ret(engine, 0);
+        }
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            return ret(engine, 0);
+        }
+    }
+}
+
+/// `wcsstr(haystack, needle)` — return pointer to first match or NULL.
+fn handle_wcsstr(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let hay = engine.read_rcx()?;
+    let needle = engine.read_rdx()?;
+    if hay == 0 || needle == 0 {
+        return ret(engine, 0);
+    }
+    // Read needle
+    let mut ndl = Vec::new();
+    let mut i = 0_u64;
+    loop {
+        let mut b = [0_u8; 2];
+        engine.mem_read(needle.wrapping_add(i.wrapping_mul(2)), &mut b)?;
+        let w = u16::from_le_bytes(b);
+        if w == 0 {
+            break;
+        }
+        ndl.push(w);
+        i = i.saturating_add(1);
+        if i > 100_000 {
+            break;
+        }
+    }
+    if ndl.is_empty() {
+        return ret(engine, hay);
+    }
+    // Scan haystack
+    let mut hay_units = Vec::new();
+    i = 0;
+    loop {
+        let mut b = [0_u8; 2];
+        engine.mem_read(hay.wrapping_add(i.wrapping_mul(2)), &mut b)?;
+        let w = u16::from_le_bytes(b);
+        if w == 0 {
+            break;
+        }
+        hay_units.push(w);
+        i = i.saturating_add(1);
+        if i > 1_000_000 {
+            break;
+        }
+    }
+    if let Some(pos) = hay_units
+        .windows(ndl.len())
+        .position(|w| w == ndl.as_slice())
+    {
+        let addr = hay.wrapping_add(u64::try_from(pos).unwrap_or(0).wrapping_mul(2));
+        return ret(engine, addr);
+    }
+    ret(engine, 0)
+}
+
+/// `_onexit` / `__dllonexit` — accept callback, return it (success).
+fn handle_onexit(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let func = engine.read_rcx()?;
+    // Return the function pointer to indicate registration success (MSVC CRT contract).
+    ret(engine, func)
+}
+
+/// `_beginthreadex` — map to soft CreateThread-like failure for now (return 0).
+///
+/// Full CRT thread start needs a guest bridge; 7za often falls back to single-thread.
+fn handle_begin_thread_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _security = engine.read_rcx()?;
+    let _stack = engine.read_rdx()?;
+    let _start = engine.read_r8()?;
+    let _arg = engine.read_r9()?;
+    // Return NULL → caller may use CreateThread or run single-threaded.
+    ret(engine, 0)
+}
+
+fn handle_purecall(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    // Pure virtual call — abort-like.
+    ret(engine, 0)
+}
+
+fn handle_terminate_cxx(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    ret(engine, 0)
+}
+
+fn handle_type_info_dtor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let this = engine.read_rcx()?;
+    ret(engine, this)
+}
+
+fn handle_cxx_throw_exception(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _ = (engine.read_rcx()?, engine.read_rdx()?);
+    // No C++ EH — return and hope caller doesn't depend on catch.
+    ret(engine, 0)
 }

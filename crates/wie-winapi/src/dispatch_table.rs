@@ -1176,16 +1176,8 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "removedirectorya",
         WinApiId::Kernel32Removefirectorya,
     ),
-    (
-        "kernel32.dll",
-        "deletefilew",
-        WinApiId::Kernel32Deletefilew,
-    ),
-    (
-        "kernel32.dll",
-        "deletefilea",
-        WinApiId::Kernel32Deletefilea,
-    ),
+    ("kernel32.dll", "deletefilew", WinApiId::Kernel32Deletefilew),
+    ("kernel32.dll", "deletefilea", WinApiId::Kernel32Deletefilea),
     ("kernel32.dll", "movefilew", WinApiId::Kernel32Movefilew),
     ("kernel32.dll", "movefilea", WinApiId::Kernel32Movefilea),
     (
@@ -1489,6 +1481,19 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "exit"
                 | "_exit"
                 | "abort"
+                | "realloc"
+                | "_isatty"
+                | "_get_osfhandle"
+                | "fputc"
+                | "fputs"
+                | "fgetc"
+                | "strcmp"
+                | "wcscmp"
+                | "wcsstr"
+                | "_onexit"
+                | "__dllonexit"
+                | "_beginthreadex"
+                | "_purecall"
         );
     }
     if library.eq_ignore_ascii_case("ole32.dll") {
@@ -1503,6 +1508,25 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         return matches!(
             n.as_str(),
             "shgetfolderpathw" | "shgetpathfromidlistw" | "shbrowseforfolderw"
+        );
+    }
+    if library.eq_ignore_ascii_case("oleaut32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "sysallocstring"
+                | "sysallocstringlen"
+                | "sysfreestring"
+                | "sysstringlen"
+                | "sysstringbyteslen"
+                | "variantclear"
+                | "variantcopy"
+                | "ordinal 2"
+                | "ordinal 4"
+                | "ordinal 6"
+                | "ordinal 7"
+                | "ordinal 9"
+                | "ordinal 10"
         );
     }
     if library.eq_ignore_ascii_case("KERNEL32.dll") {
@@ -1532,6 +1556,46 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "setevent"
                 | "resetevent"
                 | "getcurrentthread"
+                | "setconsolectrlhandler"
+                | "getconsolemode"
+                | "setconsolemode"
+                | "getconsolescreenbufferinfo"
+                | "setfileapistooem"
+                | "queryperformancefrequency"
+                | "getsysteminfo"
+                | "isprocessorfeaturepresent"
+                | "globalmemorystatusex"
+                | "getprocesstimes"
+                | "getlargepageminimum"
+                | "getprocessaffinitymask"
+                | "setprocessaffinitymask"
+                | "setthreadaffinitymask"
+                | "comparefiletime"
+                | "localfiletimetofiletime"
+                | "filetimetodosdatetime"
+                | "dosdatetimetofiletime"
+                | "getdiskfreespaceexw"
+                | "getdiskfreespacew"
+                | "getlogicaldrivestringsw"
+                | "setfileattributesw"
+                | "setfiletime"
+                | "formatmessagew"
+                | "resumethread"
+                | "createsemaphorew"
+                | "createsemaphorea"
+                | "releasesemaphore"
+                | "openeventw"
+                | "openeventa"
+                | "waitformultipleobjects"
+                | "movefilewithprogressw"
+                | "createhardlinkw"
+                | "findfirststreamw"
+                | "findnextstreamw"
+                | "deviceiocontrol"
+                | "mapviewoffile"
+                | "unmapviewoffile"
+                | "openfilemappingw"
+                | "openfilemappinga"
         );
     }
     false
@@ -1879,23 +1943,15 @@ pub fn dispatch_winapi_id(
         WinApiId::Kernel32Movefilea => kernel32::handle_move_file_a(engine, state),
         WinApiId::Kernel32Gettemppathw => kernel32::handle_get_temp_path_w(engine, state),
         WinApiId::Kernel32Gettemppatha => kernel32::handle_get_temp_path_a(engine, state),
-        WinApiId::Kernel32Gettempfilenamew => {
-            kernel32::handle_get_temp_file_name_w(engine, state)
-        }
-        WinApiId::Kernel32Gettempfilenamea => {
-            kernel32::handle_get_temp_file_name_a(engine, state)
-        }
+        WinApiId::Kernel32Gettempfilenamew => kernel32::handle_get_temp_file_name_w(engine, state),
+        WinApiId::Kernel32Gettempfilenamea => kernel32::handle_get_temp_file_name_a(engine, state),
         WinApiId::Kernel32Getdrivetypew => kernel32::handle_get_drive_type_w(engine, state),
         WinApiId::Kernel32Getdrivetypea => kernel32::handle_get_drive_type_a(engine, state),
         WinApiId::Kernel32Getlogicaldrives => kernel32::handle_get_logical_drives(engine, state),
         WinApiId::Kernel32Getsystemdirectoryw => kernel32::handle_get_system_directory_w(engine),
         WinApiId::Kernel32Getsystemdirectorya => kernel32::handle_get_system_directory_a(engine),
-        WinApiId::Kernel32Getwindowsdirectoryw => {
-            kernel32::handle_get_windows_directory_w(engine)
-        }
-        WinApiId::Kernel32Getwindowsdirectorya => {
-            kernel32::handle_get_windows_directory_a(engine)
-        }
+        WinApiId::Kernel32Getwindowsdirectoryw => kernel32::handle_get_windows_directory_w(engine),
+        WinApiId::Kernel32Getwindowsdirectorya => kernel32::handle_get_windows_directory_a(engine),
         WinApiId::Kernel32Getfilesizeex => kernel32::handle_get_file_size_ex(engine, state),
         WinApiId::Kernel32Setfilepointerex => kernel32::handle_set_file_pointer_ex(engine, state),
         WinApiId::Kernel32Setendoffile => kernel32::handle_set_end_of_file(engine, state),
@@ -1987,6 +2043,11 @@ pub fn dispatch_winapi(
     }
     if library.eq_ignore_ascii_case("advapi32.dll")
         && let Some(r) = advapi32::dispatch_advapi32_extra(engine, state, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("oleaut32.dll")
+        && let Some(r) = crate::oleaut32::dispatch_oleaut32(engine, state, name)?
     {
         return Ok(r);
     }

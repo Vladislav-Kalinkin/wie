@@ -4797,6 +4797,659 @@ pub fn handle_get_current_process(
     })
 }
 
+// ─── Soft console / process helpers for real CLI tools (7za) ────────────────
+
+const FIXED_PERFORMANCE_FREQUENCY: u64 = 10_000_000;
+const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+const ENABLE_LINE_INPUT: u32 = 0x0002;
+const ENABLE_ECHO_INPUT: u32 = 0x0004;
+const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
+const DEFAULT_CONSOLE_MODE_IN: u32 =
+    ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+const DEFAULT_CONSOLE_MODE_OUT: u32 = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
+
+fn ret_bool_true(engine: &mut dyn wie_cpu::CpuEngine, api: &str) -> Result<WinApiHandlerResult> {
+    let return_address = engine
+        .return_from_win64_api(1)
+        .with_context(|| format!("failed to return from {api}"))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+fn ret_u64(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    value: u64,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
+    let return_address = engine
+        .return_from_win64_api(value)
+        .with_context(|| format!("failed to return from {api}"))?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: value,
+    })
+}
+
+/// `BOOL SetConsoleCtrlHandler(PHANDLER_ROUTINE, BOOL)` — accept, ignore handler.
+pub fn handle_set_console_ctrl_handler(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _handler = engine.read_rcx().context("SetConsoleCtrlHandler RCX")?;
+    let _add = engine.read_rdx().context("SetConsoleCtrlHandler RDX")?;
+    ret_bool_true(engine, "SetConsoleCtrlHandler")
+}
+
+/// `BOOL GetConsoleMode(HANDLE, LPDWORD)`.
+pub fn handle_get_console_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx().context("GetConsoleMode RCX")?;
+    let mode_ptr = engine.read_rdx().context("GetConsoleMode RDX")?;
+    if mode_ptr == 0 {
+        return ret_u64(engine, 0, "GetConsoleMode");
+    }
+    let mode = if handle == FAKE_STDIN_HANDLE {
+        DEFAULT_CONSOLE_MODE_IN
+    } else {
+        DEFAULT_CONSOLE_MODE_OUT
+    };
+    write_guest_u32(engine, mode_ptr, mode)?;
+    ret_bool_true(engine, "GetConsoleMode")
+}
+
+/// `BOOL SetConsoleMode(HANDLE, DWORD)`.
+pub fn handle_set_console_mode(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _handle = engine.read_rcx().context("SetConsoleMode RCX")?;
+    let _mode = engine.read_rdx().context("SetConsoleMode RDX")?;
+    ret_bool_true(engine, "SetConsoleMode")
+}
+
+/// `BOOL GetConsoleScreenBufferInfo(HANDLE, PCONSOLE_SCREEN_BUFFER_INFO)`.
+pub fn handle_get_console_screen_buffer_info(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _handle = engine
+        .read_rcx()
+        .context("GetConsoleScreenBufferInfo RCX")?;
+    let info_ptr = engine
+        .read_rdx()
+        .context("GetConsoleScreenBufferInfo RDX")?;
+    if info_ptr == 0 {
+        return ret_u64(engine, 0, "GetConsoleScreenBufferInfo");
+    }
+    // CONSOLE_SCREEN_BUFFER_INFO is 22 bytes; pad to 24 so short stacks stay safe.
+    // COORD dwSize {X,Y} at 0; COORD dwCursorPosition at 4; WORD wAttributes at 8;
+    // SMALL_RECT srWindow at 10; COORD dwMaximumWindowSize at 18.
+    let mut buf = [0_u8; 24];
+    // dwSize = 80 x 25
+    buf[0..2].copy_from_slice(&80_u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&25_u16.to_le_bytes());
+    // wAttributes = 0x07 (gray on black)
+    buf[8..10].copy_from_slice(&0x0007_u16.to_le_bytes());
+    // srWindow: Left=0 Top=0 Right=79 Bottom=24
+    buf[10..12].copy_from_slice(&0_u16.to_le_bytes());
+    buf[12..14].copy_from_slice(&0_u16.to_le_bytes());
+    buf[14..16].copy_from_slice(&79_u16.to_le_bytes());
+    buf[16..18].copy_from_slice(&24_u16.to_le_bytes());
+    // dwMaximumWindowSize
+    buf[18..20].copy_from_slice(&80_u16.to_le_bytes());
+    buf[20..22].copy_from_slice(&25_u16.to_le_bytes());
+    engine
+        .mem_write(info_ptr, &buf)
+        .context("GetConsoleScreenBufferInfo write")?;
+    ret_bool_true(engine, "GetConsoleScreenBufferInfo")
+}
+
+/// `VOID SetFileApisToOEM(void)`.
+pub fn handle_set_file_apis_to_oem(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    ret_u64(engine, 0, "SetFileApisToOEM")
+}
+
+/// `BOOL QueryPerformanceFrequency(LARGE_INTEGER*)`.
+pub fn handle_query_performance_frequency(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let ptr = engine
+        .read_rcx()
+        .context("QueryPerformanceFrequency RCX")?;
+    if ptr != 0 {
+        write_guest_u64(engine, ptr, FIXED_PERFORMANCE_FREQUENCY)?;
+    }
+    ret_bool_true(engine, "QueryPerformanceFrequency")
+}
+
+/// `VOID GetSystemInfo(LPSYSTEM_INFO)`.
+pub fn handle_get_system_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let ptr = engine.read_rcx().context("GetSystemInfo RCX")?;
+    if ptr != 0 {
+        // SYSTEM_INFO on x64 (48 bytes):
+        // union { DWORD dwOemId; struct { WORD wProcessorArchitecture; WORD wReserved; } }
+        // DWORD dwPageSize;
+        // LPVOID lpMinimumApplicationAddress;
+        // LPVOID lpMaximumApplicationAddress;
+        // DWORD_PTR dwActiveProcessorMask;
+        // DWORD dwNumberOfProcessors;
+        // DWORD dwProcessorType;
+        // DWORD dwAllocationGranularity;
+        // WORD wProcessorLevel;
+        // WORD wProcessorRevision;
+        let mut buf = [0_u8; 48];
+        // wProcessorArchitecture = 9 (PROCESSOR_ARCHITECTURE_AMD64)
+        buf[0..2].copy_from_slice(&9_u16.to_le_bytes());
+        // dwPageSize = 0x1000
+        buf[4..8].copy_from_slice(&0x1000_u32.to_le_bytes());
+        // min app address 0x10000
+        buf[8..16].copy_from_slice(&0x1_0000_u64.to_le_bytes());
+        // max app address
+        buf[16..24].copy_from_slice(&0x0000_7fff_ffff_ffff_u64.to_le_bytes());
+        // active processor mask = 1
+        buf[24..32].copy_from_slice(&1_u64.to_le_bytes());
+        // number of processors = 1
+        buf[32..36].copy_from_slice(&1_u32.to_le_bytes());
+        // processor type = 8664
+        buf[36..40].copy_from_slice(&8664_u32.to_le_bytes());
+        // allocation granularity = 0x10000
+        buf[40..44].copy_from_slice(&0x1_0000_u32.to_le_bytes());
+        // level / revision
+        buf[44..46].copy_from_slice(&6_u16.to_le_bytes());
+        buf[46..48].copy_from_slice(&0x3c03_u16.to_le_bytes());
+        engine
+            .mem_write(ptr, &buf)
+            .context("GetSystemInfo write")?;
+    }
+    ret_u64(engine, 0, "GetSystemInfo")
+}
+
+/// `BOOL IsProcessorFeaturePresent(DWORD)`.
+pub fn handle_is_processor_feature_present(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let feature = low_u32(engine.read_rcx()?, "IsProcessorFeaturePresent")?;
+    // Advertise a few common x64 features as present; unknown → FALSE.
+    // 0=floating point, 6=compare exchange double, 7=MMX, 8=XMMI (SSE),
+    // 10=3DNow, 13=SSE2, 14=SSE3, 21=NX, 23=RDTSC, 25=compare exchange 128.
+    let present = matches!(feature, 0 | 6 | 7 | 8 | 10 | 13 | 14 | 21 | 23 | 25);
+    ret_u64(engine, u64::from(present), "IsProcessorFeaturePresent")
+}
+
+/// `BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX)`.
+pub fn handle_global_memory_status_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let ptr = engine.read_rcx().context("GlobalMemoryStatusEx RCX")?;
+    if ptr == 0 {
+        return ret_u64(engine, 0, "GlobalMemoryStatusEx");
+    }
+    // Read dwLength from guest (caller must set it); we fill the rest.
+    let length = {
+        let mut b = [0_u8; 4];
+        engine.mem_read(ptr, &mut b)?;
+        u32::from_le_bytes(b)
+    };
+    if length < 64 {
+        return ret_u64(engine, 0, "GlobalMemoryStatusEx");
+    }
+    // MEMORYSTATUSEX: dwLength@0, dwMemoryLoad@4, ullTotalPhys@8, ullAvailPhys@16,
+    // ullTotalPageFile@24, ullAvailPageFile@32, ullTotalVirtual@40, ullAvailVirtual@48,
+    // ullAvailExtendedVirtual@56.
+    write_guest_u32(engine, ptr, 64)?;
+    write_guest_u32(engine, ptr.wrapping_add(4), 25)?;
+    write_guest_u64(engine, ptr.wrapping_add(8), 8_u64 * 1024 * 1024 * 1024)?;
+    write_guest_u64(engine, ptr.wrapping_add(16), 6_u64 * 1024 * 1024 * 1024)?;
+    write_guest_u64(engine, ptr.wrapping_add(24), 16_u64 * 1024 * 1024 * 1024)?;
+    write_guest_u64(engine, ptr.wrapping_add(32), 12_u64 * 1024 * 1024 * 1024)?;
+    write_guest_u64(engine, ptr.wrapping_add(40), 128_u64 * 1024 * 1024 * 1024)?;
+    write_guest_u64(engine, ptr.wrapping_add(48), 120_u64 * 1024 * 1024 * 1024)?;
+    write_guest_u64(engine, ptr.wrapping_add(56), 0)?;
+    ret_bool_true(engine, "GlobalMemoryStatusEx")
+}
+
+/// `BOOL GetProcessTimes(HANDLE, LPFILETIME×4)`.
+pub fn handle_get_process_times(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _process = engine.read_rcx().context("GetProcessTimes RCX")?;
+    let creation = engine.read_rdx().context("GetProcessTimes RDX")?;
+    let exit_t = engine.read_r8().context("GetProcessTimes R8")?;
+    let kernel = engine.read_r9().context("GetProcessTimes R9")?;
+    let rsp = engine.read_rsp().context("GetProcessTimes RSP")?;
+    let user = read_guest_u64(engine, checked_address(rsp, 0x28, "GetProcessTimes lpUserTime")?)?;
+    // Fixed synthetic times (100-ns ticks).
+    if creation != 0 {
+        write_guest_u64(engine, creation, FIXED_SYSTEM_FILETIME)?;
+    }
+    if exit_t != 0 {
+        write_guest_u64(engine, exit_t, 0)?;
+    }
+    if kernel != 0 {
+        write_guest_u64(engine, kernel, 10_000_000)?;
+    }
+    if user != 0 {
+        write_guest_u64(engine, user, 20_000_000)?;
+    }
+    ret_bool_true(engine, "GetProcessTimes")
+}
+
+/// `SIZE_T GetLargePageMinimum(void)` — 0 = large pages unavailable.
+pub fn handle_get_large_page_minimum(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    ret_u64(engine, 0, "GetLargePageMinimum")
+}
+
+/// `BOOL GetProcessAffinityMask(HANDLE, PDWORD_PTR, PDWORD_PTR)`.
+pub fn handle_get_process_affinity_mask(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _process = engine.read_rcx()?;
+    let proc_mask = engine.read_rdx()?;
+    let sys_mask = engine.read_r8()?;
+    if proc_mask != 0 {
+        write_guest_u64(engine, proc_mask, 1)?;
+    }
+    if sys_mask != 0 {
+        write_guest_u64(engine, sys_mask, 1)?;
+    }
+    ret_bool_true(engine, "GetProcessAffinityMask")
+}
+
+/// `BOOL SetProcessAffinityMask(HANDLE, DWORD_PTR)`.
+pub fn handle_set_process_affinity_mask(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _process = engine.read_rcx()?;
+    let _mask = engine.read_rdx()?;
+    ret_bool_true(engine, "SetProcessAffinityMask")
+}
+
+/// `DWORD_PTR SetThreadAffinityMask(HANDLE, DWORD_PTR)` — return previous mask.
+pub fn handle_set_thread_affinity_mask(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _thread = engine.read_rcx()?;
+    let _mask = engine.read_rdx()?;
+    ret_u64(engine, 1, "SetThreadAffinityMask")
+}
+
+/// `LONG CompareFileTime(const FILETIME*, const FILETIME*)`.
+pub fn handle_compare_file_time(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let a = engine.read_rcx()?;
+    let b = engine.read_rdx()?;
+    let ta = if a == 0 {
+        0
+    } else {
+        read_guest_u64(engine, a)?
+    };
+    let tb = if b == 0 {
+        0
+    } else {
+        read_guest_u64(engine, b)?
+    };
+    let cmp: i32 = match ta.cmp(&tb) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    ret_u64(
+        engine,
+        u64::from_ne_bytes(i64::from(cmp).to_ne_bytes()),
+        "CompareFileTime",
+    )
+}
+
+/// `BOOL LocalFileTimeToFileTime(const FILETIME*, LPFILETIME)`.
+pub fn handle_local_file_time_to_file_time(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let local = engine.read_rcx()?;
+    let file = engine.read_rdx()?;
+    if local == 0 || file == 0 {
+        return ret_u64(engine, 0, "LocalFileTimeToFileTime");
+    }
+    // Prototype: treat local == UTC (no timezone conversion).
+    let t = read_guest_u64(engine, local)?;
+    write_guest_u64(engine, file, t)?;
+    ret_bool_true(engine, "LocalFileTimeToFileTime")
+}
+
+/// `BOOL FileTimeToDosDateTime(const FILETIME*, LPWORD, LPWORD)`.
+pub fn handle_file_time_to_dos_date_time(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let ft = engine.read_rcx()?;
+    let date_ptr = engine.read_rdx()?;
+    let time_ptr = engine.read_r8()?;
+    if ft == 0 {
+        return ret_u64(engine, 0, "FileTimeToDosDateTime");
+    }
+    // Fixed DOS date/time: 2026-07-19 12:00:00 → rough encoding.
+    // DOS date: day + (month<<5) + ((year-1980)<<9)
+    // 2026-07-19 → DOS date word; noon → DOS time word.
+    let dos_date: u16 = 0x5c_f3; // precomputed: day|month<<5|(year-1980)<<9
+    let dos_time: u16 = 0x60_00; // hour 12 << 11
+    if date_ptr != 0 {
+        write_guest_u16(engine, date_ptr, dos_date)?;
+    }
+    if time_ptr != 0 {
+        write_guest_u16(engine, time_ptr, dos_time)?;
+    }
+    ret_bool_true(engine, "FileTimeToDosDateTime")
+}
+
+/// `BOOL DosDateTimeToFileTime(WORD, WORD, LPFILETIME)`.
+pub fn handle_dos_date_time_to_file_time(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _date = engine.read_rcx()?;
+    let _time = engine.read_rdx()?;
+    let ft = engine.read_r8()?;
+    if ft == 0 {
+        return ret_u64(engine, 0, "DosDateTimeToFileTime");
+    }
+    write_guest_u64(engine, ft, FIXED_SYSTEM_FILETIME)?;
+    ret_bool_true(engine, "DosDateTimeToFileTime")
+}
+
+/// Fake free/total disk sizes for `GetDiskFreeSpace*`.
+const FAKE_DISK_GIB: u64 = 1024 * 1024 * 1024;
+/// ~100 GiB of 4 KiB clusters (8 sectors × 512).
+const FAKE_DISK_CLUSTERS: u32 = 26_214_400;
+/// Drive string payload: `C:\` + NUL + final NUL (TCHARs).
+const LOGICAL_DRIVE_TCHARS: u32 = 4;
+
+/// `BOOL GetDiskFreeSpaceExW(LPCWSTR, PULARGE_INTEGER×3)`.
+pub fn handle_get_disk_free_space_ex_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _path = engine.read_rcx()?;
+    let free_caller = engine.read_rdx()?;
+    let total = engine.read_r8()?;
+    let free_total = engine.read_r9()?;
+    if free_caller != 0 {
+        write_guest_u64(engine, free_caller, 50 * FAKE_DISK_GIB)?;
+    }
+    if total != 0 {
+        write_guest_u64(engine, total, 100 * FAKE_DISK_GIB)?;
+    }
+    if free_total != 0 {
+        write_guest_u64(engine, free_total, 50 * FAKE_DISK_GIB)?;
+    }
+    ret_bool_true(engine, "GetDiskFreeSpaceExW")
+}
+
+/// `BOOL GetDiskFreeSpaceW(LPCWSTR, LPDWORD×4)`.
+pub fn handle_get_disk_free_space_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _path = engine.read_rcx()?;
+    let spc = engine.read_rdx()?; // sectors per cluster
+    let bps = engine.read_r8()?; // bytes per sector
+    let free_clusters = engine.read_r9()?;
+    let rsp = engine.read_rsp()?;
+    let total_clusters =
+        read_guest_u64(engine, checked_address(rsp, 0x28, "GetDiskFreeSpaceW total")?)?;
+    if spc != 0 {
+        write_guest_u32(engine, spc, 8)?;
+    }
+    if bps != 0 {
+        write_guest_u32(engine, bps, 512)?;
+    }
+    let half = FAKE_DISK_CLUSTERS.wrapping_shr(1);
+    if free_clusters != 0 {
+        write_guest_u32(engine, free_clusters, half)?;
+    }
+    if total_clusters != 0 {
+        write_guest_u32(engine, total_clusters, FAKE_DISK_CLUSTERS)?;
+    }
+    ret_bool_true(engine, "GetDiskFreeSpaceW")
+}
+
+/// `DWORD GetLogicalDriveStringsW(DWORD, LPWSTR)` — report `C:\`.
+pub fn handle_get_logical_drive_strings_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let n_buffer = low_u32(engine.read_rcx()?, "GetLogicalDriveStringsW nBufferLength")?;
+    let buffer = engine.read_rdx()?;
+    if buffer == 0 || n_buffer == 0 || n_buffer < LOGICAL_DRIVE_TCHARS {
+        return ret_u64(
+            engine,
+            u64::from(LOGICAL_DRIVE_TCHARS),
+            "GetLogicalDriveStringsW",
+        );
+    }
+    // C : \ \0 + extra terminator WCHAR
+    let bytes: [u8; 10] = [
+        0x43, 0x00, // C
+        0x3A, 0x00, // :
+        0x5C, 0x00, // \
+        0x00, 0x00, // NUL
+        0x00, 0x00, // final NUL
+    ];
+    engine
+        .mem_write(buffer, &bytes)
+        .context("GetLogicalDriveStringsW write")?;
+    ret_u64(
+        engine,
+        u64::from(LOGICAL_DRIVE_TCHARS),
+        "GetLogicalDriveStringsW",
+    )
+}
+
+/// `BOOL SetFileAttributesW(LPCWSTR, DWORD)`.
+pub fn handle_set_file_attributes_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _path = engine.read_rcx()?;
+    let _attrs = engine.read_rdx()?;
+    // Best-effort success (VFS does not track Win32 attributes yet).
+    ret_bool_true(engine, "SetFileAttributesW")
+}
+
+/// `BOOL SetFileTime(HANDLE, const FILETIME*, const FILETIME*, const FILETIME*)`.
+pub fn handle_set_file_time(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _handle = engine.read_rcx()?;
+    let _creation = engine.read_rdx()?;
+    let _access = engine.read_r8()?;
+    let _write = engine.read_r9()?;
+    ret_bool_true(engine, "SetFileTime")
+}
+
+/// Minimal `FormatMessageW` — empty string / return 0 for now.
+pub fn handle_format_message_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _flags = engine.read_rcx()?;
+    let _source = engine.read_rdx()?;
+    let _message_id = engine.read_r8()?;
+    let _language_id = engine.read_r9()?;
+    // Buffer args ignored; report 0 characters written.
+    ret_u64(engine, 0, "FormatMessageW")
+}
+
+/// `DWORD ResumeThread(HANDLE)`.
+pub fn handle_resume_thread(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _thread = engine.read_rcx()?;
+    // Previous suspend count = 1 (was suspended once).
+    ret_u64(engine, 1, "ResumeThread")
+}
+
+/// `HANDLE CreateSemaphoreW(...)` — soft handle via event-like object.
+pub fn handle_create_semaphore(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    // Reuse CreateEvent machinery: a semaphore with count is modelled as an event for waits.
+    let _attrs = engine.read_rcx()?;
+    let _initial = engine.read_rdx()?;
+    let _maximum = engine.read_r8()?;
+    let _name = engine.read_r9()?;
+    // Allocate a fresh waitable handle via create_event path (manual-reset false, signaled).
+    handle_create_event_simple(engine, state, false, true)
+}
+
+fn handle_create_event_simple(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    manual_reset: bool,
+    initial_state: bool,
+) -> Result<WinApiHandlerResult> {
+    let (handle, _) = state.sync.register_event(manual_reset, initial_state);
+    state.last_error = 0;
+    ret_u64(engine, handle, "CreateSemaphore/Event")
+}
+
+/// `BOOL ReleaseSemaphore(HANDLE, LONG, LPLONG)`.
+pub fn handle_release_semaphore(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _handle = engine.read_rcx()?;
+    let _release = engine.read_rdx()?;
+    let prev = engine.read_r8()?;
+    if prev != 0 {
+        write_guest_u32(engine, prev, 0)?;
+    }
+    ret_bool_true(engine, "ReleaseSemaphore")
+}
+
+/// `HANDLE OpenEventW(DWORD, BOOL, LPCWSTR)`.
+pub fn handle_open_event(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _access = engine.read_rcx()?;
+    let _inherit = engine.read_rdx()?;
+    let _name = engine.read_r9().or_else(|_| engine.read_r8())?;
+    // Not found for named events in prototype.
+    let _ = state;
+    ret_u64(engine, 0, "OpenEventW")
+}
+
+/// `DWORD WaitForMultipleObjects(...)` — wait-all / any on soft waitables.
+pub fn handle_wait_for_multiple_objects(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    const WAIT_OBJECT_0: u64 = 0;
+    const WAIT_FAILED: u64 = 0xffff_ffff;
+    let count = low_u32(engine.read_rcx()?, "WaitForMultipleObjects count")?;
+    let handles_ptr = engine.read_rdx()?;
+    let wait_all = (engine.read_r8()? & 0xffff_ffff) != 0;
+    let _timeout = engine.read_r9()?;
+    if count == 0 || handles_ptr == 0 || count > 64 {
+        return ret_u64(engine, WAIT_FAILED, "WaitForMultipleObjects");
+    }
+    // Prototype: best-effort success at index 0 (real wait is handled by single-object path).
+    let _ = (wait_all, state);
+    for i in 0..count {
+        let ha = handles_ptr.wrapping_add(u64::from(i).wrapping_mul(8));
+        let _h = read_guest_u64(engine, ha)?;
+    }
+    ret_u64(engine, WAIT_OBJECT_0, "WaitForMultipleObjects")
+}
+
+/// `BOOL MoveFileWithProgressW` — alias MoveFileW semantics.
+pub fn handle_move_file_with_progress_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    // Same first two args as MoveFileW (existing/new).
+    handle_move_file_w(engine, state)
+}
+
+/// `BOOL CreateHardLinkW` — not supported; return FALSE.
+pub fn handle_create_hard_link_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
+    state.last_error = 1; // ERROR_INVALID_FUNCTION-ish
+    ret_u64(engine, 0, "CreateHardLinkW")
+}
+
+/// `HANDLE FindFirstStreamW` — no alternate streams.
+pub fn handle_find_first_stream_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
+    state.last_error = 38; // ERROR_HANDLE_EOF
+    ret_u64(engine, u64::MAX, "FindFirstStreamW") // INVALID_HANDLE_VALUE
+}
+
+/// `BOOL FindNextStreamW`.
+pub fn handle_find_next_stream_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _ = (engine.read_rcx()?, engine.read_rdx()?);
+    state.last_error = 38;
+    ret_u64(engine, 0, "FindNextStreamW")
+}
+
+/// `BOOL DeviceIoControl` — unsupported; return FALSE.
+pub fn handle_device_io_control(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _ = (
+        engine.read_rcx()?,
+        engine.read_rdx()?,
+        engine.read_r8()?,
+        engine.read_r9()?,
+    );
+    state.last_error = 1;
+    ret_u64(engine, 0, "DeviceIoControl")
+}
+
+/// `LPVOID MapViewOfFile` — not supported yet.
+pub fn handle_map_view_of_file(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _ = (
+        engine.read_rcx()?,
+        engine.read_rdx()?,
+        engine.read_r8()?,
+        engine.read_r9()?,
+    );
+    state.last_error = 8; // ERROR_NOT_ENOUGH_MEMORY
+    ret_u64(engine, 0, "MapViewOfFile")
+}
+
+/// `BOOL UnmapViewOfFile`.
+pub fn handle_unmap_view_of_file(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _base = engine.read_rcx()?;
+    ret_bool_true(engine, "UnmapViewOfFile")
+}
+
+/// `HANDLE OpenFileMappingW` — not found.
+pub fn handle_open_file_mapping(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
+    state.last_error = 2; // ERROR_FILE_NOT_FOUND
+    ret_u64(engine, 0, "OpenFileMapping")
+}
+
 /// Extra KERNEL32 exports used by CRT / modern PE (not yet in dense WinApiId table).
 pub fn dispatch_kernel32_extra(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -4845,6 +5498,54 @@ pub fn dispatch_kernel32_extra(
         "lstrlenw" => Ok(Some(handle_lstrlen_w(engine)?)),
         "lstrcpyw" => Ok(Some(handle_lstrcpy_w(engine)?)),
         "lstrcatw" => Ok(Some(handle_lstrcat_w(engine)?)),
+        // Console / process identity (7za CLI startup)
+        "setconsolectrlhandler" => Ok(Some(handle_set_console_ctrl_handler(engine)?)),
+        "getconsolemode" => Ok(Some(handle_get_console_mode(engine)?)),
+        "setconsolemode" => Ok(Some(handle_set_console_mode(engine)?)),
+        "getconsolescreenbufferinfo" => {
+            Ok(Some(handle_get_console_screen_buffer_info(engine)?))
+        }
+        "setfileapistooem" => Ok(Some(handle_set_file_apis_to_oem(engine)?)),
+        "queryperformancefrequency" => {
+            Ok(Some(handle_query_performance_frequency(engine)?))
+        }
+        "getsysteminfo" => Ok(Some(handle_get_system_info(engine)?)),
+        "isprocessorfeaturepresent" => {
+            Ok(Some(handle_is_processor_feature_present(engine)?))
+        }
+        "globalmemorystatusex" => Ok(Some(handle_global_memory_status_ex(engine)?)),
+        "getprocesstimes" => Ok(Some(handle_get_process_times(engine)?)),
+        "getlargepageminimum" => Ok(Some(handle_get_large_page_minimum(engine)?)),
+        "getprocessaffinitymask" => Ok(Some(handle_get_process_affinity_mask(engine)?)),
+        "setprocessaffinitymask" => Ok(Some(handle_set_process_affinity_mask(engine)?)),
+        "setthreadaffinitymask" => Ok(Some(handle_set_thread_affinity_mask(engine)?)),
+        "comparefiletime" => Ok(Some(handle_compare_file_time(engine)?)),
+        "localfiletimetofiletime" => Ok(Some(handle_local_file_time_to_file_time(engine)?)),
+        "filetimetodosdatetime" => Ok(Some(handle_file_time_to_dos_date_time(engine)?)),
+        "dosdatetimetofiletime" => Ok(Some(handle_dos_date_time_to_file_time(engine)?)),
+        "getdiskfreespaceexw" => Ok(Some(handle_get_disk_free_space_ex_w(engine, state)?)),
+        "getdiskfreespacew" => Ok(Some(handle_get_disk_free_space_w(engine, state)?)),
+        "getlogicaldrivestringsw" => Ok(Some(handle_get_logical_drive_strings_w(engine)?)),
+        "setfileattributesw" => Ok(Some(handle_set_file_attributes_w(engine, state)?)),
+        "setfiletime" => Ok(Some(handle_set_file_time(engine, state)?)),
+        "formatmessagew" => Ok(Some(handle_format_message_w(engine)?)),
+        "resumethread" => Ok(Some(handle_resume_thread(engine, state)?)),
+        "createsemaphorew" | "createsemaphorea" => {
+            Ok(Some(handle_create_semaphore(engine, state)?))
+        }
+        "releasesemaphore" => Ok(Some(handle_release_semaphore(engine, state)?)),
+        "openeventw" | "openeventa" => Ok(Some(handle_open_event(engine, state)?)),
+        "waitformultipleobjects" => Ok(Some(handle_wait_for_multiple_objects(engine, state)?)),
+        "movefilewithprogressw" => Ok(Some(handle_move_file_with_progress_w(engine, state)?)),
+        "createhardlinkw" => Ok(Some(handle_create_hard_link_w(engine, state)?)),
+        "findfirststreamw" => Ok(Some(handle_find_first_stream_w(engine, state)?)),
+        "findnextstreamw" => Ok(Some(handle_find_next_stream_w(engine, state)?)),
+        "deviceiocontrol" => Ok(Some(handle_device_io_control(engine, state)?)),
+        "mapviewoffile" => Ok(Some(handle_map_view_of_file(engine, state)?)),
+        "unmapviewoffile" => Ok(Some(handle_unmap_view_of_file(engine, state)?)),
+        "openfilemappingw" | "openfilemappinga" => {
+            Ok(Some(handle_open_file_mapping(engine, state)?))
+        }
         _ => Ok(None),
     }
 }

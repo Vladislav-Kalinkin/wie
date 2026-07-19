@@ -158,8 +158,133 @@ pub fn dispatch_advapi32_extra(
     match n.as_str() {
         "regopenkeyexw" => Ok(Some(handle_reg_open_key_ex_w(engine, state)?)),
         "regcreatekeyexw" => Ok(Some(handle_reg_create_key_ex_w(engine, state)?)),
+        "openprocesstoken" => Ok(Some(handle_open_process_token(engine, state)?)),
+        "adjusttokenprivileges" => Ok(Some(handle_adjust_token_privileges(engine)?)),
+        "lookupprivilegevaluew" | "lookupprivilegevaluea" => {
+            Ok(Some(handle_lookup_privilege_value(engine)?))
+        }
+        "systemfunction036" => Ok(Some(handle_system_function036(engine)?)),
+        "getfilesecurityw" | "getfilesecuritya" => Ok(Some(handle_get_file_security(engine)?)),
+        "setfilesecurityw" | "setfilesecuritya" => Ok(Some(handle_set_file_security(engine)?)),
         _ => Ok(None),
     }
+}
+
+const FAKE_PROCESS_TOKEN: u64 = 0x0000_0000_7000_0001;
+
+/// `BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, PHANDLE TokenHandle)`.
+fn handle_open_process_token(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let _process = engine
+        .read_rcx()
+        .context("OpenProcessToken RCX")?;
+    let _access = engine
+        .read_rdx()
+        .context("OpenProcessToken RDX")?;
+    let token_out = engine
+        .read_r8()
+        .context("OpenProcessToken R8")?;
+    if token_out != 0 {
+        write_guest_u64(engine, token_out, FAKE_PROCESS_TOKEN)?;
+    }
+    state.last_error = 0;
+    return_bool(engine, true)
+}
+
+/// `BOOL AdjustTokenPrivileges(...)` — succeed without changing privileges.
+fn handle_adjust_token_privileges(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _token = engine.read_rcx()?;
+    let _disable_all = engine.read_rdx()?;
+    let _new_state = engine.read_r8()?;
+    let _buf_len = engine.read_r9()?;
+    return_bool(engine, true)
+}
+
+/// `BOOL LookupPrivilegeValueW(LPCWSTR, LPCWSTR, PLUID)`.
+fn handle_lookup_privilege_value(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    let _system = engine.read_rcx()?;
+    let _name = engine.read_rdx()?;
+    let luid = engine.read_r8()?;
+    if luid != 0 {
+        // LUID is 8 bytes (LowPart + HighPart).
+        write_guest_u64(engine, luid, 0x20)?; // arbitrary Se* privilege id
+    }
+    return_bool(engine, true)
+}
+
+/// `BOOLEAN SystemFunction036(PVOID RandomBuffer, ULONG RandomBufferLength)` (RtlGenRandom).
+fn handle_system_function036(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let buf = engine.read_rcx()?;
+    let len = engine.read_rdx()? & 0xffff_ffff;
+    let len_usize = usize::try_from(len).unwrap_or(0);
+    if buf != 0 && len_usize > 0 {
+        // Deterministic pseudo-random fill (not crypto-grade; enough for 7z nonces).
+        let mut bytes = vec![0_u8; len_usize];
+        let mut state = 0x00c0_ffee_u64;
+        for b in &mut bytes {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            *b = u8::try_from((state >> 33) & 0xff).unwrap_or(0);
+        }
+        engine
+            .mem_write(buf, &bytes)
+            .context("SystemFunction036 write")?;
+    }
+    // BOOLEAN TRUE
+    return_bool(engine, true)
+}
+
+/// Minimal security descriptor size claim for `GetFileSecurity*`.
+const FAKE_SD_NEED: u32 = 20;
+
+/// `BOOL GetFileSecurityW(...)` — report not enough buffer / fail soft.
+fn handle_get_file_security(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _path = engine.read_rcx()?;
+    let _si = engine.read_rdx()?;
+    let sd = engine.read_r8()?;
+    let len = engine.read_r9()? & 0xffff_ffff;
+    let rsp = engine.read_rsp()?;
+    let needed_ptr = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x28, "GetFileSecurity length needed")?,
+    )?;
+    if needed_ptr != 0 {
+        write_guest_u32(engine, needed_ptr, FAKE_SD_NEED)?;
+    }
+    if sd != 0 && len >= u64::from(FAKE_SD_NEED) {
+        // Zeroed SD stub.
+        let need = usize::try_from(FAKE_SD_NEED).unwrap_or(20);
+        let zeros = vec![0_u8; need];
+        engine.mem_write(sd, &zeros)?;
+        return return_bool(engine, true);
+    }
+    return_bool(engine, false)
+}
+
+/// `BOOL SetFileSecurityW(...)` — accept.
+fn handle_set_file_security(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _path = engine.read_rcx()?;
+    let _si = engine.read_rdx()?;
+    let _sd = engine.read_r8()?;
+    return_bool(engine, true)
+}
+
+fn return_bool(engine: &mut dyn wie_cpu::CpuEngine, ok: bool) -> Result<WinApiHandlerResult> {
+    let v = u64::from(ok);
+    let return_address = engine
+        .return_from_win64_api(v)
+        .context("failed to return BOOL from ADVAPI32")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: v,
+    })
 }
 
 /// Handles `ADVAPI32.dll!RegQueryValueExA`.
