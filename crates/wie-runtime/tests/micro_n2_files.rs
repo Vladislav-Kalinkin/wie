@@ -1,4 +1,4 @@
-//! N2 micro-suite: bottle v0 write/read (freestanding PE64).
+//! N2 micro-suite: bottle write/read + VFS volume helpers (freestanding PE64).
 
 use std::path::PathBuf;
 
@@ -49,5 +49,33 @@ fn n2_write_and_read_file_in_bottle() {
         read_summary.run.termination
     );
 
+    // Skeleton dirs from ensure_bottle_skeleton.
+    assert!(bottle.join("drive_c/Windows/System32").is_dir());
+    assert!(bottle.join("drive_c/Users/WIE/AppData/Local/Temp").is_dir());
+
     let _ = std::fs::remove_dir_all(&bottle);
+}
+
+#[test]
+fn vfs_drive_d_maps_host_tree() {
+    let bottle = std::env::temp_dir().join(format!("wie-bottle-d-{}", std::process::id()));
+    let drive_d = std::env::temp_dir().join(format!("wie-drive-d-{}", std::process::id()));
+    std::fs::create_dir_all(&bottle).unwrap();
+    std::fs::create_dir_all(&drive_d).unwrap();
+    std::fs::write(drive_d.join("sample.txt"), b"from-d").unwrap();
+
+    let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.clone()), Some(drive_d.clone()));
+    let map = wie_winapi::vfs::guest_path_to_host(&volumes, r"D:\sample.txt").expect("D map");
+    assert_eq!(std::fs::read(&map.host).unwrap(), b"from-d");
+    assert_eq!(
+        wie_winapi::vfs::logical_drives_mask(&volumes),
+        (1 << 2) | (1 << 3)
+    );
+    assert_eq!(
+        wie_winapi::vfs::get_drive_type(&volumes, r"D:\"),
+        wie_winapi::vfs::DRIVE_FIXED
+    );
+
+    let _ = std::fs::remove_dir_all(&bottle);
+    let _ = std::fs::remove_dir_all(&drive_d);
 }

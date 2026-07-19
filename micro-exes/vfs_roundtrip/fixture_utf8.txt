@@ -1,0 +1,5 @@
+Hello WIE VFS — English line.
+Привет, мир! Русский текст UTF-8.
+你好世界 — Chinese (CJK).
+日本語テスト — Japanese.
+Mix: café résumé 漢字 🚀 end.

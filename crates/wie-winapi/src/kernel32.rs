@@ -190,11 +190,13 @@ const INVALID_SET_FILE_POINTER: u64 = 0xffff_ffff;
 
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_PATH_NOT_FOUND: u32 = 3;
+const ERROR_ACCESS_DENIED: u32 = 5;
 /// CreateFile CREATE_NEW when the file already exists (Microsoft Learn).
 const ERROR_FILE_EXISTS: u32 = 80;
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 const ERROR_PROC_NOT_FOUND: u32 = 127;
 const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_DIR_NOT_EMPTY: u32 = 145;
 
 // CreateFile disposition values.
 const CREATE_NEW: u64 = 1;
@@ -446,26 +448,6 @@ fn read_fixed_utf16_units(
     Ok(units)
 }
 
-fn utf16_units_to_multibyte(units: &[u16]) -> Result<Vec<u8>> {
-    let has_nul = units.last().is_some_and(|unit| *unit == 0);
-    let text_units = if has_nul {
-        units
-            .get(..units.len().saturating_sub(1))
-            .context("failed to slice UTF-16 units")?
-    } else {
-        units
-    };
-
-    let text = String::from_utf16(text_units).context("invalid UTF-16 input")?;
-    let mut bytes = text.into_bytes();
-
-    if has_nul {
-        bytes.push(0);
-    }
-
-    Ok(bytes)
-}
-
 fn classify_ctype1(unit: u16) -> u16 {
     let Some(ch) = char::from_u32(u32::from(unit)) else {
         return 0;
@@ -576,26 +558,6 @@ fn read_fixed_bytes(
         .context("failed to read fixed multibyte bytes")?;
 
     Ok(bytes)
-}
-
-fn multibyte_bytes_to_utf16_units(bytes: &[u8]) -> Result<Vec<u16>> {
-    let has_nul = bytes.last().is_some_and(|byte| *byte == 0);
-    let text_bytes = if has_nul {
-        bytes
-            .get(..bytes.len().saturating_sub(1))
-            .context("failed to slice multibyte bytes")?
-    } else {
-        bytes
-    };
-
-    let text = String::from_utf8_lossy(text_bytes);
-    let mut units: Vec<u16> = text.encode_utf16().collect();
-
-    if has_nul {
-        units.push(0);
-    }
-
-    Ok(units)
 }
 
 /// Copy a NUL-terminated ANSI path into a guest buffer.
@@ -857,55 +819,67 @@ fn read_wide_string_from_cpu(
     String::from_utf16(&units).context("wide string is not valid UTF-16")
 }
 
-fn fake_file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
+fn file_attributes_for_path(state: &WinApiState, path: &str) -> u64 {
     let normalized = path.trim();
-
     if normalized.is_empty() {
         return INVALID_FILE_ATTRIBUTES;
     }
 
-    if normalized.ends_with('\\') || normalized.ends_with('/') {
-        return FILE_ATTRIBUTE_DIRECTORY;
+    let mounts_ref: Vec<(String, std::path::PathBuf)> = state
+        .host_file_mounts
+        .iter()
+        .map(|m| (m.guest_path.clone(), m.host_path.clone()))
+        .collect();
+    let virtuals_ref: Vec<(String, usize)> = state
+        .virtual_files
+        .iter()
+        .map(|v| (v.guest_path.clone(), v.bytes.len()))
+        .collect();
+    let ctx = crate::vfs::ResolveCtx {
+        volumes: &state.volumes,
+        main_module_path: &state.main_module_path,
+        main_module_file_name: &state.main_module_file_name,
+        host_file_mounts: &mounts_ref,
+        virtual_files: &virtuals_ref,
+        synthetic_dirs: crate::vfs::DEFAULT_SYNTHETIC_DIRS,
+    };
+
+    let st = crate::vfs::stat_path(&ctx, normalized);
+    match st.kind {
+        crate::vfs::PathKind::NotFound => INVALID_FILE_ATTRIBUTES,
+        crate::vfs::PathKind::Directory => u64::from(st.attributes),
+        crate::vfs::PathKind::File => {
+            if ctx.path_is_main_module(normalized) {
+                FILE_ATTRIBUTE_ARCHIVE
+            } else {
+                u64::from(st.attributes).max(FILE_ATTRIBUTE_ARCHIVE)
+            }
+        }
     }
-
-    let lower = normalized.to_ascii_lowercase();
-
-    if lower.ends_with(':')
-        || lower.contains("\\windows")
-        || lower.contains("/windows")
-        || lower.contains("\\temp")
-        || lower.contains("/temp")
-    {
-        return FILE_ATTRIBUTE_DIRECTORY;
-    }
-
-    if guest_path_exists(state, normalized) {
-        return FILE_ATTRIBUTE_ARCHIVE;
-    }
-
-    // Keep historical permissive behavior for bootstrap probes of unknown paths.
-    FILE_ATTRIBUTE_ARCHIVE
 }
 
-fn fake_find_file_name_for_pattern(pattern: &str) -> String {
-    let trimmed = pattern.trim();
-
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let normalized = trimmed.replace('\\', "/");
-
-    if normalized.ends_with("/*") || normalized.ends_with("/*.*") {
-        return ".".to_owned();
-    }
-
-    normalized
-        .rsplit('/')
-        .next()
-        .filter(|name| !name.is_empty())
-        .unwrap_or(".")
-        .to_owned()
+/// Collect dir entries for a Find pattern (dir + mask).
+fn collect_find_entries(state: &WinApiState, full_pattern: &str) -> Vec<crate::vfs::DirEntry> {
+    let mounts_ref: Vec<(String, std::path::PathBuf)> = state
+        .host_file_mounts
+        .iter()
+        .map(|m| (m.guest_path.clone(), m.host_path.clone()))
+        .collect();
+    let virtuals_ref: Vec<(String, usize)> = state
+        .virtual_files
+        .iter()
+        .map(|v| (v.guest_path.clone(), v.bytes.len()))
+        .collect();
+    let ctx = crate::vfs::ResolveCtx {
+        volumes: &state.volumes,
+        main_module_path: &state.main_module_path,
+        main_module_file_name: &state.main_module_file_name,
+        host_file_mounts: &mounts_ref,
+        virtual_files: &virtuals_ref,
+        synthetic_dirs: crate::vfs::DEFAULT_SYNTHETIC_DIRS,
+    };
+    let (dir, mask) = crate::vfs::split_find_pattern(full_pattern);
+    crate::vfs::list_dir_filtered(&ctx, &dir, &mask)
 }
 
 fn write_find_data_common(
@@ -974,7 +948,7 @@ fn write_find_data_a(
     // WIN32_FIND_DATAA.cFileName offset is also 44.
     let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAA.cFileName")?;
 
-    let mut bytes = file_name.as_bytes().to_vec();
+    let mut bytes = crate::vfs::encode_acp(file_name);
     bytes.push(0);
 
     engine
@@ -1756,7 +1730,7 @@ pub fn handle_free_environment_strings_w(
 pub fn handle_wide_char_to_multi_byte(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
-    let _code_page = engine
+    let code_page = engine
         .read_rcx()
         .context("failed to read RCX for WideCharToMultiByte")?;
 
@@ -1783,7 +1757,9 @@ pub fn handle_wide_char_to_multi_byte(
     let out_len = read_guest_u64(engine, out_len_address)?;
 
     let units = read_utf16_units(engine, wide_ptr, wide_len_raw)?;
-    let bytes = utf16_units_to_multibyte(&units)?;
+    let cp = u32::try_from(code_page & 0xffff_ffff).unwrap_or(crate::vfs::CP_ACP);
+    let bytes = crate::vfs::wide_to_multibyte(cp, &units)
+        .ok_or_else(|| anyhow::anyhow!("WideCharToMultiByte invalid UTF-16"))?;
 
     let required_size =
         u64::try_from(bytes.len()).context("WideCharToMultiByte result length does not fit u64")?;
@@ -2015,12 +1991,8 @@ pub fn handle_multi_byte_to_wide_char(
     )?;
 
     let input_bytes = read_multibyte_bytes(engine, input_ptr, input_len_raw)?;
-    let sbcs = matches!(code_page & 0xffff_ffff, 0 | 1 | 2 | 3 | 437 | 1252);
-    let units = if sbcs {
-        multibyte_bytes_to_utf16_sbcs(&input_bytes)
-    } else {
-        multibyte_bytes_to_utf16_units(&input_bytes)?
-    };
+    let cp = u32::try_from(code_page & 0xffff_ffff).unwrap_or(0);
+    let units = crate::vfs::multibyte_to_wide(cp, &input_bytes);
 
     let required_units =
         u64::try_from(units.len()).context("MultiByteToWideChar unit length does not fit u64")?;
@@ -2057,10 +2029,6 @@ pub fn handle_multi_byte_to_wide_char(
 }
 
 /// Zero-extend each byte to UTF-16 (SBCS / Latin-1 identity).
-fn multibyte_bytes_to_utf16_sbcs(bytes: &[u8]) -> Vec<u16> {
-    bytes.iter().map(|b| u16::from(*b)).collect()
-}
-
 /// Handles `KERNEL32.dll!LCMapStringW`.
 pub fn handle_lc_map_string_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _locale = engine
@@ -2422,7 +2390,7 @@ pub fn handle_get_proc_address(
 /// Handles `KERNEL32.dll!GetFileAttributesA`.
 pub fn handle_get_file_attributes_a(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let path_ptr = engine
         .read_rcx()
@@ -2431,7 +2399,12 @@ pub fn handle_get_file_attributes_a(
     let path = read_ansi_string_from_cpu(engine, path_ptr, 1024)?;
     let cwd = String::from_utf16_lossy(&state.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, &path);
-    let return_value = fake_file_attributes_for_path(state, &full_path);
+    let return_value = file_attributes_for_path(state, &full_path);
+    if return_value == INVALID_FILE_ATTRIBUTES {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+    } else {
+        state.last_error = 0;
+    }
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2446,7 +2419,7 @@ pub fn handle_get_file_attributes_a(
 /// Handles `KERNEL32.dll!GetFileAttributesW`.
 pub fn handle_get_file_attributes_w(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let path_ptr = engine
         .read_rcx()
@@ -2455,7 +2428,12 @@ pub fn handle_get_file_attributes_w(
     let path = read_wide_string_from_cpu(engine, path_ptr, 1024)?;
     let cwd = String::from_utf16_lossy(&state.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, &path);
-    let return_value = fake_file_attributes_for_path(state, &full_path);
+    let return_value = file_attributes_for_path(state, &full_path);
+    if return_value == INVALID_FILE_ATTRIBUTES {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+    } else {
+        state.last_error = 0;
+    }
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2481,33 +2459,7 @@ pub fn handle_find_first_file_w(
         .context("failed to read RDX for FindFirstFileW")?;
 
     let pattern = read_wide_string_from_cpu(engine, pattern_ptr, 1024)?;
-
-    let return_value = if pattern.trim().is_empty() {
-        state.last_error = ERROR_FILE_NOT_FOUND;
-        INVALID_HANDLE_VALUE
-    } else {
-        let file_name = fake_find_file_name_for_pattern(&pattern);
-        let attributes_u64 = fake_file_attributes_for_path(state, &pattern);
-        let attributes = u32::try_from(attributes_u64 & 0xffff_ffff)
-            .context("FindFirstFileW attributes do not fit u32")?;
-
-        write_find_data_w(engine, find_data_ptr, &file_name, attributes)?;
-
-        let handle = state.next_find_handle;
-        state.next_find_handle = state
-            .next_find_handle
-            .checked_add(1)
-            .context("find handle overflow")?;
-
-        state.find_handles.push(FindHandle {
-            handle,
-            pattern,
-            consumed: true,
-        });
-
-        state.last_error = 0;
-        handle
-    };
+    let return_value = finish_find_first(engine, state, &pattern, find_data_ptr, true)?;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2533,33 +2485,7 @@ pub fn handle_find_first_file_a(
         .context("failed to read RDX for FindFirstFileA")?;
 
     let pattern = read_ansi_string_from_cpu(engine, pattern_ptr, 1024)?;
-
-    let return_value = if pattern.trim().is_empty() {
-        state.last_error = ERROR_FILE_NOT_FOUND;
-        INVALID_HANDLE_VALUE
-    } else {
-        let file_name = fake_find_file_name_for_pattern(&pattern);
-        let attributes_u64 = fake_file_attributes_for_path(state, &pattern);
-        let attributes = u32::try_from(attributes_u64 & 0xffff_ffff)
-            .context("FindFirstFileA attributes do not fit u32")?;
-
-        write_find_data_a(engine, find_data_ptr, &file_name, attributes)?;
-
-        let handle = state.next_find_handle;
-        state.next_find_handle = state
-            .next_find_handle
-            .checked_add(1)
-            .context("find handle overflow")?;
-
-        state.find_handles.push(FindHandle {
-            handle,
-            pattern,
-            consumed: true,
-        });
-
-        state.last_error = 0;
-        handle
-    };
+    let return_value = finish_find_first(engine, state, &pattern, find_data_ptr, false)?;
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2571,6 +2497,59 @@ pub fn handle_find_first_file_a(
     })
 }
 
+fn finish_find_first(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    pattern: &str,
+    find_data_ptr: u64,
+    unicode: bool,
+) -> Result<u64> {
+    if pattern.trim().is_empty() {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full_pattern = resolve_full_windows_path(&cwd, pattern);
+    let mut entries = collect_find_entries(state, &full_pattern);
+    if entries.is_empty() {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return Ok(INVALID_HANDLE_VALUE);
+    }
+
+    let first = entries.remove(0);
+    if unicode {
+        write_find_data_w(engine, find_data_ptr, &first.name, first.attributes)?;
+    } else {
+        write_find_data_a(engine, find_data_ptr, &first.name, first.attributes)?;
+    }
+    // Fill size fields.
+    if find_data_ptr != 0 {
+        let high = checked_field_address(find_data_ptr, 28, "nFileSizeHigh")?;
+        let low = checked_field_address(find_data_ptr, 32, "nFileSizeLow")?;
+        write_guest_u32(engine, high, u32::try_from(first.size >> 32).unwrap_or(0))?;
+        write_guest_u32(
+            engine,
+            low,
+            u32::try_from(first.size & 0xffff_ffff).unwrap_or(0),
+        )?;
+    }
+
+    let handle = state.next_find_handle;
+    state.next_find_handle = state
+        .next_find_handle
+        .checked_add(1)
+        .context("find handle overflow")?;
+
+    state.find_handles.push(FindHandle {
+        handle,
+        pattern: full_pattern,
+        remaining: entries,
+    });
+    state.last_error = 0;
+    Ok(handle)
+}
+
 /// Handles `KERNEL32.dll!FindNextFileW`.
 pub fn handle_find_next_file_w(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -2580,24 +2559,19 @@ pub fn handle_find_next_file_w(
         .read_rcx()
         .context("failed to read RCX for FindNextFileW")?;
 
-    let _find_data_ptr = engine
+    let find_data_ptr = engine
         .read_rdx()
         .context("failed to read RDX for FindNextFileW")?;
 
-    let valid = state.find_handles.iter().any(|h| h.handle == find_handle);
-    state.last_error = if valid {
-        ERROR_NO_MORE_FILES
-    } else {
-        ERROR_INVALID_HANDLE
-    };
+    let return_value = finish_find_next(engine, state, find_handle, find_data_ptr, true)?;
 
     let return_address = engine
-        .return_from_win64_api(0)
+        .return_from_win64_api(return_value)
         .context("failed to return from FindNextFileW")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 0,
+        return_value,
     })
 }
 
@@ -2610,25 +2584,61 @@ pub fn handle_find_next_file_a(
         .read_rcx()
         .context("failed to read RCX for FindNextFileA")?;
 
-    let _find_data_ptr = engine
+    let find_data_ptr = engine
         .read_rdx()
         .context("failed to read RDX for FindNextFileA")?;
 
-    let valid = state.find_handles.iter().any(|h| h.handle == find_handle);
-    state.last_error = if valid {
-        ERROR_NO_MORE_FILES
-    } else {
-        ERROR_INVALID_HANDLE
-    };
+    let return_value = finish_find_next(engine, state, find_handle, find_data_ptr, false)?;
 
     let return_address = engine
-        .return_from_win64_api(0)
+        .return_from_win64_api(return_value)
         .context("failed to return from FindNextFileA")?;
 
     Ok(WinApiHandlerResult {
         return_address,
-        return_value: 0,
+        return_value,
     })
+}
+
+fn finish_find_next(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    find_handle: u64,
+    find_data_ptr: u64,
+    unicode: bool,
+) -> Result<u64> {
+    let Some(slot) = state
+        .find_handles
+        .iter_mut()
+        .find(|h| h.handle == find_handle)
+    else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        return Ok(0);
+    };
+
+    if slot.remaining.is_empty() {
+        state.last_error = ERROR_NO_MORE_FILES;
+        return Ok(0);
+    }
+
+    let next = slot.remaining.remove(0);
+    if unicode {
+        write_find_data_w(engine, find_data_ptr, &next.name, next.attributes)?;
+    } else {
+        write_find_data_a(engine, find_data_ptr, &next.name, next.attributes)?;
+    }
+    if find_data_ptr != 0 {
+        let high = checked_field_address(find_data_ptr, 28, "nFileSizeHigh")?;
+        let low = checked_field_address(find_data_ptr, 32, "nFileSizeLow")?;
+        write_guest_u32(engine, high, u32::try_from(next.size >> 32).unwrap_or(0))?;
+        write_guest_u32(
+            engine,
+            low,
+            u32::try_from(next.size & 0xffff_ffff).unwrap_or(0),
+        )?;
+    }
+    state.last_error = 0;
+    Ok(1)
 }
 
 /// Handles `KERNEL32.dll!FindClose`.
@@ -3190,8 +3200,7 @@ pub fn handle_get_file_information_by_handle(
         let file_index_high_address = checked_field_address(info_ptr, 44, "nFileIndexHigh")?;
         let file_index_low_address = checked_field_address(info_ptr, 48, "nFileIndexLow")?;
 
-        let file_size =
-            u64::try_from(open_file.bytes.len()).context("open file size does not fit u64")?;
+        let file_size = open_file.size();
 
         write_guest_u32(
             engine,
@@ -3231,23 +3240,13 @@ pub fn handle_get_file_information_by_handle(
     })
 }
 
-fn normalize_guest_path(path: &str) -> String {
-    path.trim()
-        .trim_matches('"')
-        .replace('/', "\\")
-        .to_ascii_lowercase()
-}
-
 fn guest_basename(path: &str) -> &str {
-    path.rsplit(['\\', '/']).next().unwrap_or(path)
+    crate::vfs::guest_basename(path)
 }
 
+/// Full path equality (case-insensitive). Used for FS identity.
 fn paths_match_guest(requested: &str, candidate: &str) -> bool {
-    let requested_norm = normalize_guest_path(requested);
-    let candidate_norm = normalize_guest_path(candidate);
-
-    requested_norm == candidate_norm
-        || guest_basename(&requested_norm) == guest_basename(&candidate_norm)
+    crate::vfs::paths_equal_ci(requested, candidate)
 }
 
 fn find_open_file(state: &WinApiState, handle: u64) -> Option<&OpenGuestFile> {
@@ -3302,13 +3301,15 @@ fn open_or_create_guest_path(
         return Err(ERROR_PATH_NOT_FOUND);
     }
 
+    // Keep volumes.bottle_root in sync with legacy field.
+    if state.volumes.bottle_root != state.bottle_root {
+        state.volumes.bottle_root = state.bottle_root.clone();
+    }
+
     let cwd = String::from_utf16_lossy(&state.current_directory_wide);
     let full_path = resolve_full_windows_path(&cwd, guest_path);
 
-    let bottle_host = state
-        .bottle_root
-        .as_ref()
-        .and_then(|root| crate::guest_path_to_host(root, &full_path));
+    let bottle_host = crate::vfs::guest_path_to_host(&state.volumes, &full_path).map(|m| m.host);
     let existed = guest_path_exists(state, &full_path);
 
     match creation_disposition {
@@ -3368,11 +3369,6 @@ fn open_existing_guest_file(
     bottle_host: Option<&std::path::PathBuf>,
     truncate: bool,
 ) -> std::result::Result<u64, u32> {
-    let mut bytes =
-        resolve_guest_file_bytes(state, guest_path).map_err(|_| ERROR_FILE_NOT_FOUND)?;
-    if truncate {
-        bytes.clear();
-    }
     let host_path = bottle_host.cloned().or_else(|| {
         state
             .host_file_mounts
@@ -3380,6 +3376,32 @@ fn open_existing_guest_file(
             .find(|m| paths_match_guest(guest_path, &m.guest_path))
             .map(|m| m.host_path.clone())
     });
+
+    // Large host files: stream without loading into RAM.
+    if let Some(ref host) = host_path
+        && !is_main_module_path(state, guest_path)
+        && let Ok(meta) = std::fs::metadata(host)
+        && meta.is_file()
+        && meta.len() > crate::vfs::BUFFER_SIZE_THRESHOLD
+    {
+        if truncate {
+            drop(crate::vfs::host_set_len(host, 0));
+        }
+        return allocate_open_file_ex(
+            state,
+            guest_path,
+            Vec::new(),
+            Some(host.clone()),
+            true,
+        )
+        .map_err(|_| ERROR_FILE_NOT_FOUND);
+    }
+
+    let mut bytes =
+        resolve_guest_file_bytes(state, guest_path).map_err(|_| ERROR_FILE_NOT_FOUND)?;
+    if truncate {
+        bytes.clear();
+    }
     allocate_open_file(state, guest_path, bytes, host_path).map_err(|_| ERROR_FILE_NOT_FOUND)
 }
 
@@ -3435,14 +3457,13 @@ fn resolve_guest_file_bytes(state: &WinApiState, guest_path: &str) -> Result<Vec
         });
     }
 
-    if let Some(root) = state.bottle_root.as_ref()
-        && let Some(host) = crate::guest_path_to_host(root, guest_path)
-        && host.is_file()
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, guest_path)
+        && map.host.is_file()
     {
-        return std::fs::read(&host).with_context(|| {
+        return std::fs::read(&map.host).with_context(|| {
             format!(
-                "failed to read bottle file {} for guest path {guest_path}",
-                host.display()
+                "failed to read volume file {} for guest path {guest_path}",
+                map.host.display()
             )
         });
     }
@@ -3489,12 +3510,37 @@ fn allocate_open_file(
     bytes: Vec<u8>,
     host_path: Option<std::path::PathBuf>,
 ) -> Result<u64> {
+    allocate_open_file_ex(state, path, bytes, host_path, false)
+}
+
+fn allocate_open_file_ex(
+    state: &mut WinApiState,
+    path: &str,
+    bytes: Vec<u8>,
+    host_path: Option<std::path::PathBuf>,
+    force_stream: bool,
+) -> Result<u64> {
     let handle = state.next_file_handle;
 
     state.next_file_handle = state
         .next_file_handle
         .checked_add(1)
         .context("guest file handle allocator overflow")?;
+
+    let size_u64 = if force_stream {
+        host_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len())
+    } else {
+        u64::try_from(bytes.len()).unwrap_or(0)
+    };
+    // Stream large host-backed files; keep small files fully buffered for guest I/O accel.
+    let streaming = force_stream
+        || (host_path.is_some()
+            && size_u64 > crate::vfs::BUFFER_SIZE_THRESHOLD
+            && !is_main_module_path(state, path));
+    let bytes = if streaming { Vec::new() } else { bytes };
 
     state.open_files.insert(
         handle,
@@ -3504,6 +3550,7 @@ fn allocate_open_file(
             bytes,
             cursor: 0,
             host_path,
+            streaming,
             guest_data_va: None,
             guest_slot_index: None,
         },
@@ -3517,11 +3564,14 @@ fn allocate_open_file(
     Ok(handle)
 }
 
-/// Flush open-file buffer to bottle/mount host path when present.
+/// Flush open-file buffer to bottle/mount host path when present (buffered only).
 fn persist_open_file_to_host(state: &WinApiState, handle: u64) {
     let Some(open_file) = find_open_file(state, handle) else {
         return;
     };
+    if open_file.streaming {
+        return;
+    }
     let Some(host_path) = open_file.host_path.as_ref() else {
         return;
     };
@@ -3566,6 +3616,7 @@ pub fn mount_host_file(
     Ok(())
 }
 
+/// Whether a **file** exists at the guest path (for CreateFile open dispositions).
 fn guest_path_exists(state: &WinApiState, path: &str) -> bool {
     if is_main_module_path(state, path) {
         return true;
@@ -3577,12 +3628,6 @@ fn guest_path_exists(state: &WinApiState, path: &str) -> bool {
     {
         return true;
     }
-    if let Some(root) = state.bottle_root.as_ref()
-        && let Some(host) = crate::guest_path_to_host(root, path)
-        && host.is_file()
-    {
-        return true;
-    }
     if state
         .virtual_files
         .iter()
@@ -3590,8 +3635,15 @@ fn guest_path_exists(state: &WinApiState, path: &str) -> bool {
     {
         return true;
     }
-    let as_path = Path::new(path);
-    as_path.is_absolute() && as_path.is_file()
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, path) {
+        return map.host.is_file();
+    }
+    false
+}
+
+fn guest_dir_exists(state: &WinApiState, path: &str) -> bool {
+    let attrs = file_attributes_for_path(state, path);
+    attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
 }
 
 /// Handles `KERNEL32.dll!FileTimeToLocalFileTime`.
@@ -3862,8 +3914,7 @@ pub fn handle_set_file_pointer(
             let open_file = find_open_file_mut(state, handle)
                 .context("open file vanished during SetFilePointer")?;
 
-            let file_size =
-                u64::try_from(open_file.bytes.len()).context("open file size does not fit u64")?;
+            let file_size = open_file.size();
             let path = open_file.path.clone();
 
             let base = if move_method == FILE_BEGIN {
@@ -3932,8 +3983,7 @@ pub fn handle_get_file_size(
         .context("failed to read RDX for GetFileSize")?;
 
     let return_value = if let Some(open_file) = find_open_file(state, handle) {
-        let file_size =
-            u64::try_from(open_file.bytes.len()).context("open file size does not fit u64")?;
+        let file_size = open_file.size();
 
         let file_size_high =
             u32::try_from(file_size >> 32).context("open file size high does not fit u32")?;
@@ -4126,58 +4176,100 @@ pub fn handle_read_file(
 
     if success {
         let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
-        // Phase 1: advance cursor and capture slice bounds without cloning the path/body.
-        let (start, end, cursor_after, is_exe) = {
-            let (cursor_usize, end, cursor_after, path_for_exe) = {
-                let open_file = find_open_file_mut(state, handle)
+        let requested =
+            usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
+
+        let streaming = find_open_file(state, handle).is_some_and(|f| f.streaming);
+        if streaming {
+            let (host_path, cursor_before, path) = {
+                let open_file = find_open_file(state, handle)
                     .context("open file vanished during ReadFile")?;
-
-                let cursor_before = open_file.cursor;
-                let cursor_usize =
-                    usize::try_from(cursor_before).context("file cursor does not fit usize")?;
-                let requested = usize::try_from(bytes_to_read)
-                    .context("ReadFile byte count does not fit usize")?;
-                let available = open_file.bytes.len().saturating_sub(cursor_usize);
-                let read_len = requested.min(available);
-                let end = cursor_usize
-                    .checked_add(read_len)
-                    .context("ReadFile end offset overflow")?;
-                let read_len_u64 =
-                    u64::try_from(read_len).context("ReadFile byte count does not fit u64")?;
-                open_file.cursor = cursor_before
-                    .checked_add(read_len_u64)
-                    .context("ReadFile cursor overflow")?;
-                (cursor_usize, end, open_file.cursor, open_file.path.clone())
+                (
+                    open_file.host_path.clone(),
+                    open_file.cursor,
+                    open_file.path.clone(),
+                )
             };
-            let is_exe = is_main_module_path(state, &path_for_exe);
-            (cursor_usize, end, cursor_after, is_exe)
-        };
-
-        // Phase 2: immutable borrow for zero-copy mem_write of the file slice.
-        {
-            let open_file = find_open_file(state, handle)
-                .context("open file vanished during ReadFile write")?;
-            let data = open_file
-                .bytes
-                .get(start..end)
-                .context("ReadFile slice out of range")?;
+            let Some(host) = host_path else {
+                state.last_error = ERROR_INVALID_HANDLE;
+                let return_address = engine.return_from_win64_api(0)?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: 0,
+                });
+            };
+            let mut data = vec![0_u8; requested];
+            let n = crate::vfs::host_read_at(&host, cursor_before, &mut data).unwrap_or(0);
+            data.truncate(n);
             engine
-                .mem_write(buffer_ptr, data)
-                .context("failed to write ReadFile bytes")?;
-
-            let read_len_u32 =
-                u32::try_from(data.len()).context("ReadFile byte count does not fit u32")?;
-            if bytes_read_ptr != 0 {
-                write_guest_u32(engine, bytes_read_ptr, read_len_u32)?;
+                .mem_write(buffer_ptr, &data)
+                .context("failed to write ReadFile stream bytes")?;
+            if let Some(open_file) = find_open_file_mut(state, handle) {
+                open_file.cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
             }
-        }
+            if bytes_read_ptr != 0 {
+                write_guest_u32(
+                    engine,
+                    bytes_read_ptr,
+                    u32::try_from(n).unwrap_or(0),
+                )?;
+            }
+            if is_main_module_path(state, &path) {
+                state.executable_file_cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
+            }
+            state.last_error = 0;
+        } else {
+            // Phase 1: advance cursor and capture slice bounds without cloning the path/body.
+            let (start, end, cursor_after, is_exe) = {
+                let (cursor_usize, end, cursor_after, path_for_exe) = {
+                    let open_file = find_open_file_mut(state, handle)
+                        .context("open file vanished during ReadFile")?;
 
-        if is_exe {
-            state.executable_file_cursor = cursor_after;
-        }
+                    let cursor_before = open_file.cursor;
+                    let cursor_usize = usize::try_from(cursor_before)
+                        .context("file cursor does not fit usize")?;
+                    let available = open_file.bytes.len().saturating_sub(cursor_usize);
+                    let read_len = requested.min(available);
+                    let end = cursor_usize
+                        .checked_add(read_len)
+                        .context("ReadFile end offset overflow")?;
+                    let read_len_u64 =
+                        u64::try_from(read_len).context("ReadFile byte count does not fit u64")?;
+                    open_file.cursor = cursor_before
+                        .checked_add(read_len_u64)
+                        .context("ReadFile cursor overflow")?;
+                    (cursor_usize, end, open_file.cursor, open_file.path.clone())
+                };
+                let is_exe = is_main_module_path(state, &path_for_exe);
+                (cursor_usize, end, cursor_after, is_exe)
+            };
 
-        state.last_error = 0;
-        let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
+            // Phase 2: immutable borrow for zero-copy mem_write of the file slice.
+            {
+                let open_file = find_open_file(state, handle)
+                    .context("open file vanished during ReadFile write")?;
+                let data = open_file
+                    .bytes
+                    .get(start..end)
+                    .context("ReadFile slice out of range")?;
+                engine
+                    .mem_write(buffer_ptr, data)
+                    .context("failed to write ReadFile bytes")?;
+
+                let read_len_u32 =
+                    u32::try_from(data.len()).context("ReadFile byte count does not fit u32")?;
+                if bytes_read_ptr != 0 {
+                    write_guest_u32(engine, bytes_read_ptr, read_len_u32)?;
+                }
+            }
+
+            if is_exe {
+                state.executable_file_cursor = cursor_after;
+            }
+
+            state.last_error = 0;
+            let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
+        }
     } else {
         state.last_error = ERROR_INVALID_HANDLE;
     }
@@ -4276,7 +4368,29 @@ pub fn handle_write_file(
                 .context("failed to read WriteFile source buffer")?;
         }
 
-        let (path, cursor_before, cursor_after, file_size) = {
+        let streaming = find_open_file(state, handle).is_some_and(|f| f.streaming);
+        let (path, cursor_before, cursor_after, file_size) = if streaming {
+            let open_file =
+                find_open_file(state, handle).context("open file vanished during WriteFile")?;
+            let host = open_file
+                .host_path
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("streaming file missing host_path"))?;
+            let cursor_before = open_file.cursor;
+            let path = open_file.path.clone();
+            crate::vfs::host_write_at(&host, cursor_before, &data)
+                .map_err(|e| anyhow::anyhow!("host WriteFile: {e}"))?;
+            let write_len_u64 =
+                u64::try_from(write_len).context("WriteFile byte count does not fit u64")?;
+            let cursor_after = cursor_before
+                .checked_add(write_len_u64)
+                .context("WriteFile cursor overflow")?;
+            if let Some(open_file) = find_open_file_mut(state, handle) {
+                open_file.cursor = cursor_after;
+            }
+            let file_size = find_open_file(state, handle).map_or(0, OpenGuestFile::size);
+            (path, cursor_before, cursor_after, file_size)
+        } else {
             let open_file =
                 find_open_file_mut(state, handle).context("open file vanished during WriteFile")?;
 
@@ -4308,13 +4422,15 @@ pub fn handle_write_file(
                 .context("WriteFile cursor overflow")?;
 
             let cursor_after = open_file.cursor;
-            let file_size = open_file.bytes.len();
+            let file_size = u64::try_from(open_file.bytes.len()).unwrap_or(0);
             (path, cursor_before, cursor_after, file_size)
         };
 
         // Persist writes into the virtual-file store and bottle host path.
-        sync_open_bytes_to_virtual(state, &path, handle);
-        persist_open_file_to_host(state, handle);
+        if !streaming {
+            sync_open_bytes_to_virtual(state, &path, handle);
+            persist_open_file_to_host(state, handle);
+        }
 
         if is_main_module_path(state, &path) {
             state.executable_file_cursor = cursor_after;
@@ -4479,9 +4595,15 @@ pub fn handle_set_current_directory_w(
             // Relative directory names resolve against the current directory (MSDN).
             let cwd = String::from_utf16_lossy(&state.current_directory_wide);
             let full = resolve_full_windows_path(&cwd, &directory);
-            state.current_directory_wide = full.encode_utf16().collect();
-            state.last_error = 0;
-            true
+            if guest_dir_exists(state, &full) {
+                state.current_directory_wide = full.encode_utf16().collect();
+                // Keep guest cwd blob in sync when stubs are installed (best-effort).
+                state.last_error = 0;
+                true
+            } else {
+                state.last_error = ERROR_PATH_NOT_FOUND;
+                false
+            }
         }
     };
 
@@ -5966,107 +6088,14 @@ pub fn handle_global_delete_atom(
     })
 }
 
-fn normalize_windows_path_separators(path: &str) -> String {
-    path.chars()
-        .map(|character| if character == '/' { '\\' } else { character })
-        .collect()
-}
-
-fn is_windows_absolute_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-
-    let has_drive_prefix = bytes.get(1).is_some_and(|value| *value == b':')
-        && bytes.get(2).is_some_and(|value| *value == b'\\');
-
-    let has_unc_prefix = bytes.first() == Some(&b'\\') && bytes.get(1) == Some(&b'\\');
-
-    has_drive_prefix || has_unc_prefix
-}
-
-fn join_windows_path(base: &str, relative: &str) -> String {
-    let mut joined = base.trim_end_matches('\\').to_owned();
-
-    if !joined.is_empty() {
-        joined.push('\\');
-    }
-
-    joined.push_str(relative);
-    joined
-}
-
-fn normalize_windows_path_components(path: &str) -> String {
-    let normalized = normalize_windows_path_separators(path);
-
-    let mut prefix = String::new();
-    let mut remainder = normalized.as_str();
-
-    let bytes = normalized.as_bytes();
-
-    if bytes.get(1).is_some_and(|value| *value == b':') {
-        if let Some(drive) = normalized.get(..2) {
-            prefix.push_str(drive);
-        }
-
-        remainder = normalized.get(2..).unwrap_or_default();
-
-        if remainder.starts_with('\\') {
-            prefix.push('\\');
-            remainder = remainder.trim_start_matches('\\');
-        }
-    } else if normalized.starts_with("\\\\") {
-        prefix.push_str("\\\\");
-        remainder = normalized.strip_prefix("\\\\").unwrap_or_default();
-    }
-
-    let mut components = Vec::<String>::new();
-
-    for component in remainder.split('\\') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                let _removed = components.pop();
-            }
-            _ => components.push(component.to_owned()),
-        }
-    }
-
-    let mut result = prefix;
-
-    for component in components {
-        if !result.is_empty() && !result.ends_with('\\') {
-            result.push('\\');
-        }
-
-        result.push_str(&component);
-    }
-
-    result
-}
-
 /// Resolve a Windows path against the process current directory.
-///
-/// Clean room (Microsoft Learn path forms):
-/// - Absolute: `C:\…`, `\\server\share\…`
-/// - Drive-relative / relative: `file`, `.\file`, `subdir\file`, `..\file`
-/// - Rooted on current drive: `\file` → `{drive}:\file`
 fn resolve_full_windows_path(current_directory: &str, input_path: &str) -> String {
-    let normalized_input = normalize_windows_path_separators(input_path);
-    let cwd = normalize_windows_path_separators(current_directory);
+    crate::vfs::resolve_full_windows_path(current_directory, input_path)
+}
 
-    let combined = if is_windows_absolute_path(&normalized_input) {
-        normalized_input
-    } else if normalized_input.starts_with('\\') {
-        // `\foo` is rooted on the current drive (not a UNC path — those start with `\\`).
-        let drive = cwd
-            .get(..2)
-            .filter(|d| d.as_bytes().get(1) == Some(&b':'))
-            .unwrap_or("C:");
-        format!("{drive}{normalized_input}")
-    } else {
-        join_windows_path(&cwd, &normalized_input)
-    };
-
-    normalize_windows_path_components(&combined)
+#[cfg(test)]
+fn normalize_windows_path_components(path: &str) -> String {
+    crate::vfs::normalize_windows_path_components(path)
 }
 
 /// Handles `KERNEL32.dll!GetFullPathNameW`.
@@ -6168,6 +6197,825 @@ pub fn handle_get_full_path_name_w(
         .return_from_win64_api(return_value)
         .context("failed to return from GetFullPathNameW")?;
 
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetFullPathNameA`.
+pub fn handle_get_full_path_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let input_path_ptr = engine.read_rcx()?;
+    let buffer_characters_raw = engine.read_rdx()?;
+    let output_buffer_ptr = engine.read_r8()?;
+    let file_part_ptr_ptr = engine.read_r9()?;
+
+    let return_value = if input_path_ptr == 0 {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        0
+    } else {
+        let input_path = read_ansi_string_from_cpu(engine, input_path_ptr, 32_768)?;
+        if input_path.is_empty() {
+            state.last_error = ERROR_INVALID_PARAMETER;
+            0
+        } else {
+            let current_directory = String::from_utf16_lossy(&state.current_directory_wide);
+            let full_path = resolve_full_windows_path(&current_directory, &input_path);
+            let path_bytes = crate::vfs::encode_acp(&full_path);
+            let path_length = path_bytes.len();
+            let required_with_null = path_length.saturating_add(1);
+            let buffer_characters = usize::try_from(buffer_characters_raw).unwrap_or(0);
+            if output_buffer_ptr == 0 || buffer_characters < required_with_null {
+                if file_part_ptr_ptr != 0 {
+                    write_guest_u64(engine, file_part_ptr_ptr, 0)?;
+                }
+                state.last_error = 0;
+                u64::try_from(required_with_null).unwrap_or(0)
+            } else {
+                let mut out = path_bytes;
+                out.push(0);
+                engine.mem_write(output_buffer_ptr, &out)?;
+                if file_part_ptr_ptr != 0 {
+                    let file_off = full_path
+                        .rfind('\\')
+                        .map_or(0, |i| i.saturating_add(1));
+                    let file_part_ptr = output_buffer_ptr.saturating_add(u64::try_from(file_off).unwrap_or(0));
+                    write_guest_u64(engine, file_part_ptr_ptr, file_part_ptr)?;
+                }
+                state.last_error = 0;
+                u64::try_from(path_length).unwrap_or(0)
+            }
+        }
+    };
+
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetCurrentDirectoryA`.
+pub fn handle_get_current_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buffer_length = engine.read_rcx()?;
+    let buffer_ptr = engine.read_rdx()?;
+    let directory = String::from_utf16_lossy(&state.current_directory_wide);
+    let bytes = crate::vfs::encode_acp(&directory);
+    let character_count = u64::try_from(bytes.len()).unwrap_or(0);
+    let required_with_nul = character_count.saturating_add(1);
+    let return_value = if buffer_ptr == 0 || buffer_length == 0 || buffer_length <= character_count {
+        required_with_nul
+    } else {
+        let mut out = bytes;
+        out.push(0);
+        engine.mem_write(buffer_ptr, &out)?;
+        character_count
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!SetCurrentDirectoryA`.
+pub fn handle_set_current_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let directory_ptr = engine.read_rcx()?;
+    let success = if directory_ptr == 0 {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        false
+    } else {
+        let directory = read_ansi_string_from_cpu(engine, directory_ptr, 32_768)?;
+        if directory.is_empty() {
+            state.last_error = ERROR_PATH_NOT_FOUND;
+            false
+        } else {
+            let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+            let full = resolve_full_windows_path(&cwd, &directory);
+            if guest_dir_exists(state, &full) {
+                state.current_directory_wide = full.encode_utf16().collect();
+                state.last_error = 0;
+                true
+            } else {
+                state.last_error = ERROR_PATH_NOT_FOUND;
+                false
+            }
+        }
+    };
+    let return_value = u64::from(success);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
+    if path.is_empty() {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    }
+    if state.volumes.bottle_root != state.bottle_root {
+        state.volumes.bottle_root = state.bottle_root.clone();
+    }
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, path);
+    if guest_dir_exists(state, &full) {
+        state.last_error = ERROR_ALREADY_EXISTS;
+        return 0;
+    }
+    let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) else {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    };
+    if crate::vfs::mkdir_host(&map.host).is_ok() {
+        state.last_error = 0;
+        1
+    } else {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        0
+    }
+}
+
+/// Handles `KERNEL32.dll!CreateDirectoryW`.
+pub fn handle_create_directory_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let return_value = finish_create_directory(state, &path);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!CreateDirectoryA`.
+pub fn handle_create_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let return_value = finish_create_directory(state, &path);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
+    if path.is_empty() {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    }
+    if state.volumes.bottle_root != state.bottle_root {
+        state.volumes.bottle_root = state.bottle_root.clone();
+    }
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, path);
+    state
+        .virtual_files
+        .retain(|v| !paths_match_guest(&full, &v.guest_path));
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) {
+        if crate::vfs::remove_file_host(&map.host).is_ok() {
+            state.last_error = 0;
+            return 1;
+        }
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return 0;
+    }
+    state.last_error = ERROR_FILE_NOT_FOUND;
+    0
+}
+
+/// Handles `KERNEL32.dll!DeleteFileW`.
+pub fn handle_delete_file_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let return_value = finish_delete_file(state, &path);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!DeleteFileA`.
+pub fn handle_delete_file_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let return_value = finish_delete_file(state, &path);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u64 {
+    if path.is_empty() {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    }
+    if state.volumes.bottle_root != state.bottle_root {
+        state.volumes.bottle_root = state.bottle_root.clone();
+    }
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, path);
+    let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) else {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    };
+    match crate::vfs::remove_dir_host(&map.host) {
+        Ok(()) => {
+            state.last_error = 0;
+            1
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            state.last_error = ERROR_DIR_NOT_EMPTY;
+            0
+        }
+        Err(_) => {
+            state.last_error = ERROR_PATH_NOT_FOUND;
+            0
+        }
+    }
+}
+
+/// Handles `KERNEL32.dll!RemoveDirectoryW`.
+pub fn handle_remove_directory_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let return_value = finish_remove_directory(state, &path);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!RemoveDirectoryA`.
+pub fn handle_remove_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let return_value = finish_remove_directory(state, &path);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) -> u64 {
+    if from.is_empty() || to.is_empty() {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    }
+    if state.volumes.bottle_root != state.bottle_root {
+        state.volumes.bottle_root = state.bottle_root.clone();
+    }
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full_from = resolve_full_windows_path(&cwd, from);
+    let full_to = resolve_full_windows_path(&cwd, to);
+    let Some(src) = crate::vfs::guest_path_to_host(&state.volumes, &full_from) else {
+        state.last_error = ERROR_FILE_NOT_FOUND;
+        return 0;
+    };
+    let Some(dst) = crate::vfs::guest_path_to_host(&state.volumes, &full_to) else {
+        state.last_error = ERROR_PATH_NOT_FOUND;
+        return 0;
+    };
+    if crate::vfs::rename_host(&src.host, &dst.host).is_ok() {
+        state.last_error = 0;
+        1
+    } else {
+        state.last_error = ERROR_ACCESS_DENIED;
+        0
+    }
+}
+
+fn temp_name_id_u32(id: u64) -> u32 {
+    u32::try_from(id & 0xffff_ffff).unwrap_or(0)
+}
+
+/// Handles `KERNEL32.dll!MoveFileW`.
+pub fn handle_move_file_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let from_ptr = engine.read_rcx()?;
+    let to_ptr = engine.read_rdx()?;
+    let from = if from_ptr == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, from_ptr, 32_768)?
+    };
+    let to = if to_ptr == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, to_ptr, 32_768)?
+    };
+    let return_value = finish_move_file(state, &from, &to);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!MoveFileA`.
+pub fn handle_move_file_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let from_ptr = engine.read_rcx()?;
+    let to_ptr = engine.read_rdx()?;
+    let from = if from_ptr == 0 {
+        String::new()
+    } else {
+        read_ansi_string_from_cpu(engine, from_ptr, 32_768)?
+    };
+    let to = if to_ptr == 0 {
+        String::new()
+    } else {
+        read_ansi_string_from_cpu(engine, to_ptr, 32_768)?
+    };
+    let return_value = finish_move_file(state, &from, &to);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetTempPathW`.
+pub fn handle_get_temp_path_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buffer_len = engine.read_rcx()?;
+    let buffer_ptr = engine.read_rdx()?;
+    // Trailing backslash per Microsoft Learn.
+    let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
+    let units: Vec<u16> = temp.encode_utf16().collect();
+    let required = u64::try_from(units.len().saturating_add(1)).unwrap_or(0);
+    let return_value = if buffer_ptr == 0 || buffer_len < required {
+        required
+    } else {
+        let mut terminated = units;
+        terminated.push(0);
+        write_guest_utf16_units(engine, buffer_ptr, &terminated)?;
+        u64::try_from(terminated.len().saturating_sub(1)).unwrap_or(0)
+    };
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetTempPathA`.
+pub fn handle_get_temp_path_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let buffer_len = engine.read_rcx()?;
+    let buffer_ptr = engine.read_rdx()?;
+    let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
+    let bytes = crate::vfs::encode_acp(&temp);
+    let required = u64::try_from(bytes.len().saturating_add(1)).unwrap_or(0);
+    let return_value = if buffer_ptr == 0 || buffer_len < required {
+        required
+    } else {
+        let mut out = bytes;
+        out.push(0);
+        engine.mem_write(buffer_ptr, &out)?;
+        u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
+    };
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetTempFileNameW` (unique name under path; creates 0-byte file).
+pub fn handle_get_temp_file_name_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let prefix_ptr = engine.read_rdx()?;
+    let unique = engine.read_r8()?;
+    let buffer_ptr = engine.read_r9()?;
+    let path = if path_ptr == 0 {
+        crate::vfs::GUEST_TEMP_PATH.to_owned()
+    } else {
+        read_wide_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let prefix = if prefix_ptr == 0 {
+        "WIE".to_owned()
+    } else {
+        read_wide_string_from_cpu(engine, prefix_ptr, 16)?
+    };
+    let prefix: String = prefix.chars().take(3).collect();
+    let id = if unique == 0 {
+        state.tick_count = state.tick_count.wrapping_add(1);
+        state.tick_count
+    } else {
+        unique
+    };
+    let id_u32 = temp_name_id_u32(id);
+    let name = format!(
+        "{}\\{}{:04X}.tmp",
+        path.trim_end_matches('\\'),
+        prefix,
+        id_u32
+    );
+    finish_create_file_create_only(state, &name);
+    if buffer_ptr != 0 {
+        let mut units: Vec<u16> = name.encode_utf16().collect();
+        units.push(0);
+        write_guest_utf16_units(engine, buffer_ptr, &units)?;
+    }
+    state.last_error = 0;
+    let return_value = u64::from(id_u32).max(1);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+fn finish_create_file_create_only(state: &mut WinApiState, guest_path: &str) {
+    let cwd = String::from_utf16_lossy(&state.current_directory_wide);
+    let full = resolve_full_windows_path(&cwd, guest_path);
+    if state.volumes.bottle_root != state.bottle_root {
+        state.volumes.bottle_root = state.bottle_root.clone();
+    }
+    if let Some(map) = crate::vfs::guest_path_to_host(&state.volumes, &full) {
+        drop(crate::vfs::create_host_file(&map.host));
+    } else {
+        ensure_virtual_file(state, &full);
+    }
+}
+
+/// Handles `KERNEL32.dll!GetTempFileNameA`.
+pub fn handle_get_temp_file_name_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let prefix_ptr = engine.read_rdx()?;
+    let unique = engine.read_r8()?;
+    let buffer_ptr = engine.read_r9()?;
+    let path = if path_ptr == 0 {
+        crate::vfs::GUEST_TEMP_PATH.to_owned()
+    } else {
+        read_ansi_string_from_cpu(engine, path_ptr, 32_768)?
+    };
+    let prefix = if prefix_ptr == 0 {
+        "WIE".to_owned()
+    } else {
+        read_ansi_string_from_cpu(engine, prefix_ptr, 16)?
+    };
+    let prefix: String = prefix.chars().take(3).collect();
+    let id = if unique == 0 {
+        state.tick_count = state.tick_count.wrapping_add(1);
+        state.tick_count
+    } else {
+        unique
+    };
+    let id_u32 = temp_name_id_u32(id);
+    let name = format!(
+        "{}\\{}{:04X}.tmp",
+        path.trim_end_matches('\\'),
+        prefix,
+        id_u32
+    );
+    finish_create_file_create_only(state, &name);
+    if buffer_ptr != 0 {
+        let mut out = crate::vfs::encode_acp(&name);
+        out.push(0);
+        engine.mem_write(buffer_ptr, &out)?;
+    }
+    state.last_error = 0;
+    let return_value = u64::from(id_u32).max(1);
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetDriveTypeW`.
+pub fn handle_get_drive_type_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_wide_string_from_cpu(engine, path_ptr, 16)?
+    };
+    let return_value = u64::from(crate::vfs::get_drive_type(&state.volumes, &path));
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetDriveTypeA`.
+pub fn handle_get_drive_type_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let path_ptr = engine.read_rcx()?;
+    let path = if path_ptr == 0 {
+        String::new()
+    } else {
+        read_ansi_string_from_cpu(engine, path_ptr, 16)?
+    };
+    let return_value = u64::from(crate::vfs::get_drive_type(&state.volumes, &path));
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetLogicalDrives`.
+pub fn handle_get_logical_drives(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let return_value = u64::from(crate::vfs::logical_drives_mask(&state.volumes));
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetSystemDirectoryW`.
+pub fn handle_get_system_directory_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    write_fixed_dir_w(engine, crate::vfs::GUEST_SYSTEM_DIR)
+}
+
+/// Handles `KERNEL32.dll!GetSystemDirectoryA`.
+pub fn handle_get_system_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    write_fixed_dir_a(engine, crate::vfs::GUEST_SYSTEM_DIR)
+}
+
+/// Handles `KERNEL32.dll!GetWindowsDirectoryW`.
+pub fn handle_get_windows_directory_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    write_fixed_dir_w(engine, crate::vfs::GUEST_WINDOWS_DIR)
+}
+
+/// Handles `KERNEL32.dll!GetWindowsDirectoryA`.
+pub fn handle_get_windows_directory_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+) -> Result<WinApiHandlerResult> {
+    write_fixed_dir_a(engine, crate::vfs::GUEST_WINDOWS_DIR)
+}
+
+fn write_fixed_dir_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    dir: &str,
+) -> Result<WinApiHandlerResult> {
+    let buffer_len = engine.read_rcx()?;
+    let buffer_ptr = engine.read_rdx()?;
+    let units: Vec<u16> = dir.encode_utf16().collect();
+    let required = u64::try_from(units.len().saturating_add(1)).unwrap_or(0);
+    let return_value = if buffer_ptr == 0 || buffer_len < required {
+        required
+    } else {
+        let mut t = units;
+        t.push(0);
+        write_guest_utf16_units(engine, buffer_ptr, &t)?;
+        u64::try_from(t.len().saturating_sub(1)).unwrap_or(0)
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+fn write_fixed_dir_a(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    dir: &str,
+) -> Result<WinApiHandlerResult> {
+    let buffer_len = engine.read_rcx()?;
+    let buffer_ptr = engine.read_rdx()?;
+    let bytes = crate::vfs::encode_acp(dir);
+    let required = u64::try_from(bytes.len().saturating_add(1)).unwrap_or(0);
+    let return_value = if buffer_ptr == 0 || buffer_len < required {
+        required
+    } else {
+        let mut out = bytes;
+        out.push(0);
+        engine.mem_write(buffer_ptr, &out)?;
+        u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetFileSizeEx`.
+pub fn handle_get_file_size_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let size_ptr = engine.read_rdx()?;
+    let return_value = if let Some(open_file) = find_open_file(state, handle) {
+        if size_ptr != 0 {
+            write_guest_u64(engine, size_ptr, open_file.size())?;
+        }
+        state.last_error = 0;
+        1
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        0
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!SetFilePointerEx`.
+pub fn handle_set_file_pointer_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    // Win64: DistanceToMove is LARGE_INTEGER by value in RDX (signed 64-bit).
+    let distance_raw = engine.read_rdx()?;
+    let distance = i64::from_le_bytes(distance_raw.to_le_bytes());
+    let move_method = engine.read_r8()?;
+    let new_pos_ptr = engine.read_r9()?;
+
+    let valid_method =
+        move_method == FILE_BEGIN || move_method == FILE_CURRENT || move_method == FILE_END;
+    let return_value = if !is_open_file_handle(state, handle) {
+        state.last_error = ERROR_INVALID_HANDLE;
+        0
+    } else if !valid_method {
+        state.last_error = ERROR_INVALID_PARAMETER;
+        0
+    } else {
+        let open_file = find_open_file_mut(state, handle)
+            .context("open file vanished during SetFilePointerEx")?;
+        let file_size = open_file.size();
+        let base = if move_method == FILE_BEGIN {
+            0_i64
+        } else if move_method == FILE_CURRENT {
+            i64::try_from(open_file.cursor).unwrap_or(0)
+        } else {
+            i64::try_from(file_size).unwrap_or(0)
+        };
+        let new_position = base.saturating_add(distance);
+        if new_position < 0 {
+            state.last_error = ERROR_INVALID_PARAMETER;
+            0
+        } else {
+            let new_cursor = u64::try_from(new_position).unwrap_or(0);
+            open_file.cursor = new_cursor;
+            if new_pos_ptr != 0 {
+                write_guest_u64(engine, new_pos_ptr, new_cursor)?;
+            }
+            state.last_error = 0;
+            1
+        }
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!SetEndOfFile`.
+pub fn handle_set_end_of_file(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let return_value = if is_open_file_handle(state, handle) {
+        let (streaming, host, cursor, path) = {
+            let f = find_open_file(state, handle).context("open file vanished")?;
+            (
+                f.streaming,
+                f.host_path.clone(),
+                f.cursor,
+                f.path.clone(),
+            )
+        };
+        if streaming {
+            if let Some(host) = host {
+                drop(crate::vfs::host_set_len(&host, cursor));
+            }
+        } else {
+            if let Some(f) = find_open_file_mut(state, handle) {
+                let len = usize::try_from(cursor).unwrap_or(0);
+                f.bytes.resize(len, 0);
+            }
+            sync_open_bytes_to_virtual(state, &path, handle);
+            persist_open_file_to_host(state, handle);
+        }
+        state.last_error = 0;
+        1
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        0
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!FlushFileBuffers`.
+pub fn handle_flush_file_buffers(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let handle = engine.read_rcx()?;
+    let return_value = if is_open_file_handle(state, handle) {
+        persist_open_file_to_host(state, handle);
+        state.last_error = 0;
+        1
+    } else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        0
+    };
+    let return_address = engine.return_from_win64_api(return_value)?;
     Ok(WinApiHandlerResult {
         return_address,
         return_value,

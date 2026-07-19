@@ -49,6 +49,9 @@ printf 'CLI_IN\n' | ./target/release/wie-cli run micro-exes/out/cli_args.exe --s
 BOTTLE=$(mktemp -d)
 mkdir -p "$BOTTLE/drive_c/App"
 ./target/release/wie-cli run micro-exes/out/write_file.exe --root "$BOTTLE"
+
+# Optional host bridge: guest D:\… → host path (WIE_DRIVE_D / --drive-d)
+# ./target/release/wie-cli run real_exes/7z.exe --root "$BOTTLE" --drive-d "$PWD/data" -- a C:\App\out.7z D:\sample.txt
 ```
 
 ```bash
@@ -85,7 +88,7 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 5. **Fast paths** — JIT can lower hot UCRT imports (`malloc`, `free`, `memcpy`, `strlen`, `fwrite`, `fflush`, `__acrt_iob_func`) as direct host calls. Block chaining + edge IC + a shadow return stack keep control in native code across calls/rets/self-loops. Stack-heavy pure loops use a **block-wide pin super path** (bare host load/store after one prologue guard).
 
-6. **Host resources** — Bottles map `C:\…` → `{root}/drive_c/…`. Files, fake HWNDs, and a minimal message path live on the host. `VirtualAlloc` family goes through PageMap + VAD (soft translate only — no guest-VA `mmap`).
+6. **Host resources** — Bottles map `C:\…` → `{root}/drive_c/…` (Win10 skeleton dirs, no PE/DLL payload). Optional **D:** host bridge (`--drive-d` / `WIE_DRIVE_D`). Files, fake HWNDs, and a minimal message path live on the host. `VirtualAlloc` family goes through PageMap + VAD (soft translate only — no guest-VA `mmap`).
 
 ## JIT Compilation Details
 
@@ -127,7 +130,8 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 | `WIE_JIT_VERIFY=1`                      | Enable Cranelift IR verifier outside tests                                                            |
 | `WIE_RUNTIME_PROFILE=1`                 | Wall/CPU%, host stops, JIT load/store counts, `mem_backend`                                           |
 | `WIE_API_JOURNAL=path`                  | Per-API journal for backend A/B diffs                                                                 |
-| `WIE_ROOT` / `--root`                   | Bottle root for file APIs                                                                             |
+| `WIE_ROOT` / `--root`                   | Bottle root for guest `C:\` file APIs                                                                 |
+| `WIE_DRIVE_D` / `--drive-d`             | Host root for guest `D:\` bridge (`auto` = host cwd); unset = no D:                                   |
 | `WIE_GUEST_HEAP=1`                      | Rewire process-heap `HeapAlloc`/`HeapFree` to guest code                                              |
 | `WIE_GUEST_IO=0` \| `all`               | I/O accelerator: default seeks/size in-guest; `all` also guest Read (large → host); `0` = all host    |
 | `WIE_GUEST_MBWC=1`                      | Guest MultiByte↔WideChar helpers                                                                      |

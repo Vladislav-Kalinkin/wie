@@ -1,57 +1,30 @@
-//! Bottle v0: host workspace root for guest `C:\…` paths.
+//! Bottle v1: thin wrappers over [`crate::vfs`] volume mapping.
 //!
-//! Clean room: simple map only — `{root}/drive_c/<path-after-C:>`.
-//! Not a Wine/ReactOS prefix clone.
+//! Clean room: `{root}/drive_c/<path-after-C:>` for C:; optional D: via `VolumeConfig`.
 
+use crate::vfs::{VolumeConfig, guest_path_to_host as vfs_guest_path_to_host};
 use std::path::{Path, PathBuf};
 
-/// Map a guest Windows path to a host path under `bottle_root`.
-///
-/// Rules (v0):
-/// - Accepts `C:\…` / `c:/…` (drive C only; drive letter case-insensitive).
-/// - Host path is `{bottle_root}/drive_c/<relative>` with **path component case preserved**.
-/// - Rejects `..` components (no escape from root).
-/// - Returns `None` if the path is not a mappable C: path.
+/// Map a guest Windows path to a host path under `bottle_root` (C: only).
 #[must_use]
 pub fn guest_path_to_host(bottle_root: &Path, guest_path: &str) -> Option<PathBuf> {
-    let trimmed = guest_path.trim().trim_matches('"').replace('/', "\\");
-    let lower = trimmed.to_ascii_lowercase();
-
-    let relative = relative_after_drive_c(&trimmed, &lower)?;
-
-    if relative
-        .split('\\')
-        .any(|component| component == ".." || component.eq_ignore_ascii_case(".."))
-    {
-        return None;
-    }
-
-    let mut host = bottle_root.join("drive_c");
-    for component in relative.split('\\').filter(|c| !c.is_empty() && *c != ".") {
-        if component.contains('/') || component.contains('\\') {
-            return None;
-        }
-        host.push(component);
-    }
-    Some(host)
-}
-
-/// Returns the relative path after `C:\` with original case preserved.
-fn relative_after_drive_c<'a>(trimmed: &'a str, lower: &str) -> Option<&'a str> {
-    if lower.starts_with("c:\\") {
-        // ASCII prefixes only (`C:\` / `c:\`).
-        return trimmed.get(3..);
-    }
-    if lower == "c:" {
-        return Some("");
-    }
-    None
+    let volumes = VolumeConfig {
+        bottle_root: Some(bottle_root.to_path_buf()),
+        drive_d_root: None,
+    };
+    vfs_guest_path_to_host(&volumes, guest_path).map(|m| m.host)
 }
 
 /// Resolve bottle root from environment (`WIE_ROOT`).
 #[must_use]
 pub fn bottle_root_from_env() -> Option<PathBuf> {
-    std::env::var_os("WIE_ROOT").map(PathBuf::from)
+    crate::vfs::bottle_root_from_env()
+}
+
+/// Resolve optional D: host root from `WIE_DRIVE_D`.
+#[must_use]
+pub fn drive_d_from_env() -> Option<PathBuf> {
+    crate::vfs::drive_d_from_env()
 }
 
 #[cfg(test)]
@@ -83,7 +56,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_c() {
+    fn rejects_non_c_without_d() {
         let root = Path::new("/tmp/bottle");
         assert!(guest_path_to_host(root, r"D:\App\x").is_none());
     }

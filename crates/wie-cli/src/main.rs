@@ -69,6 +69,10 @@ enum Command {
         #[arg(long)]
         root: Option<PathBuf>,
 
+        /// Host root for guest `D:\…` bridge (also `WIE_DRIVE_D`; use `auto` for host cwd).
+        #[arg(long)]
+        drive_d: Option<PathBuf>,
+
         /// Host file whose bytes are injected as guest console stdin.
         #[arg(long)]
         stdin: Option<PathBuf>,
@@ -143,6 +147,7 @@ fn main() -> Result<()> {
             max_api,
             expect_code,
             root,
+            drive_d,
             stdin,
             persistent,
             guest_args,
@@ -152,8 +157,8 @@ fn main() -> Result<()> {
                 if !guest_args.is_empty() {
                     bail!("guest argv is only supported in micro mode (omit --persistent)");
                 }
-                if root.is_some() || stdin.is_some() {
-                    bail!("--root / --stdin are only supported in micro mode");
+                if root.is_some() || stdin.is_some() || drive_d.is_some() {
+                    bail!("--root / --drive-d / --stdin are only supported in micro mode");
                 }
                 if expect_code != 0 {
                     bail!("--expect-code is only supported in micro mode");
@@ -166,6 +171,7 @@ fn main() -> Result<()> {
                     max,
                     expect_code,
                     root.as_deref(),
+                    drive_d.as_deref(),
                     stdin.as_deref(),
                     &guest_args,
                 )?;

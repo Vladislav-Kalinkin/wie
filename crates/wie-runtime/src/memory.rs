@@ -214,6 +214,14 @@ pub(crate) fn default_winapi_state(
         threads: wie_winapi::ThreadState::primary(),
         sync: wie_winapi::SyncState::new(),
         bottle_root: wie_winapi::bottle_root_from_env(),
+        volumes: {
+            let bottle = wie_winapi::bottle_root_from_env();
+            let drive_d = wie_winapi::drive_d_from_env();
+            if let Some(ref root) = bottle {
+                let _ = wie_winapi::ensure_bottle_skeleton(root);
+            }
+            wie_winapi::VolumeConfig::from_parts(bottle, drive_d)
+        },
         executable_file_cursor: 0,
         next_resource_handle: 0x0000_0000_6300_0000,
         resources: Vec::new(),
@@ -349,7 +357,11 @@ pub(crate) fn write_utf16_string(
 }
 
 pub(crate) fn build_default_environment_strings_w() -> Result<Vec<u8>> {
-    let values = ["PATH=C:\\Windows\\System32", "TEMP=C:\\Temp"];
+    let values = [
+        "PATH=C:\\Windows\\System32",
+        "TEMP=C:\\Users\\WIE\\AppData\\Local\\Temp",
+        "TMP=C:\\Users\\WIE\\AppData\\Local\\Temp",
+    ];
 
     let mut bytes = Vec::new();
 

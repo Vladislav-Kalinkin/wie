@@ -23,8 +23,10 @@ pub mod thread;
 pub mod ucrt;
 pub mod user32;
 pub mod uxtheme;
+pub mod vfs;
 pub mod winmm;
-pub use bottle::{bottle_root_from_env, guest_path_to_host};
+pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
+pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
 pub use sync_obj::{
     CsWaitQueue, INFINITE, KernelObject, PendingSpawn, STILL_ACTIVE, SyncState, WAIT_FAILED,
     WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
@@ -116,7 +118,11 @@ pub struct WinApiState {
     /// Optional bottle root: guest `C:\…` maps to `{root}/drive_c/…` on the host.
     ///
     /// Set via `WIE_ROOT` / session. When set, CreateFile create/open uses real host files.
+    /// Prefer [`Self::volumes`]; this field is kept in sync for compatibility.
     pub bottle_root: Option<std::path::PathBuf>,
+
+    /// Volume table: bottle C: + optional host-bridge D:.
+    pub volumes: VolumeConfig,
 
     /// Current cursor for the fake executable file handle.
     ///
@@ -363,20 +369,38 @@ pub struct OpenGuestFile {
     /// Guest path used to open the file.
     pub path: String,
 
-    /// File contents (working buffer; flushed to `host_path` when set).
+    /// File contents (working buffer). Empty when [`Self::streaming`] is true.
     pub bytes: Vec<u8>,
 
     /// Current read/write cursor.
     pub cursor: u64,
 
-    /// When set, file is bottle/mount-backed and must be flushed to this host path.
+    /// When set, file is bottle/mount/D-backed and may be flushed/streamed here.
     pub host_path: Option<std::path::PathBuf>,
+
+    /// Large host file: I/O via `host_path` seek/read/write without full buffer.
+    pub streaming: bool,
 
     /// Guest VA of mirrored file bytes for in-guest ReadFile (if registered).
     pub guest_data_va: Option<u64>,
 
     /// Index into the guest I/O handle table (if registered).
     pub guest_slot_index: Option<u32>,
+}
+
+impl OpenGuestFile {
+    /// Logical file size in bytes.
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        if self.streaming {
+            self.host_path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map_or(0, |m| m.len())
+        } else {
+            u64::try_from(self.bytes.len()).unwrap_or(0)
+        }
+    }
 }
 
 /// A pure-guest virtual file (not backed by a host path).
@@ -602,17 +626,17 @@ pub struct ResourceRecord {
     pub size: u32,
 }
 
-/// Fake find-file handle.
+/// Fake find-file handle (materialized directory enumeration).
 #[derive(Debug, Clone)]
 pub struct FindHandle {
     /// Fake find handle.
     pub handle: u64,
 
-    /// Search pattern/path.
+    /// Search pattern/path as provided by the guest.
     pub pattern: String,
 
-    /// Whether first result was already consumed.
-    pub consumed: bool,
+    /// Remaining entries after the one returned by FindFirst (FindNext consumes).
+    pub remaining: Vec<vfs::DirEntry>,
 }
 
 /// Fake registry key.
@@ -796,6 +820,8 @@ mod tests {
             threads: ThreadState::primary(),
             sync: SyncState::new(),
             bottle_root: None,
+            volumes: VolumeConfig::default(),
+            // volumes.bottle_root kept in sync via set helpers / session
             executable_file_cursor: 0,
             host_file_mounts: Vec::new(),
             virtual_files: Vec::new(),

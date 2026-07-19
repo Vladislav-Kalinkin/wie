@@ -88,5 +88,44 @@ if ! grep -q 'REL_OK' "$BOTTLE/drive_c/App/n2_rel_out.txt"; then
 fi
 echo "relative path write ok: $BOTTLE/drive_c/App/n2_rel_out.txt"
 
-rm -rf "$BOTTLE"
+# Final VFS gate: host user dir as D: ↔ bottle C: UTF-8 round-trip
+DRIVE_D="$(mktemp -d "${TMPDIR:-/tmp}/wie-drive-d.XXXXXX")"
+FIXTURE="$ROOT/micro-exes/vfs_roundtrip/fixture_utf8.txt"
+cp "$FIXTURE" "$DRIVE_D/vfs_in.txt"
+echo "drive_d (host user bridge): $DRIVE_D"
+
+run_one "$ROOT/micro-exes/out/vfs_roundtrip.exe" --root "$BOTTLE" --drive-d "$DRIVE_D"
+
+if [[ ! -f "$BOTTLE/drive_c/App/vfs_copy.txt" ]]; then
+  echo "FAIL: vfs_copy.txt not created in bottle" >&2
+  exit 1
+fi
+if ! cmp -s "$FIXTURE" "$BOTTLE/drive_c/App/vfs_copy.txt"; then
+  echo "FAIL: bottle copy is not byte-identical to fixture" >&2
+  exit 1
+fi
+if [[ ! -f "$DRIVE_D/vfs_out.txt" ]]; then
+  echo "FAIL: vfs_out.txt not written back to host D:" >&2
+  exit 1
+fi
+if ! grep -q '---WIE_VFS---' "$DRIVE_D/vfs_out.txt"; then
+  echo "FAIL: vfs_out.txt missing stamp" >&2
+  exit 1
+fi
+# Unicode must survive (UTF-8 substrings).
+if ! grep -q 'Привет' "$DRIVE_D/vfs_out.txt"; then
+  echo "FAIL: Russian missing in host output" >&2
+  exit 1
+fi
+if ! grep -q '你好' "$DRIVE_D/vfs_out.txt"; then
+  echo "FAIL: Chinese missing in host output" >&2
+  exit 1
+fi
+if ! grep -q '日本語' "$DRIVE_D/vfs_out.txt"; then
+  echo "FAIL: Japanese missing in host output" >&2
+  exit 1
+fi
+echo "vfs_roundtrip ok: bottle copy + host D: modified export (EN/RU/CJK)"
+
+rm -rf "$BOTTLE" "$DRIVE_D"
 echo "=== micro-suite: ok ==="

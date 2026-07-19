@@ -28,6 +28,7 @@ pub fn register_open_file(
     };
 
     let size = match state.open_files.get(&handle) {
+        Some(f) if f.streaming => return Ok(()), // large host streams stay on host path
         Some(f) => f.bytes.len(),
         None => return Ok(()),
     };

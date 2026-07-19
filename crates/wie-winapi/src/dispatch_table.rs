@@ -289,9 +289,35 @@ pub enum WinApiId {
     User32Dispatchmessagea = 276,
     D3d9Idirect3ddevice9Release = 277,
     D3d9Idirect3d9Release = 278,
+    Kernel32Getfullpathnamea = 279,
+    Kernel32Getcurrentdirectorya = 280,
+    Kernel32Setcurrentdirectorya = 281,
+    Kernel32Createdirectoryw = 282,
+    Kernel32Createdirectorya = 283,
+    Kernel32Removefirectoryw = 284,
+    Kernel32Removefirectorya = 285,
+    Kernel32Deletefilew = 286,
+    Kernel32Deletefilea = 287,
+    Kernel32Movefilew = 288,
+    Kernel32Movefilea = 289,
+    Kernel32Gettemppathw = 290,
+    Kernel32Gettemppatha = 291,
+    Kernel32Gettempfilenamew = 292,
+    Kernel32Gettempfilenamea = 293,
+    Kernel32Getdrivetypew = 294,
+    Kernel32Getdrivetypea = 295,
+    Kernel32Getlogicaldrives = 296,
+    Kernel32Getsystemdirectoryw = 297,
+    Kernel32Getsystemdirectorya = 298,
+    Kernel32Getwindowsdirectoryw = 299,
+    Kernel32Getwindowsdirectorya = 300,
+    Kernel32Getfilesizeex = 301,
+    Kernel32Setfilepointerex = 302,
+    Kernel32Setendoffile = 303,
+    Kernel32Flushfilebuffers = 304,
 }
 
-pub const WINAPI_ID_COUNT: usize = 279;
+pub const WINAPI_ID_COUNT: usize = 305;
 
 impl WinApiId {
     /// Discriminant as `u16` (`#[repr(u16)]`).
@@ -1115,6 +1141,128 @@ static WINAPI_NAME_ROWS: &[(&str, &str, WinApiId)] = &[
         "getfullpathnamew",
         WinApiId::Kernel32Getfullpathnamew,
     ),
+    (
+        "kernel32.dll",
+        "getfullpathnamea",
+        WinApiId::Kernel32Getfullpathnamea,
+    ),
+    (
+        "kernel32.dll",
+        "getcurrentdirectorya",
+        WinApiId::Kernel32Getcurrentdirectorya,
+    ),
+    (
+        "kernel32.dll",
+        "setcurrentdirectorya",
+        WinApiId::Kernel32Setcurrentdirectorya,
+    ),
+    (
+        "kernel32.dll",
+        "createdirectoryw",
+        WinApiId::Kernel32Createdirectoryw,
+    ),
+    (
+        "kernel32.dll",
+        "createdirectorya",
+        WinApiId::Kernel32Createdirectorya,
+    ),
+    (
+        "kernel32.dll",
+        "removedirectoryw",
+        WinApiId::Kernel32Removefirectoryw,
+    ),
+    (
+        "kernel32.dll",
+        "removedirectorya",
+        WinApiId::Kernel32Removefirectorya,
+    ),
+    (
+        "kernel32.dll",
+        "deletefilew",
+        WinApiId::Kernel32Deletefilew,
+    ),
+    (
+        "kernel32.dll",
+        "deletefilea",
+        WinApiId::Kernel32Deletefilea,
+    ),
+    ("kernel32.dll", "movefilew", WinApiId::Kernel32Movefilew),
+    ("kernel32.dll", "movefilea", WinApiId::Kernel32Movefilea),
+    (
+        "kernel32.dll",
+        "gettemppathw",
+        WinApiId::Kernel32Gettemppathw,
+    ),
+    (
+        "kernel32.dll",
+        "gettemppatha",
+        WinApiId::Kernel32Gettemppatha,
+    ),
+    (
+        "kernel32.dll",
+        "gettempfilenamew",
+        WinApiId::Kernel32Gettempfilenamew,
+    ),
+    (
+        "kernel32.dll",
+        "gettempfilenamea",
+        WinApiId::Kernel32Gettempfilenamea,
+    ),
+    (
+        "kernel32.dll",
+        "getdrivetypew",
+        WinApiId::Kernel32Getdrivetypew,
+    ),
+    (
+        "kernel32.dll",
+        "getdrivetypea",
+        WinApiId::Kernel32Getdrivetypea,
+    ),
+    (
+        "kernel32.dll",
+        "getlogicaldrives",
+        WinApiId::Kernel32Getlogicaldrives,
+    ),
+    (
+        "kernel32.dll",
+        "getsystemdirectoryw",
+        WinApiId::Kernel32Getsystemdirectoryw,
+    ),
+    (
+        "kernel32.dll",
+        "getsystemdirectorya",
+        WinApiId::Kernel32Getsystemdirectorya,
+    ),
+    (
+        "kernel32.dll",
+        "getwindowsdirectoryw",
+        WinApiId::Kernel32Getwindowsdirectoryw,
+    ),
+    (
+        "kernel32.dll",
+        "getwindowsdirectorya",
+        WinApiId::Kernel32Getwindowsdirectorya,
+    ),
+    (
+        "kernel32.dll",
+        "getfilesizeex",
+        WinApiId::Kernel32Getfilesizeex,
+    ),
+    (
+        "kernel32.dll",
+        "setfilepointerex",
+        WinApiId::Kernel32Setfilepointerex,
+    ),
+    (
+        "kernel32.dll",
+        "setendoffile",
+        WinApiId::Kernel32Setendoffile,
+    ),
+    (
+        "kernel32.dll",
+        "flushfilebuffers",
+        WinApiId::Kernel32Flushfilebuffers,
+    ),
     ("d3d9.dll", "direct3dcreate9", WinApiId::D3d9Direct3dcreate9),
     (
         "d3d9.dll",
@@ -1617,6 +1765,44 @@ pub fn dispatch_winapi_id(
         WinApiId::User32Unhookwindowshookex => user32::handle_unhook_windows_hook_ex(engine, state),
         WinApiId::User32Callnexthookex => user32::handle_call_next_hook_ex(engine),
         WinApiId::Kernel32Getfullpathnamew => kernel32::handle_get_full_path_name_w(engine, state),
+        WinApiId::Kernel32Getfullpathnamea => kernel32::handle_get_full_path_name_a(engine, state),
+        WinApiId::Kernel32Getcurrentdirectorya => {
+            kernel32::handle_get_current_directory_a(engine, state)
+        }
+        WinApiId::Kernel32Setcurrentdirectorya => {
+            kernel32::handle_set_current_directory_a(engine, state)
+        }
+        WinApiId::Kernel32Createdirectoryw => kernel32::handle_create_directory_w(engine, state),
+        WinApiId::Kernel32Createdirectorya => kernel32::handle_create_directory_a(engine, state),
+        WinApiId::Kernel32Removefirectoryw => kernel32::handle_remove_directory_w(engine, state),
+        WinApiId::Kernel32Removefirectorya => kernel32::handle_remove_directory_a(engine, state),
+        WinApiId::Kernel32Deletefilew => kernel32::handle_delete_file_w(engine, state),
+        WinApiId::Kernel32Deletefilea => kernel32::handle_delete_file_a(engine, state),
+        WinApiId::Kernel32Movefilew => kernel32::handle_move_file_w(engine, state),
+        WinApiId::Kernel32Movefilea => kernel32::handle_move_file_a(engine, state),
+        WinApiId::Kernel32Gettemppathw => kernel32::handle_get_temp_path_w(engine, state),
+        WinApiId::Kernel32Gettemppatha => kernel32::handle_get_temp_path_a(engine, state),
+        WinApiId::Kernel32Gettempfilenamew => {
+            kernel32::handle_get_temp_file_name_w(engine, state)
+        }
+        WinApiId::Kernel32Gettempfilenamea => {
+            kernel32::handle_get_temp_file_name_a(engine, state)
+        }
+        WinApiId::Kernel32Getdrivetypew => kernel32::handle_get_drive_type_w(engine, state),
+        WinApiId::Kernel32Getdrivetypea => kernel32::handle_get_drive_type_a(engine, state),
+        WinApiId::Kernel32Getlogicaldrives => kernel32::handle_get_logical_drives(engine, state),
+        WinApiId::Kernel32Getsystemdirectoryw => kernel32::handle_get_system_directory_w(engine),
+        WinApiId::Kernel32Getsystemdirectorya => kernel32::handle_get_system_directory_a(engine),
+        WinApiId::Kernel32Getwindowsdirectoryw => {
+            kernel32::handle_get_windows_directory_w(engine)
+        }
+        WinApiId::Kernel32Getwindowsdirectorya => {
+            kernel32::handle_get_windows_directory_a(engine)
+        }
+        WinApiId::Kernel32Getfilesizeex => kernel32::handle_get_file_size_ex(engine, state),
+        WinApiId::Kernel32Setfilepointerex => kernel32::handle_set_file_pointer_ex(engine, state),
+        WinApiId::Kernel32Setendoffile => kernel32::handle_set_end_of_file(engine, state),
+        WinApiId::Kernel32Flushfilebuffers => kernel32::handle_flush_file_buffers(engine, state),
         WinApiId::D3d9Direct3dcreate9 => d3d9::handle_direct3d_create9(engine, state),
         WinApiId::D3d9Idirect3d9Getadaptercount => d3d9::handle_get_adapter_count(engine),
         WinApiId::D3d9Idirect3d9Getadaptermonitor => d3d9::handle_get_adapter_monitor(engine),

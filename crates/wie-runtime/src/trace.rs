@@ -181,6 +181,8 @@ pub fn run_micro_exe_with_root(
 pub struct MicroRunOptions {
     /// Bottle root for guest `C:\…` mapping (`None` = no bottle / ignore `WIE_ROOT`).
     pub bottle_root: Option<std::path::PathBuf>,
+    /// Optional host root for guest `D:\…` (`None` = no D: / use `WIE_DRIVE_D` only if set at session build).
+    pub drive_d_root: Option<std::path::PathBuf>,
     /// Extra guest argv after the module basename (visible via `GetCommandLine*`).
     pub guest_args: Vec<String>,
     /// Console stdin bytes for `ReadFile(STD_INPUT_HANDLE)`.
@@ -206,6 +208,9 @@ pub fn run_micro_exe_with_options(
         },
     )?;
     session.set_bottle_root(options.bottle_root);
+    if options.drive_d_root.is_some() {
+        session.set_drive_d(options.drive_d_root);
+    }
     let entry_point_va = session.entry_point_va();
     let initial_rsp = session.initial_rsp();
     let run = session.run_until_stop(max_api)?;

@@ -1040,7 +1040,18 @@ impl RuntimeSession {
     ///
     /// Overrides any `WIE_ROOT` applied at session construction.
     pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
-        self.process.with_mut(|_, s| s.bottle_root = root);
+        self.process.with_mut(|_, s| {
+            if let Some(ref r) = root {
+                let _ = wie_winapi::ensure_bottle_skeleton(r);
+            }
+            s.bottle_root = root.clone();
+            s.volumes.bottle_root = root;
+        });
+    }
+
+    /// Sets optional host-bridge root for guest `D:\…` (`None` unmounts D:).
+    pub fn set_drive_d(&mut self, root: Option<std::path::PathBuf>) {
+        self.process.with_mut(|_, s| s.volumes.drive_d_root = root);
     }
 
     /// Replaces guest stdin buffer for console `ReadFile` on STD_INPUT_HANDLE.

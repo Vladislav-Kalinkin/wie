@@ -10,6 +10,7 @@ pub(crate) fn run_micro(
     max_api: usize,
     expect_code: u32,
     bottle_root: Option<&Path>,
+    drive_d: Option<&Path>,
     stdin_path: Option<&Path>,
     guest_args: &[String],
 ) -> Result<()> {
@@ -18,6 +19,12 @@ pub(crate) fn run_micro(
         .or_else(wie_winapi::bottle_root_from_env);
     if let Some(ref r) = root {
         println!("bottle_root: {}", r.display());
+    }
+    let drive_d_root = drive_d
+        .map(std::path::Path::to_path_buf)
+        .or_else(wie_winapi::drive_d_from_env);
+    if let Some(ref d) = drive_d_root {
+        println!("drive_d: {}", d.display());
     }
     let stdin_bytes = match stdin_path {
         Some(p) => std::fs::read(p)
@@ -35,6 +42,7 @@ pub(crate) fn run_micro(
         max_api,
         wie_runtime::MicroRunOptions {
             bottle_root: root,
+            drive_d_root,
             guest_args: guest_args.to_vec(),
             stdin_bytes,
         },

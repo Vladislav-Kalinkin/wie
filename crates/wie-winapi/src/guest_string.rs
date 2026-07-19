@@ -5,8 +5,19 @@ pub(crate) fn read_ansi_lossy(
     address: u64,
     max_bytes: usize,
 ) -> Result<String> {
+    let bytes = read_ansi_bytes(engine, address, max_bytes)?;
+    // Prefer ACP-1252 for path/ANSI APIs (GetACP); UTF-8 lossy was too aggressive.
+    Ok(crate::vfs::decode_acp(&bytes))
+}
+
+/// Read raw ANSI bytes (NUL-terminated), excluding the terminator.
+pub(crate) fn read_ansi_bytes(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    address: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     if address == 0 {
-        return Ok(String::new());
+        return Ok(Vec::new());
     }
 
     let mut bytes = Vec::new();
@@ -33,7 +44,7 @@ pub(crate) fn read_ansi_lossy(
         bytes.push(value);
     }
 
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 pub(crate) fn read_utf16_lossy(
