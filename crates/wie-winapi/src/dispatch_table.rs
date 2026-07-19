@@ -1437,7 +1437,104 @@ pub fn winapi_id_export(id: WinApiId) -> Option<(&'static str, &'static str)> {
 
 #[must_use]
 pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
-    resolve_winapi_id(library, name).is_some()
+    if resolve_winapi_id(library, name).is_some() {
+        return true;
+    }
+    // Soft UCRT / msvcrt path (string dispatch, not dense WinApiId).
+    if crate::ucrt::is_ucrt_library(library) {
+        if crate::ucrt::crt_data_import_va(name).is_some() {
+            return true;
+        }
+        // Mirror dispatch_ucrt arms that are callable exports.
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "__acrt_iob_func"
+                | "fwrite"
+                | "fflush"
+                | "setvbuf"
+                | "__stdio_common_vfprintf"
+                | "malloc"
+                | "calloc"
+                | "free"
+                | "_set_new_mode"
+                | "__p__environ"
+                | "__p__acmdln"
+                | "__p___argc"
+                | "__p___argv"
+                | "__p__commode"
+                | "__p__fmode"
+                | "_configthreadlocale"
+                | "__setusermatherr"
+                | "__c_specific_handler"
+                | "memcpy"
+                | "memmove"
+                | "memcmp"
+                | "memset"
+                | "strlen"
+                | "strncmp"
+                | "_initterm"
+                | "_initterm_e"
+                | "_configure_narrow_argv"
+                | "_initialize_narrow_environment"
+                | "_crt_atexit"
+                | "_set_app_type"
+                | "__set_app_type"
+                | "_set_invalid_parameter_handler"
+                | "__getmainargs"
+                | "_xcptfilter"
+                | "_cexit"
+                | "_c_exit"
+                | "signal"
+                | "exit"
+                | "_exit"
+                | "abort"
+        );
+    }
+    if library.eq_ignore_ascii_case("ole32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "coinitialize" | "coinitializeex" | "couninitialize" | "cocreateinstance"
+        );
+    }
+    if library.eq_ignore_ascii_case("shell32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "shgetfolderpathw" | "shgetpathfromidlistw" | "shbrowseforfolderw"
+        );
+    }
+    if library.eq_ignore_ascii_case("KERNEL32.dll") {
+        let n = name.to_ascii_lowercase();
+        return matches!(
+            n.as_str(),
+            "getversion"
+                | "getmodulehandlew"
+                | "lstrlenw"
+                | "lstrcpyw"
+                | "lstrcatw"
+                | "virtualalloc"
+                | "virtualfree"
+                | "virtualprotect"
+                | "virtualquery"
+                | "flushinstructioncache"
+                | "tlsgetvalue"
+                | "tlssetvalue"
+                | "tlsalloc"
+                | "tlsfree"
+                | "createthread"
+                | "exitthread"
+                | "getexitcodethread"
+                | "waitforsingleobject"
+                | "createeventa"
+                | "createeventw"
+                | "setevent"
+                | "resetevent"
+                | "getcurrentthread"
+        );
+    }
+    false
 }
 
 /// Hot-path dispatch: integer match (LLVM jump table), no string work.
@@ -1875,6 +1972,21 @@ pub fn dispatch_winapi(
     // Kernel32 CRT-deps not yet in the dense id table (Virtual*, Tls*).
     if library.eq_ignore_ascii_case("KERNEL32.dll")
         && let Some(r) = kernel32::dispatch_kernel32_extra(engine, environment, state, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("ole32.dll")
+        && let Some(r) = crate::ole32::dispatch_ole32(engine, state, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("shell32.dll")
+        && let Some(r) = crate::shell32::dispatch_shell32(engine, state, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("advapi32.dll")
+        && let Some(r) = advapi32::dispatch_advapi32_extra(engine, state, name)?
     {
         return Ok(r);
     }

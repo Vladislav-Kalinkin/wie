@@ -18,6 +18,8 @@ mod guest_memory;
 mod guest_string;
 pub mod idle;
 pub mod kernel32;
+pub mod ole32;
+pub mod shell32;
 pub mod sync_obj;
 pub mod thread;
 pub mod ucrt;

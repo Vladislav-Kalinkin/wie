@@ -28,6 +28,20 @@ pub fn is_ucrt_library(library: &str) -> bool {
     l.starts_with("api-ms-win-crt-") || l == "ucrtbase.dll" || l == "msvcrt.dll"
 }
 
+/// Guest VA for legacy `msvcrt` **data** imports (`_fmode`, `_commode`, `_acmdln`).
+///
+/// These are not callable: the IAT slot must hold the address of the variable so
+/// guest code can `mov` through it. Returns `None` for ordinary function exports.
+#[must_use]
+pub fn crt_data_import_va(name: &str) -> Option<u64> {
+    match name.to_ascii_lowercase().as_str() {
+        "_fmode" => Some(FMODE_SLOT),
+        "_commode" => Some(COMMODE_SLOT),
+        "_acmdln" => Some(ACMDLN_PTR_SLOT),
+        _ => None,
+    }
+}
+
 /// Dispatch a UCRT export by name (case-insensitive).
 pub fn dispatch_ucrt(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -56,6 +70,9 @@ pub fn dispatch_ucrt(
         "__setusermatherr" => handle_set_user_matherr(engine),
         "__c_specific_handler" => handle_c_specific_handler(engine),
         "memcpy" => handle_memcpy(engine),
+        "memmove" => handle_memmove(engine),
+        "memcmp" => handle_memcmp(engine),
+        "memset" => handle_memset(engine),
         "strlen" => handle_strlen(engine),
         "strncmp" => handle_strncmp(engine),
         "_initterm" => handle_initterm(engine),
@@ -63,9 +80,13 @@ pub fn dispatch_ucrt(
         "_configure_narrow_argv" => handle_configure_narrow_argv(engine),
         "_initialize_narrow_environment" => handle_initialize_narrow_environment(engine),
         "_crt_atexit" => handle_crt_atexit(engine),
-        "_set_app_type" => handle_set_app_type(engine),
+        // UCRT: `_set_app_type`; legacy msvcrt: `__set_app_type`.
+        "_set_app_type" | "__set_app_type" => handle_set_app_type(engine),
         "_set_invalid_parameter_handler" => handle_set_invalid_parameter_handler(engine),
-        "_cexit" => handle_cexit(engine),
+        // Legacy msvcrt CRT startup / teardown.
+        "__getmainargs" => handle_getmainargs(engine),
+        "_xcptfilter" => handle_xcpt_filter(engine),
+        "_cexit" | "_c_exit" => handle_cexit(engine),
         "signal" => handle_signal(engine),
         // exit / _exit / abort: marked exit_process in hooks; still provide handler body
         // in case traits path misses API-set library names.
@@ -306,6 +327,92 @@ fn handle_memcpy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
         engine.mem_write(dest, &buf)?;
     }
     ret(engine, dest)
+}
+
+/// `memmove` — like `memcpy` but correct for overlapping ranges (host-side buffer).
+fn handle_memmove(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    // Staging buffer already implements overlap-safe semantics.
+    handle_memcpy(engine)
+}
+
+fn handle_memcmp(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let a = engine.read_rcx()?;
+    let b = engine.read_rdx()?;
+    let n = engine.read_r8()?;
+    let n_usize = usize::try_from(n).unwrap_or(0);
+    if n_usize == 0 || a == 0 || b == 0 {
+        return ret(engine, 0);
+    }
+    let mut ba = vec![0_u8; n_usize];
+    let mut bb = vec![0_u8; n_usize];
+    engine.mem_read(a, &mut ba)?;
+    engine.mem_read(b, &mut bb)?;
+    let mut result: i32 = 0;
+    for (xa, xb) in ba.iter().zip(bb.iter()) {
+        if xa != xb {
+            result = i32::from(*xa).wrapping_sub(i32::from(*xb));
+            break;
+        }
+    }
+    ret(engine, i32_status_to_u64(result))
+}
+
+fn handle_memset(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let dest = engine.read_rcx()?;
+    let c = engine.read_rdx()? & 0xff;
+    let n = engine.read_r8()?;
+    let n_usize = usize::try_from(n).unwrap_or(0);
+    if n_usize > 0 && dest != 0 {
+        let buf = vec![u8::try_from(c).unwrap_or(0); n_usize];
+        engine.mem_write(dest, &buf)?;
+    }
+    ret(engine, dest)
+}
+
+/// Legacy msvcrt `__getmainargs(argc*, argv**, env**, doWildcard, startupinfo*)`.
+///
+/// Fills caller out-params from the CRT page prepared at session start.
+fn handle_getmainargs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let argc_ptr = engine.read_rcx()?;
+    let argv_ptr = engine.read_rdx()?;
+    let env_ptr = engine.read_r8()?;
+    let _do_wildcard = engine.read_r9()?;
+    // 5th arg on stack is ignored (startupinfo*).
+
+    if argc_ptr != 0 {
+        let mut argc_bytes = [0_u8; 4];
+        engine
+            .mem_read(ARGC_SLOT, &mut argc_bytes)
+            .context("__getmainargs read argc slot")?;
+        engine
+            .mem_write(argc_ptr, &argc_bytes)
+            .context("__getmainargs write *argc")?;
+    }
+    if argv_ptr != 0 {
+        // *argv = char** table (same layout as __p___argv materialization).
+        const ARGV_TABLE: u64 = CRT_GUEST_BASE + 0x400;
+        engine
+            .mem_write(argv_ptr, &ARGV_TABLE.to_le_bytes())
+            .context("__getmainargs write *argv")?;
+    }
+    if env_ptr != 0 {
+        // Empty environment: ENVIRON_PTR_SLOT holds a single NULL char* terminator.
+        engine
+            .mem_write(ENVIRON_PTR_SLOT, &0_u64.to_le_bytes())
+            .context("__getmainargs zero env list")?;
+        engine
+            .mem_write(env_ptr, &ENVIRON_PTR_SLOT.to_le_bytes())
+            .context("__getmainargs write *env")?;
+    }
+    ret(engine, 0)
+}
+
+/// `_XcptFilter` — SEH filter; continue search (no host exception model).
+fn handle_xcpt_filter(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let _xcptnum = engine.read_rcx()?;
+    let _info = engine.read_rdx()?;
+    // EXCEPTION_CONTINUE_SEARCH
+    ret(engine, 0)
 }
 
 fn handle_strlen(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {

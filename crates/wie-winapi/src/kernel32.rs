@@ -220,6 +220,35 @@ fn low_u32(value: u64, context_name: &str) -> Result<u32> {
         .with_context(|| format!("{context_name} low u32 conversion failed"))
 }
 
+/// Guest OS identity shared by `GetVersion` / `GetVersionEx*`.
+const GUEST_OS_MAJOR: u32 = 10;
+const GUEST_OS_MINOR: u32 = 0;
+const GUEST_OS_BUILD: u32 = 19045;
+const GUEST_OS_PLATFORM_NT: u32 = 2;
+
+/// Packed `GetVersion` DWORD for the emulated OS (NT bit set in high word).
+#[must_use]
+fn packed_get_version() -> u64 {
+    // Low byte major, next minor, high word build; bit 31 set ⇒ Windows NT family.
+    let packed = GUEST_OS_MAJOR
+        | (GUEST_OS_MINOR << 8)
+        | (GUEST_OS_BUILD << 16)
+        | 0x8000_0000;
+    u64::from(packed)
+}
+
+/// Handles `KERNEL32.dll!GetVersion` (legacy packed DWORD).
+pub fn handle_get_version(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let return_value = packed_get_version();
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetVersion")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
 /// Handles `KERNEL32.dll!GetVersionExA`.
 pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let version_info_ptr = engine
@@ -237,10 +266,10 @@ pub fn handle_get_version_ex_a(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Wi
         });
     }
 
-    let major_version = 10_u32;
-    let minor_version = 0_u32;
-    let build_number = 19045_u32;
-    let platform_id = 2_u32;
+    let major_version = GUEST_OS_MAJOR;
+    let minor_version = GUEST_OS_MINOR;
+    let build_number = GUEST_OS_BUILD;
+    let platform_id = GUEST_OS_PLATFORM_NT;
 
     // OSVERSIONINFOA:
     // DWORD dwOSVersionInfoSize; offset 0
@@ -306,6 +335,138 @@ pub fn handle_get_module_handle_a(
     Ok(WinApiHandlerResult {
         return_address,
         return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!GetModuleHandleW`.
+pub fn handle_get_module_handle_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    environment: crate::WinApiEnvironment,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let module_name_ptr = engine
+        .read_rcx()
+        .context("failed to read RCX for GetModuleHandleW")?;
+
+    let return_value = if module_name_ptr == 0 {
+        state.last_error = 0;
+        environment.image_base
+    } else {
+        let module_name = read_guest_utf16_lossy(engine, module_name_ptr, 260)?;
+        let handle = resolve_loaded_module_handle(&module_name, environment.image_base, state);
+        if handle == 0 {
+            state.last_error = ERROR_MOD_NOT_FOUND;
+        } else {
+            state.last_error = 0;
+        }
+        handle
+    };
+
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from GetModuleHandleW")?;
+
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!lstrlenW`.
+pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let s = engine.read_rcx().context("failed to read RCX for lstrlenW")?;
+    let return_value = if s == 0 {
+        0_u64
+    } else {
+        let mut len = 0_u64;
+        loop {
+            let mut buf = [0_u8; 2];
+            engine.mem_read(s.wrapping_add(len.saturating_mul(2)), &mut buf)?;
+            if u16::from_le_bytes(buf) == 0 {
+                break;
+            }
+            len = len.saturating_add(1);
+            if len > 1_000_000 {
+                break;
+            }
+        }
+        len
+    };
+    let return_address = engine
+        .return_from_win64_api(return_value)
+        .context("failed to return from lstrlenW")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value,
+    })
+}
+
+/// Handles `KERNEL32.dll!lstrcpyW` — copy wide string; returns dest.
+pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let dest = engine.read_rcx().context("failed to read RCX for lstrcpyW")?;
+    let src = engine.read_rdx().context("failed to read RDX for lstrcpyW")?;
+    if dest != 0 && src != 0 {
+        let mut offset = 0_u64;
+        loop {
+            let mut buf = [0_u8; 2];
+            engine.mem_read(src.wrapping_add(offset), &mut buf)?;
+            engine.mem_write(dest.wrapping_add(offset), &buf)?;
+            if u16::from_le_bytes(buf) == 0 {
+                break;
+            }
+            offset = offset.saturating_add(2);
+            if offset > 2_000_000 {
+                break;
+            }
+        }
+    }
+    let return_address = engine
+        .return_from_win64_api(dest)
+        .context("failed to return from lstrcpyW")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: dest,
+    })
+}
+
+/// Handles `KERNEL32.dll!lstrcatW` — append wide string; returns dest.
+pub fn handle_lstrcat_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    let dest = engine.read_rcx().context("failed to read RCX for lstrcatW")?;
+    let src = engine.read_rdx().context("failed to read RDX for lstrcatW")?;
+    if dest != 0 && src != 0 {
+        // Find end of dest.
+        let mut dest_end = 0_u64;
+        loop {
+            let mut buf = [0_u8; 2];
+            engine.mem_read(dest.wrapping_add(dest_end), &mut buf)?;
+            if u16::from_le_bytes(buf) == 0 {
+                break;
+            }
+            dest_end = dest_end.saturating_add(2);
+            if dest_end > 2_000_000 {
+                break;
+            }
+        }
+        let mut offset = 0_u64;
+        loop {
+            let mut buf = [0_u8; 2];
+            engine.mem_read(src.wrapping_add(offset), &mut buf)?;
+            engine.mem_write(dest.wrapping_add(dest_end).wrapping_add(offset), &buf)?;
+            if u16::from_le_bytes(buf) == 0 {
+                break;
+            }
+            offset = offset.saturating_add(2);
+            if offset > 2_000_000 {
+                break;
+            }
+        }
+    }
+    let return_address = engine
+        .return_from_win64_api(dest)
+        .context("failed to return from lstrcatW")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: dest,
     })
 }
 
@@ -4639,7 +4800,7 @@ pub fn handle_get_current_process(
 /// Extra KERNEL32 exports used by CRT / modern PE (not yet in dense WinApiId table).
 pub fn dispatch_kernel32_extra(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _environment: crate::WinApiEnvironment,
+    environment: crate::WinApiEnvironment,
     state: &mut WinApiState,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
@@ -4676,6 +4837,14 @@ pub fn dispatch_kernel32_extra(
             Ok(Some(handle_interlocked_compare_exchange64(engine)?))
         }
         "interlockedexchangeadd64" => Ok(Some(handle_interlocked_exchange_add64(engine)?)),
+        // Real-tool surface (7z / CRT-linked PE)
+        "getversion" => Ok(Some(handle_get_version(engine)?)),
+        "getmodulehandlew" => Ok(Some(handle_get_module_handle_w(
+            engine, environment, state,
+        )?)),
+        "lstrlenw" => Ok(Some(handle_lstrlen_w(engine)?)),
+        "lstrcpyw" => Ok(Some(handle_lstrcpy_w(engine)?)),
+        "lstrcatw" => Ok(Some(handle_lstrcat_w(engine)?)),
         _ => Ok(None),
     }
 }

@@ -480,6 +480,8 @@ pub fn handle_message_box_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinAp
         .context("failed to read MessageBoxW caption")?;
 
     tracing::info!(caption = %caption, text = %text, "MessageBoxW");
+    // Always surface guest error UI on host console (7z bring-up).
+    eprintln!("[MessageBoxW] {caption}: {text}");
 
     let return_address = engine
         .return_from_win64_api(IDOK)

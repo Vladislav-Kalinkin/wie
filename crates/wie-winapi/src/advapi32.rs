@@ -2,7 +2,9 @@ use crate::guest_memory::{
     checked_address, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
     write_u64 as write_guest_u64,
 };
-use crate::guest_string::read_ansi_lossy as read_guest_ansi_lossy;
+use crate::guest_string::{
+    read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
+};
 use crate::{RegistryKey, WinApiHandlerResult, WinApiState};
 use anyhow::{Context, Result};
 
@@ -77,6 +79,87 @@ pub fn handle_reg_open_key_ex_a(
     }
 
     return_status(engine, ERROR_SUCCESS)
+}
+
+/// Handles `ADVAPI32.dll!RegOpenKeyExW`.
+pub fn handle_reg_open_key_ex_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let parent_key = engine
+        .read_rcx()
+        .context("failed to read RCX for RegOpenKeyExW")?;
+
+    let subkey_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for RegOpenKeyExW")?;
+
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for RegOpenKeyExW")?;
+
+    let phk_result_address = checked_address(rsp, 0x30, "RegOpenKeyExW phkResult")?;
+    let phk_result = read_guest_u64(engine, phk_result_address)?;
+
+    let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
+    let (handle, _disposition) = open_or_create_registry_key(state, parent_key, subkey)?;
+
+    if phk_result != 0 {
+        write_guest_u64(engine, phk_result, handle)?;
+    }
+
+    return_status(engine, ERROR_SUCCESS)
+}
+
+/// Handles `ADVAPI32.dll!RegCreateKeyExW`.
+pub fn handle_reg_create_key_ex_w(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let parent_key = engine
+        .read_rcx()
+        .context("failed to read RCX for RegCreateKeyExW")?;
+
+    let subkey_ptr = engine
+        .read_rdx()
+        .context("failed to read RDX for RegCreateKeyExW")?;
+
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for RegCreateKeyExW")?;
+
+    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExW phkResult")?;
+    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExW lpdwDisposition")?;
+
+    let phk_result = read_guest_u64(engine, phk_result_address)?;
+    let disposition_ptr = read_guest_u64(engine, disposition_address)?;
+
+    let subkey = read_optional_utf16_string(engine, subkey_ptr)?;
+    let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey)?;
+
+    if phk_result != 0 {
+        write_guest_u64(engine, phk_result, handle)?;
+    }
+
+    if disposition_ptr != 0 {
+        write_guest_u32(engine, disposition_ptr, disposition)?;
+    }
+
+    return_status(engine, ERROR_SUCCESS)
+}
+
+/// Soft-dispatch path for ADVAPI32 exports not yet in the dense `WinApiId` table.
+pub fn dispatch_advapi32_extra(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    name: &str,
+) -> Result<Option<WinApiHandlerResult>> {
+    let n = name.to_ascii_lowercase();
+    match n.as_str() {
+        "regopenkeyexw" => Ok(Some(handle_reg_open_key_ex_w(engine, state)?)),
+        "regcreatekeyexw" => Ok(Some(handle_reg_create_key_ex_w(engine, state)?)),
+        _ => Ok(None),
+    }
 }
 
 /// Handles `ADVAPI32.dll!RegQueryValueExA`.
@@ -255,5 +338,13 @@ fn read_optional_ansi_string(engine: &mut dyn wie_cpu::CpuEngine, address: u64) 
         Ok(String::new())
     } else {
         read_guest_ansi_lossy(engine, address, 1024)
+    }
+}
+
+fn read_optional_utf16_string(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<String> {
+    if address == 0 {
+        Ok(String::new())
+    } else {
+        read_guest_utf16_lossy(engine, address, 1024)
     }
 }

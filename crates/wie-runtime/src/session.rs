@@ -602,6 +602,13 @@ impl RuntimeSession {
                 } else {
                     import.name.clone()
                 };
+                // Legacy msvcrt data imports: IAT must hold the variable address,
+                // not a callable fake VA (guest loads through the slot).
+                if wie_winapi::ucrt::is_ucrt_library(&import.library)
+                    && let Some(data_va) = wie_winapi::ucrt::crt_data_import_va(&name)
+                {
+                    return Ok(data_va);
+                }
                 let (va, _) =
                     resolve_import_fake_va(&import.library, &name, import.iat_slot_va, &mut soft_apis)?;
                 Ok(va)
