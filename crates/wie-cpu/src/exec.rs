@@ -18,9 +18,9 @@ use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
 #[cfg(debug_assertions)]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(debug_assertions)]
 use std::sync::LazyLock;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Access type codes matching Unicorn-ish invalid-memory reporting (0=read,1=write,2=fetch).
 pub(crate) const ACCESS_READ: i32 = 0;
@@ -686,9 +686,7 @@ fn exec_arith(
             regs.set_flag(rflags::CF, u128::from(d) < wide_src);
             let d_s = i128::from(sign_extend(d, size));
             let s_s = i128::from(sign_extend(s, size));
-            let expected = d_s
-                .wrapping_sub(s_s)
-                .wrapping_sub(i128::from(cf != 0));
+            let expected = d_s.wrapping_sub(s_s).wrapping_sub(i128::from(cf != 0));
             let got = i128::from(sign_extend(r, size));
             regs.set_flag(rflags::OF, expected != got);
             write_op(mem, regs, instr, 0, r)?;
@@ -2185,7 +2183,7 @@ pub(crate) fn dump_iced_counters() {
         }
         pairs.push((count, i as u16));
     }
-    pairs.sort_by(|a, b| b.0.cmp(&a.0));
+    pairs.sort_by_key(|a| std::cmp::Reverse(a.0));
     let total: u64 = pairs.iter().map(|(c, _)| c).sum();
     eprintln!("--- iced-interp mnemonic counts (total={total}) ---");
     for (count, idx) in &pairs {
