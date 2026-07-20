@@ -3,10 +3,36 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use wie_winapi::{
-    FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export, encode_unresolved,
-    resolve_winapi_id, winapi_id_export,
+    FakeVa, WinApiId, WinApiTraits, WINAPI_NAME_ROWS, decode_fake_va, encode_export,
+    encode_unresolved, resolve_winapi_id,
 };
+
+/// Pre-computed `(library, name)` as [`Arc<str>`] for every [`WinApiId`].
+///
+/// Built once on first access from the static [`WINAPI_NAME_ROWS`] table.
+/// The Export/Alias path in [`resolve_fake_api_at`] clones from this cache
+/// instead of calling `Arc::<str>::from(lib)` on every API stop — replaces a
+/// heap allocation + string copy with an atomic increment.
+///
+/// The table is sized to [`WINAPI_ID_COUNT`] with unused slots filled with the
+/// fallback `("unknown.dll", "unknown")`.  WinApiId values that appear in the
+/// static row table get their real library/name; all others get the fallback.
+static EXPORT_NAME_CACHE: LazyLock<Vec<(Arc<str>, Arc<str>)>> = LazyLock::new(|| {
+    let cap = wie_winapi::WINAPI_ID_COUNT;
+    let mut table = vec![
+        (Arc::from("unknown.dll"), Arc::from("unknown"));
+        cap
+    ];
+    for &(lib, name, id) in WINAPI_NAME_ROWS {
+        let idx = id.to_u16() as usize;
+        if idx < cap {
+            table[idx] = (Arc::from(lib), Arc::from(name));
+        }
+    }
+    table
+});
 
 /// Runtime fake API dispatch entry (IAT soft slots + trace metadata).
 #[derive(Debug, Clone)]
@@ -153,10 +179,11 @@ pub(crate) fn resolve_fake_api_at(
     let _ = address; // available for future trace correlation
     match decoded {
         FakeVa::Export(id) | FakeVa::Alias(id) => {
-            let (lib, name) = winapi_id_export(id).unwrap_or(("unknown.dll", "unknown"));
+            let idx = id.to_u16() as usize;
+            let (lib, name) = &EXPORT_NAME_CACHE[idx];
             Some(ResolvedFakeApi {
-                library: Arc::<str>::from(lib),
-                name: Arc::<str>::from(name),
+                library: lib.clone(),
+                name: name.clone(),
                 winapi_id: Some(id),
                 traits: id.traits(),
             })

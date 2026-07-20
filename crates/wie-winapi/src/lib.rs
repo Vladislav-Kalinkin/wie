@@ -36,6 +36,7 @@ pub use sync_obj::{
     wait_multiple,
 };
 // HostParkReason is defined with WinApiControlSignal below.
+pub use dispatch_table::WINAPI_NAME_ROWS;
 pub use fake_va::{
     COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
     SPECIAL_CALLBACK_RETURN, callback_return_trampoline_va, decode as decode_fake_va,
