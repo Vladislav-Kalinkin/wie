@@ -202,8 +202,10 @@ fn is_near_branch(instr: &Instruction) -> bool {
 
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
-        Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => true,
-        // LEA: all standard SIB forms (base/index*1|2|4|8 + disp) + RIP-relative.
+        // Nop, endbranch, sign-extension: always lowerable.
+        Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Cwde | Mnemonic::Cdqe => {
+            true
+        }
         Mnemonic::Lea => lea_is_simple(instr),
         Mnemonic::Mov => mov_is_lowerable(instr),
         Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => movx_is_lowerable(instr),
@@ -218,9 +220,11 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::And
         | Mnemonic::Or
         | Mnemonic::Cmp
-        | Mnemonic::Test => alu_is_lowerable(instr),
+        | Mnemonic::Test
+        | Mnemonic::Bt
+        | Mnemonic::Bts
+        | Mnemonic::Btr => alu_is_lowerable(instr),
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
-        Mnemonic::Cwde | Mnemonic::Cdqe => true, // register-only sign-extension
         Mnemonic::Imul => imul_is_lowerable(instr),
         Mnemonic::Xchg => xchg_is_lowerable(instr),
         Mnemonic::Shl
@@ -231,16 +235,8 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Ror
         | Mnemonic::Rcl
         | Mnemonic::Rcr => shift_is_lowerable(instr),
-        // Bit test operations: same operand forms as ALU (reg/mem, reg/imm).
-        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr => alu_is_lowerable(instr),
-        // Xadd: exchange and add — dst reg/mem, src must be register.
-        Mnemonic::Xadd => match (instr.op0_kind(), instr.op1_kind()) {
-            (OpKind::Register, OpKind::Register) => true,
-            (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
-            _ => false,
-        },
-        // CmpXchg: compare and exchange — dst reg/mem, src register.
-        Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
+        // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register).
+        Mnemonic::Xadd | Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
             (OpKind::Register, OpKind::Register) => true,
             (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
             _ => false,

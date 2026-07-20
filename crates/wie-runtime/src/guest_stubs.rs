@@ -224,7 +224,7 @@ impl GuestStubKind {
             Self::IdentityRcxToRax => false,
             Self::ReturnZero => false,
             Self::ReturnImm32(_) => false,
-            Self::ReturnImm64(_) => true,   // GetCommandLineA/W, GetProcessHeap, GetDesktopWindow
+            Self::ReturnImm64(_) => true, // GetCommandLineA/W, GetProcessHeap, GetDesktopWindow
             Self::LoadZx32FromVa(_) => true, // TEB_LAST_ERROR_VA (constant, but safe to re-classify)
             Self::StoreEcxToVa(_) => true,   // TEB_LAST_ERROR_VA (same)
             Self::FlsGetValue { .. } => true,
@@ -733,7 +733,7 @@ pub(crate) fn plant_guest_stubs(
                     None => continue,
                 }
             }
-            Some(kind) => kind.clone(),
+            Some(kind) => *kind,
             None => continue,
         };
         let body = kind.encode();
@@ -864,11 +864,20 @@ mod tests {
             ("api-ms-win-crt-runtime-l1-1-0.dll", "fflush"),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "setvbuf"),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit"),
-            ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_invalid_parameter_handler"),
+            (
+                "api-ms-win-crt-runtime-l1-1-0.dll",
+                "_set_invalid_parameter_handler",
+            ),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type"),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_new_mode"),
-            ("api-ms-win-crt-runtime-l1-1-0.dll", "_configure_narrow_argv"),
-            ("api-ms-win-crt-runtime-l1-1-0.dll", "_initialize_narrow_environment"),
+            (
+                "api-ms-win-crt-runtime-l1-1-0.dll",
+                "_configure_narrow_argv",
+            ),
+            (
+                "api-ms-win-crt-runtime-l1-1-0.dll",
+                "_initialize_narrow_environment",
+            ),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "__setusermatherr"),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_configthreadlocale"),
             ("api-ms-win-crt-runtime-l1-1-0.dll", "_cexit"),
@@ -936,7 +945,9 @@ mod tests {
                     panic!("{library}!{name}: classifies with real cfg but not with CLASSIFY_ONLY");
                 }
                 (None, None) => {
-                    panic!("{library}!{name}: no longer classifies as a guest stub; remove from test");
+                    panic!(
+                        "{library}!{name}: no longer classifies as a guest stub; remove from test"
+                    );
                 }
             }
         }
