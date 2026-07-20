@@ -595,47 +595,69 @@ impl RuntimeSession {
                     )
                 })?;
         }
-        let (image, image_summary, patched_imports) =
-            wie_pe::build_loaded_image_with_fake_imports_with(path, |import| {
-                let name = if import.name.is_empty() {
-                    format!("ORDINAL {}", import.ordinal)
-                } else {
-                    import.name.clone()
-                };
-                // Legacy msvcrt data imports: IAT must hold the variable address,
-                // not a callable fake VA (guest loads through the slot).
-                if wie_winapi::ucrt::is_ucrt_library(&import.library)
-                    && let Some(data_va) = wie_winapi::ucrt::crt_data_import_va(&name)
-                {
-                    return Ok(data_va);
-                }
-                let (va, _) =
-                    resolve_import_fake_va(&import.library, &name, import.iat_slot_va, &mut soft_apis)?;
-                Ok(va)
-            })?;
-
-        let iat_entries = build_iat_fake_api_entries(&patched_imports);
-        let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
+        // Read the PE file once; we need the bytes for both identity and loading.
+        let pe_bytes = std::fs::read(path)
+            .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+        let identity = wie_pe::pe_identity_from_bytes(path, &pe_bytes)
+            .context("failed to parse PE identity")?;
+        let image_size =
+            usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
 
         // WIE CPU backend (Unicorn default; `WIE_CPU=iced` for interpreter).
         let mut engine = crate::open_default_cpu().context("failed to open WIE CPU backend")?;
 
-        // Phase 3.3: one MEM_IMAGE arena, temporary RWX for copy/IAT (IAT patched
-        // in the host buffer already), then section protects via VirtualProtect.
+        // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
+        // are written directly into guest memory (no intermediate Vec<u8> buffer).
         engine
             .mem_map_image(
-                image_summary.image_base,
-                image_summary.image_size,
+                identity.image_base,
+                image_size,
                 wie_cpu::perm::ALL,
             )
             .context("failed to map PE image memory")?;
 
-        engine
-            .mem_write(image_summary.image_base, &image)
-            .context("failed to write PE image into guest memory")?;
+        // Load PE directly into guest memory: single PE parse, writes headers +
+        // sections + patches IAT in-place through the engine. Returns the section
+        // map plan too — no need to re-read the file.
+        let (image_summary, pe_map_plan, patched_imports) = {
+            let engine_ref = &mut *engine;
+            wie_pe::load_pe_direct_from_bytes(
+                &pe_bytes,
+                identity.image_base,
+                image_size,
+                |va, bytes| {
+                    engine_ref
+                        .mem_write(va, bytes)
+                        .map_err(|e| anyhow::anyhow!("PE write to guest memory failed: {e}"))
+                },
+                |import| {
+                    let name = if import.name.is_empty() {
+                        format!("ORDINAL {}", import.ordinal)
+                    } else {
+                        import.name.clone()
+                    };
+                    // Legacy msvcrt data imports: IAT must hold the variable address,
+                    // not a callable fake VA (guest loads through the slot).
+                    if wie_winapi::ucrt::is_ucrt_library(&import.library)
+                        && let Some(data_va) = wie_winapi::ucrt::crt_data_import_va(&name)
+                    {
+                        return Ok(data_va);
+                    }
+                    let (va, _) = resolve_import_fake_va(
+                        &import.library,
+                        &name,
+                        import.iat_slot_va,
+                        &mut soft_apis,
+                    )?;
+                    Ok(va)
+                },
+            )
+            .context("failed to load PE64 image directly into guest memory")?
+        };
 
-        let pe_map_plan =
-            wie_pe::pe_map_plan_from_file(path).context("failed to build PE section map plan")?;
+        let iat_entries = build_iat_fake_api_entries(&patched_imports);
+        let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
+
         apply_pe_section_protects(engine.as_mut(), &pe_map_plan)
             .context("failed to apply PE section protects")?;
 

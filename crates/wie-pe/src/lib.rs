@@ -125,7 +125,11 @@ pub fn quote_windows_arg(arg: &str) -> String {
 /// Parses PE64 bytes and returns loader identity (image base + entry).
 pub fn pe_identity_from_bytes(path: &Path, bytes: &[u8]) -> Result<PeIdentity> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
+    pe_identity_from_parsed(&pe, path, bytes)
+}
 
+/// Private: extract identity from a pre-parsed PE (no re-parse).
+fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
@@ -308,10 +312,15 @@ pub fn pe_map_plan_from_file(path: &Path) -> Result<PeMapPlan> {
 /// Build a [`PeMapPlan`] from PE bytes.
 pub fn pe_map_plan_from_bytes(bytes: &[u8]) -> Result<PeMapPlan> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
+    pe_map_plan_from_parsed(&pe, bytes)
+}
+
+/// Private: build map plan from a pre-parsed PE (no re-parse).
+fn pe_map_plan_from_parsed(pe: &PE, bytes: &[u8]) -> Result<PeMapPlan> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
-    let identity = pe_identity_from_bytes(Path::new("<memory>"), bytes)?;
+    let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
     let mut sections = Vec::with_capacity(pe.sections.len());
     for section in &pe.sections {
         let name = section
@@ -526,7 +535,11 @@ pub fn inspect_pe_imports(path: &Path) -> Result<Vec<PeImportSummary>> {
 /// Reads import metadata from `PE` bytes.
 pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
+    inspect_pe_imports_from_parsed(&pe, bytes)
+}
 
+/// Private: parse imports from a pre-parsed PE (no re-parse).
+fn inspect_pe_imports_from_parsed(pe: &PE, bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
@@ -547,7 +560,7 @@ pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
     let mut descriptor_rva = import_directory.virtual_address;
 
     loop {
-        let descriptor_offset = rva_to_file_offset(&pe, descriptor_rva).with_context(|| {
+        let descriptor_offset = rva_to_file_offset(pe, descriptor_rva).with_context(|| {
             format!("failed to map import descriptor RVA {descriptor_rva:#010x}")
         })?;
 
@@ -561,7 +574,7 @@ pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
             break;
         }
 
-        let library = read_c_string_at_rva(&pe, bytes, name_rva)
+        let library = read_c_string_at_rva(pe, bytes, name_rva)
             .with_context(|| format!("failed to read DLL name at RVA {name_rva:#010x}"))?;
 
         let lookup_thunk = if original_first_thunk == 0 {
@@ -571,7 +584,7 @@ pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
         };
 
         read_import_thunks(
-            &pe,
+            pe,
             bytes,
             image_base,
             &library,
@@ -759,13 +772,17 @@ pub fn build_loaded_image(path: &Path) -> Result<(Vec<u8>, PeLoadedImageSummary)
 /// Builds a Windows-loader-like memory image from `PE64` bytes.
 pub fn build_loaded_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
     let pe = PE::parse(bytes).context("failed to parse PE image")?;
+    build_loaded_image_from_parsed(&pe, bytes)
+}
 
+/// Private: build loaded image from a pre-parsed PE (no re-parse).
+fn build_loaded_image_from_parsed(pe: &PE, bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
 
     // Path is only for diagnostics in identity; bytes carry all header fields.
-    let identity = pe_identity_from_bytes(Path::new("<memory>"), bytes)?;
+    let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
 
     let image_size =
         usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
@@ -845,6 +862,8 @@ fn copy_section(
 ///
 /// `fake_target` maps each import to a dense-encoded fake API address (see
 /// `wie_winapi::fake_va`). The resolver is invoked once per IAT slot.
+///
+/// Reads the file once and passes bytes through to avoid a double read.
 pub fn build_loaded_image_with_fake_imports_with<F>(
     path: &Path,
     mut fake_target: F,
@@ -852,11 +871,173 @@ pub fn build_loaded_image_with_fake_imports_with<F>(
 where
     F: FnMut(&PeImportSummary) -> Result<u64>,
 {
-    let (mut image, summary) = build_loaded_image(path)?;
-    let imports = inspect_pe_imports(path)?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    let pe = PE::parse(&bytes).context("failed to parse PE image")?;
+
+    let (mut image, summary) = build_loaded_image_from_parsed(&pe, &bytes)?;
+    let imports = inspect_pe_imports_from_parsed(&pe, &bytes)?;
     let patched = patch_loaded_image_imports_with(&mut image, &imports, &mut fake_target)?;
 
     Ok((image, summary, patched))
+}
+
+/// Loads a PE64 image directly into guest memory through a writer callback.
+///
+/// Single file read, single PE parse. Returns the loaded image summary, section
+/// map plan (no re-read needed), and patched import info. No intermediate
+/// [`Vec<u8>`] buffer — headers and sections are written straight through
+/// `mem_write`, then IAT slots are patched in-place in guest memory.
+///
+/// The caller is responsible for mapping guest memory at `image_base` with at
+/// least `image_size` bytes before calling (temporary RWX). Use the returned
+/// [`PeMapPlan`] to apply final section-level page protects.
+///
+/// To avoid a double file read, pre-read the file and use
+/// [`load_pe_direct_from_bytes`] instead.
+pub fn load_pe_direct<F, W>(
+    path: &Path,
+    image_base: u64,
+    image_size: usize,
+    mem_write: W,
+    fake_target: F,
+) -> Result<(PeLoadedImageSummary, PeMapPlan, Vec<PePatchedImport>)>
+where
+    F: FnMut(&PeImportSummary) -> Result<u64>,
+    W: FnMut(u64, &[u8]) -> Result<()>,
+{
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read PE file: {}", path.display()))?;
+    load_pe_direct_from_bytes(&bytes, image_base, image_size, mem_write, fake_target)
+}
+
+/// Like [`load_pe_direct`] but takes pre-read PE bytes instead of a path,
+/// allowing the caller to parse the identity *and* load with a single file read.
+pub fn load_pe_direct_from_bytes<F, W>(
+    bytes: &[u8],
+    image_base: u64,
+    image_size: usize,
+    mut mem_write: W,
+    mut fake_target: F,
+) -> Result<(PeLoadedImageSummary, PeMapPlan, Vec<PePatchedImport>)>
+where
+    F: FnMut(&PeImportSummary) -> Result<u64>,
+    W: FnMut(u64, &[u8]) -> Result<()>,
+{
+    let pe = PE::parse(bytes).context("failed to parse PE image")?;
+
+    if !pe.is_64 {
+        bail!("expected PE64 image, got PE32");
+    }
+
+    let identity = pe_identity_from_parsed(&pe, Path::new("<memory>"), bytes)?;
+    let map_plan = pe_map_plan_from_parsed(&pe, bytes)?;
+
+    let header_size = usize::try_from(identity.size_of_headers)
+        .context("size_of_headers does not fit usize")?;
+
+    if header_size > bytes.len() {
+        bail!("size_of_headers is larger than file size");
+    }
+
+    // Write headers directly to guest memory.
+    mem_write(image_base, &bytes[..header_size])
+        .context("failed to write PE headers to guest memory")?;
+
+    // Write sections directly to guest memory.
+    for section in &pe.sections {
+        let raw_offset = usize::try_from(section.pointer_to_raw_data)
+            .context("section raw offset does not fit usize")?;
+        let raw_size = usize::try_from(section.size_of_raw_data)
+            .context("section raw size does not fit usize")?;
+
+        if raw_size == 0 {
+            continue;
+        }
+
+        let va = image_base
+            .checked_add(u64::from(section.virtual_address))
+            .context("section VA overflow")?;
+
+        let raw_end = raw_offset
+            .checked_add(raw_size)
+            .context("section source range overflow")?;
+
+        let section_bytes = bytes
+            .get(raw_offset..raw_end)
+            .context("section raw data outside file")?;
+
+        mem_write(va, section_bytes).with_context(|| {
+            format!(
+                "failed to write section `{}` to guest memory",
+                section.name().unwrap_or("<unnamed>")
+            )
+        })?;
+    }
+
+    // Parse imports from the same bytes (no re-parse).
+    let imports = inspect_pe_imports_from_parsed(&pe, bytes)?;
+
+    // Patch IAT directly in guest memory through the writer.
+    let patched = patch_loaded_image_imports_direct(
+        image_base,
+        &imports,
+        &mut mem_write,
+        &mut fake_target,
+    )?;
+
+    let summary = PeLoadedImageSummary {
+        image_base: identity.image_base,
+        entry_rva: identity.entry_rva,
+        entry_point_va: identity.entry_va,
+        image_size,
+        header_size,
+        section_count: identity.section_count,
+    };
+
+    Ok((summary, map_plan, patched))
+}
+
+/// Patches IAT slots in guest memory through a writer callback.
+/// Used internally by [`load_pe_direct`].
+fn patch_loaded_image_imports_direct<F, W>(
+    image_base: u64,
+    imports: &[PeImportSummary],
+    mem_write: &mut W,
+    fake_target: &mut F,
+) -> Result<Vec<PePatchedImport>>
+where
+    F: FnMut(&PeImportSummary) -> Result<u64>,
+    W: FnMut(u64, &[u8]) -> Result<()>,
+{
+    let mut patched = Vec::with_capacity(imports.len());
+
+    for import in imports {
+        let fake_target_va = fake_target(import)?;
+
+        let slot_va = image_base
+            .checked_add(import.iat_slot_rva)
+            .context("IAT slot VA overflow")?;
+
+        mem_write(slot_va, &fake_target_va.to_le_bytes())
+            .context("failed to patch IAT slot in guest memory")?;
+
+        let name = if import.name.is_empty() {
+            format!("ORDINAL {}", import.ordinal)
+        } else {
+            import.name.clone()
+        };
+
+        patched.push(PePatchedImport {
+            library: import.library.clone(),
+            name,
+            iat_slot_va: import.iat_slot_va,
+            iat_slot_rva: import.iat_slot_rva,
+            fake_target_va,
+        });
+    }
+
+    Ok(patched)
 }
 
 /// Patches `IAT` slots using a dense fake-VA resolver.
