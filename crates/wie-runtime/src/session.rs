@@ -523,9 +523,7 @@ impl RuntimeSession {
     /// Publish host `last_error` into guest TEB.LastErrorValue so in-guest
     /// `GetLastError` stubs stay coherent with host-side API failures.
     fn publish_last_error_to_guest(&mut self) {
-        let err = self
-            .process
-            .with_mut(|_, st| st.last_error);
+        let err = self.process.with_mut(|_, st| st.last_error);
         if self.last_published_last_error == Some(err) {
             return;
         }
@@ -594,10 +592,7 @@ impl RuntimeSession {
             soft_apis
                 .intern(entry.library, entry.name, 0)
                 .with_context(|| {
-                    format!(
-                        "failed to plant soft API {}!{}",
-                        entry.library, entry.name
-                    )
+                    format!("failed to plant soft API {}!{}", entry.library, entry.name)
                 })?;
         }
         // Read the PE file once; we need the bytes for both identity and loading.
@@ -614,11 +609,7 @@ impl RuntimeSession {
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
         // are written directly into guest memory (no intermediate Vec<u8> buffer).
         engine
-            .mem_map_image(
-                identity.image_base,
-                image_size,
-                wie_cpu::perm::ALL,
-            )
+            .mem_map_image(identity.image_base, image_size, wie_cpu::perm::ALL)
             .context("failed to map PE image memory")?;
 
         // Load PE directly into guest memory: single PE parse, writes headers +
@@ -1069,8 +1060,9 @@ impl RuntimeSession {
             self.profile.cpu_user_us = cpu_user_us;
             self.profile.cpu_sys_us = cpu_sys_us;
             self.profile.jit = self.process.with_mut(|e, _| e.cpu_stats());
-            self.profile.mem_backend =
-                self.process.with_mut(|e, _| e.mem_backend_name().to_owned());
+            self.profile.mem_backend = self
+                .process
+                .with_mut(|e, _| e.mem_backend_name().to_owned());
         }
         // Residual iced histogram (opt-in via `WIE_EXEC_TRACE=1`).
         wie_cpu::dump_iced_counters();
@@ -1136,7 +1128,8 @@ impl RuntimeSession {
 
     /// Changes the behavior of `GetMessageA` when the queue is empty.
     pub fn set_message_queue_idle_policy(&mut self, policy: wie_winapi::MessageQueueIdlePolicy) {
-        self.process.with_mut(|_, s| s.message_queue_idle_policy = policy);
+        self.process
+            .with_mut(|_, s| s.message_queue_idle_policy = policy);
     }
 
     /// Adds one message to the persistent guest message queue.
@@ -1269,10 +1262,7 @@ impl RuntimeSession {
                 if matches!(quantum, Quantum::Break) {
                     // already set break_term
                 } else if invalid_memory.hit {
-                    break_term = Some(invalid_memory_diagnostic(
-                        engine,
-                        &invalid_memory,
-                    )?);
+                    break_term = Some(invalid_memory_diagnostic(engine, &invalid_memory)?);
                     quantum = Quantum::Break;
                 } else if !hook.hit {
                     self.no_hook_slices = self
@@ -1359,219 +1349,221 @@ impl RuntimeSession {
                     }
 
                     if let Some(resolved) = resolved_opt {
-                    if let Some(t0) = resolve_t0 {
-                        self.profile.resolve_ns = self
-                            .profile
-                            .resolve_ns
-                            .saturating_add(t0.elapsed().as_nanos());
-                    }
-
-                    if self.profile_enabled {
-                        self.profile.host_stops = self.profile.host_stops.saturating_add(1);
-                    }
-
-                    let export_key = if self.profile_enabled {
-                        Some(format!(
-                            "{}!{}",
-                            resolved.library.as_ref(),
-                            resolved.name.as_ref()
-                        ))
-                    } else {
-                        None
-                    };
-
-                    {
-                        let mut teb_err = [0_u8; 4];
-                        if engine
-                            .mem_read(crate::guest_stubs::TEB_LAST_ERROR_VA, &mut teb_err)
-                            .is_ok()
-                        {
-                            winapi_state.last_error = u32::from_le_bytes(teb_err);
+                        if let Some(t0) = resolve_t0 {
+                            self.profile.resolve_ns = self
+                                .profile
+                                .resolve_ns
+                                .saturating_add(t0.elapsed().as_nanos());
                         }
-                    }
 
-                    let mut record_handler = |ns: u128, noisy: bool| {
-                        if !self.profile_enabled {
-                            return;
+                        if self.profile_enabled {
+                            self.profile.host_stops = self.profile.host_stops.saturating_add(1);
                         }
-                        self.profile.handler_ns = self.profile.handler_ns.saturating_add(ns);
-                        if noisy {
-                            self.profile.noisy_calls = self.profile.noisy_calls.saturating_add(1);
+
+                        let export_key = if self.profile_enabled {
+                            Some(format!(
+                                "{}!{}",
+                                resolved.library.as_ref(),
+                                resolved.name.as_ref()
+                            ))
                         } else {
-                            self.profile.charged_calls =
-                                self.profile.charged_calls.saturating_add(1);
-                        }
-                        if let Some(key) = export_key.as_ref() {
-                            let entry = self.profile.by_export.entry(key.clone()).or_insert((0, 0));
-                            entry.0 = entry.0.saturating_add(1);
-                            entry.1 = entry.1.saturating_add(ns);
-                        }
-                    };
-
-                    if resolved.traits.exit_process() {
-                        let handler_t0 = self.profile_enabled.then(Instant::now);
-                        let exit_code_raw = engine
-                            .read_rcx()
-                            .context("failed to read RCX for ExitProcess")?;
-                        let exit_code = u32::try_from(exit_code_raw & u64::from(u32::MAX))
-                            .context("ExitProcess code does not fit u32")?;
-                        events.push(EntryTraceEvent {
-                            index,
-                            library: resolved.library.clone().into(),
-                            name: resolved.name.clone().into(),
-                            fake_target_va: hook.address,
-                            handled: true,
-                            return_value: None,
-                            return_address: None,
-                        });
-                        if let Some(t0) = handler_t0 {
-                            record_handler(t0.elapsed().as_nanos(), false);
-                        }
-                        winapi_state.sync.process_dying = true;
-                        break_term =
-                            Some(EntryTraceTermination::ExitProcess { code: exit_code });
-                        quantum = Quantum::Break;
-                    } else if resolved.traits.fast_void_sync() {
-                        let handler_t0 = self.profile_enabled.then(Instant::now);
-                        engine
-                            .return_from_win64_api(0)
-                            .context("failed to return from fast synchronization API")?;
-                        if let Some(t0) = handler_t0 {
-                            record_handler(t0.elapsed().as_nanos(), true);
-                        }
-                        noisy_api = noisy_api.saturating_add(1);
-                        // publish last error
-                        let err = winapi_state.last_error;
-                        if self.last_published_last_error != Some(err) {
-                            let bytes = err.to_le_bytes();
-                            if engine
-                                .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                .is_ok()
-                            {
-                                self.last_published_last_error = Some(err);
-                            }
-                        }
-                        quantum = Quantum::Continue;
-                    } else if matches!(
-                        resolved.winapi_id,
-                        Some(wie_winapi::WinApiId::Kernel32Heapalloc)
-                    ) {
-                        let handler_t0 = self.profile_enabled.then(Instant::now);
-                        wie_winapi::kernel32::handle_heap_alloc(engine, winapi_state)?;
-                        if let Some(t0) = handler_t0 {
-                            record_handler(t0.elapsed().as_nanos(), true);
-                        }
-                        noisy_api = noisy_api.saturating_add(1);
-                        let err = winapi_state.last_error;
-                        if self.last_published_last_error != Some(err) {
-                            let bytes = err.to_le_bytes();
-                            if engine
-                                .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                .is_ok()
-                            {
-                                self.last_published_last_error = Some(err);
-                            }
-                        }
-                        quantum = Quantum::Continue;
-                    } else if matches!(
-                        resolved.winapi_id,
-                        Some(wie_winapi::WinApiId::Kernel32Heapfree)
-                    ) {
-                        let handler_t0 = self.profile_enabled.then(Instant::now);
-                        wie_winapi::kernel32::handle_heap_free(engine, winapi_state)?;
-                        if let Some(t0) = handler_t0 {
-                            record_handler(t0.elapsed().as_nanos(), true);
-                        }
-                        noisy_api = noisy_api.saturating_add(1);
-                        let err = winapi_state.last_error;
-                        if self.last_published_last_error != Some(err) {
-                            let bytes = err.to_le_bytes();
-                            if engine
-                                .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
-                                .is_ok()
-                            {
-                                self.last_published_last_error = Some(err);
-                            }
-                        }
-                        quantum = Quantum::Continue;
-                    } else if matches!(
-                        resolved.winapi_id,
-                        Some(wie_winapi::WinApiId::Kernel32Multibytetowidechar)
-                    ) {
-                        let handler_t0 = self.profile_enabled.then(Instant::now);
-                        wie_winapi::kernel32::handle_multi_byte_to_wide_char(engine)?;
-                        if let Some(t0) = handler_t0 {
-                            record_handler(t0.elapsed().as_nanos(), true);
-                        }
-                        noisy_api = noisy_api.saturating_add(1);
-                        quantum = Quantum::Continue;
-                    } else {
-                        let handler_t0 = self.profile_enabled.then(Instant::now);
-                        let dispatch_result = if let Some(id) = resolved.winapi_id {
-                            wie_winapi::dispatch_winapi_id(
-                                engine,
-                                environment,
-                                winapi_state,
-                                id,
-                            )
-                        } else {
-                            wie_winapi::dispatch_winapi(
-                                engine,
-                                environment,
-                                winapi_state,
-                                &resolved.library,
-                                &resolved.name,
-                            )
+                            None
                         };
-                        let handler_ns =
-                            handler_t0.map(|t0| t0.elapsed().as_nanos()).unwrap_or(0);
 
-                        match dispatch_result {
-                            Ok(handler_result) => {
-                                if resolved.traits.noisy() {
-                                    record_handler(handler_ns, true);
-                                    noisy_api = noisy_api.saturating_add(1);
-                                } else {
-                                    record_handler(handler_ns, false);
-                                    charged_api = charged_api.saturating_add(1);
-                                    events.push(EntryTraceEvent {
-                                        index,
-                                        library: resolved.library.clone().into(),
-                                        name: resolved.name.clone().into(),
-                                        fake_target_va: hook.address,
-                                        handled: true,
-                                        return_value: Some(handler_result.return_value),
-                                        return_address: Some(handler_result.return_address),
-                                    });
-                                }
-                                let err = winapi_state.last_error;
-                                if self.last_published_last_error != Some(err) {
-                                    let bytes = err.to_le_bytes();
-                                    if engine
-                                        .mem_write(
-                                            crate::guest_stubs::TEB_LAST_ERROR_VA,
-                                            &bytes,
-                                        )
-                                        .is_ok()
-                                    {
-                                        self.last_published_last_error = Some(err);
-                                    }
-                                }
-                                journal_api_return(
-                                    index,
-                                    resolved.library.as_ref(),
-                                    resolved.name.as_ref(),
-                                    engine,
-                                    handler_result.return_value,
-                                    handler_result.return_address,
-                                );
-                                quantum = Quantum::Continue;
+                        {
+                            let mut teb_err = [0_u8; 4];
+                            if engine
+                                .mem_read(crate::guest_stubs::TEB_LAST_ERROR_VA, &mut teb_err)
+                                .is_ok()
+                            {
+                                winapi_state.last_error = u32::from_le_bytes(teb_err);
                             }
-                            Err(error) => {
-                                record_handler(handler_ns, false);
-                                let control_signal =
-                                    error.downcast_ref::<wie_winapi::WinApiControlSignal>();
-                                match control_signal {
+                        }
+
+                        let mut record_handler = |ns: u128, noisy: bool| {
+                            if !self.profile_enabled {
+                                return;
+                            }
+                            self.profile.handler_ns = self.profile.handler_ns.saturating_add(ns);
+                            if noisy {
+                                self.profile.noisy_calls =
+                                    self.profile.noisy_calls.saturating_add(1);
+                            } else {
+                                self.profile.charged_calls =
+                                    self.profile.charged_calls.saturating_add(1);
+                            }
+                            if let Some(key) = export_key.as_ref() {
+                                let entry =
+                                    self.profile.by_export.entry(key.clone()).or_insert((0, 0));
+                                entry.0 = entry.0.saturating_add(1);
+                                entry.1 = entry.1.saturating_add(ns);
+                            }
+                        };
+
+                        if resolved.traits.exit_process() {
+                            let handler_t0 = self.profile_enabled.then(Instant::now);
+                            let exit_code_raw = engine
+                                .read_rcx()
+                                .context("failed to read RCX for ExitProcess")?;
+                            let exit_code = u32::try_from(exit_code_raw & u64::from(u32::MAX))
+                                .context("ExitProcess code does not fit u32")?;
+                            events.push(EntryTraceEvent {
+                                index,
+                                library: resolved.library.clone().into(),
+                                name: resolved.name.clone().into(),
+                                fake_target_va: hook.address,
+                                handled: true,
+                                return_value: None,
+                                return_address: None,
+                            });
+                            if let Some(t0) = handler_t0 {
+                                record_handler(t0.elapsed().as_nanos(), false);
+                            }
+                            winapi_state.sync.process_dying = true;
+                            break_term =
+                                Some(EntryTraceTermination::ExitProcess { code: exit_code });
+                            quantum = Quantum::Break;
+                        } else if resolved.traits.fast_void_sync() {
+                            let handler_t0 = self.profile_enabled.then(Instant::now);
+                            engine
+                                .return_from_win64_api(0)
+                                .context("failed to return from fast synchronization API")?;
+                            if let Some(t0) = handler_t0 {
+                                record_handler(t0.elapsed().as_nanos(), true);
+                            }
+                            noisy_api = noisy_api.saturating_add(1);
+                            // publish last error
+                            let err = winapi_state.last_error;
+                            if self.last_published_last_error != Some(err) {
+                                let bytes = err.to_le_bytes();
+                                if engine
+                                    .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
+                                    .is_ok()
+                                {
+                                    self.last_published_last_error = Some(err);
+                                }
+                            }
+                            quantum = Quantum::Continue;
+                        } else if matches!(
+                            resolved.winapi_id,
+                            Some(wie_winapi::WinApiId::Kernel32Heapalloc)
+                        ) {
+                            let handler_t0 = self.profile_enabled.then(Instant::now);
+                            wie_winapi::kernel32::handle_heap_alloc(engine, winapi_state)?;
+                            if let Some(t0) = handler_t0 {
+                                record_handler(t0.elapsed().as_nanos(), true);
+                            }
+                            noisy_api = noisy_api.saturating_add(1);
+                            let err = winapi_state.last_error;
+                            if self.last_published_last_error != Some(err) {
+                                let bytes = err.to_le_bytes();
+                                if engine
+                                    .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
+                                    .is_ok()
+                                {
+                                    self.last_published_last_error = Some(err);
+                                }
+                            }
+                            quantum = Quantum::Continue;
+                        } else if matches!(
+                            resolved.winapi_id,
+                            Some(wie_winapi::WinApiId::Kernel32Heapfree)
+                        ) {
+                            let handler_t0 = self.profile_enabled.then(Instant::now);
+                            wie_winapi::kernel32::handle_heap_free(engine, winapi_state)?;
+                            if let Some(t0) = handler_t0 {
+                                record_handler(t0.elapsed().as_nanos(), true);
+                            }
+                            noisy_api = noisy_api.saturating_add(1);
+                            let err = winapi_state.last_error;
+                            if self.last_published_last_error != Some(err) {
+                                let bytes = err.to_le_bytes();
+                                if engine
+                                    .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
+                                    .is_ok()
+                                {
+                                    self.last_published_last_error = Some(err);
+                                }
+                            }
+                            quantum = Quantum::Continue;
+                        } else if matches!(
+                            resolved.winapi_id,
+                            Some(wie_winapi::WinApiId::Kernel32Multibytetowidechar)
+                        ) {
+                            let handler_t0 = self.profile_enabled.then(Instant::now);
+                            wie_winapi::kernel32::handle_multi_byte_to_wide_char(engine)?;
+                            if let Some(t0) = handler_t0 {
+                                record_handler(t0.elapsed().as_nanos(), true);
+                            }
+                            noisy_api = noisy_api.saturating_add(1);
+                            quantum = Quantum::Continue;
+                        } else {
+                            let handler_t0 = self.profile_enabled.then(Instant::now);
+                            let dispatch_result = if let Some(id) = resolved.winapi_id {
+                                wie_winapi::dispatch_winapi_id(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                    id,
+                                )
+                            } else {
+                                wie_winapi::dispatch_winapi(
+                                    engine,
+                                    environment,
+                                    winapi_state,
+                                    &resolved.library,
+                                    &resolved.name,
+                                )
+                            };
+                            let handler_ns =
+                                handler_t0.map(|t0| t0.elapsed().as_nanos()).unwrap_or(0);
+
+                            match dispatch_result {
+                                Ok(handler_result) => {
+                                    if resolved.traits.noisy() {
+                                        record_handler(handler_ns, true);
+                                        noisy_api = noisy_api.saturating_add(1);
+                                    } else {
+                                        record_handler(handler_ns, false);
+                                        charged_api = charged_api.saturating_add(1);
+                                        events.push(EntryTraceEvent {
+                                            index,
+                                            library: resolved.library.clone().into(),
+                                            name: resolved.name.clone().into(),
+                                            fake_target_va: hook.address,
+                                            handled: true,
+                                            return_value: Some(handler_result.return_value),
+                                            return_address: Some(handler_result.return_address),
+                                        });
+                                    }
+                                    let err = winapi_state.last_error;
+                                    if self.last_published_last_error != Some(err) {
+                                        let bytes = err.to_le_bytes();
+                                        if engine
+                                            .mem_write(
+                                                crate::guest_stubs::TEB_LAST_ERROR_VA,
+                                                &bytes,
+                                            )
+                                            .is_ok()
+                                        {
+                                            self.last_published_last_error = Some(err);
+                                        }
+                                    }
+                                    journal_api_return(
+                                        index,
+                                        resolved.library.as_ref(),
+                                        resolved.name.as_ref(),
+                                        engine,
+                                        handler_result.return_value,
+                                        handler_result.return_address,
+                                    );
+                                    quantum = Quantum::Continue;
+                                }
+                                Err(error) => {
+                                    record_handler(handler_ns, false);
+                                    let control_signal =
+                                        error.downcast_ref::<wie_winapi::WinApiControlSignal>();
+                                    match control_signal {
                                     Some(wie_winapi::WinApiControlSignal::WaitingForMessage) => {
                                         self.next_api_index = self
                                             .next_api_index
@@ -1647,9 +1639,9 @@ impl RuntimeSession {
                                         quantum = Quantum::Break;
                                     }
                                 }
+                                }
                             }
                         }
-                    }
                     } // break_term.is_none resolved block
                 }
             } // drop pair (process locks)
@@ -1672,9 +1664,9 @@ impl RuntimeSession {
                         wie_winapi::HostParkReason::CriticalSection { cs } => {
                             // Clone queue under lock, park **without** process locks
                             // so the CS owner can Leave and wake us.
-                            let q = self.process.with_mut(|_, st| {
-                                wie_winapi::kernel32::resolve_cs_queue(st, cs)
-                            });
+                            let q = self
+                                .process
+                                .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
                             q.park_brief();
                             // Retry Enter: restore primary regs; RIP still at API.
                             self.process.with_mut(|eng, st| {
@@ -1701,14 +1693,14 @@ impl RuntimeSession {
                             charged_api = charged_api.saturating_add(1);
                         }
                         wie_winapi::HostParkReason::WaitMultiple => {
-                            let req = self.process.with_mut(|_, st| {
-                                st.sync.multi_wait.remove(&primary_tid)
-                            });
+                            let req = self
+                                .process
+                                .with_mut(|_, st| st.sync.multi_wait.remove(&primary_tid));
                             let result = match req {
                                 Some(req) => {
-                                    let targets = self.process.with_mut(|_, st| {
-                                        st.sync.wait_targets(&req.handles)
-                                    });
+                                    let targets = self
+                                        .process
+                                        .with_mut(|_, st| st.sync.wait_targets(&req.handles));
                                     match targets {
                                         Some(ts) => wie_winapi::wait_multiple(
                                             &ts,
@@ -1733,10 +1725,7 @@ impl RuntimeSession {
         }
 
         // Join workers if process exited.
-        if matches!(
-            termination,
-            EntryTraceTermination::ExitProcess { .. }
-        ) {
+        if matches!(termination, EntryTraceTermination::ExitProcess { .. }) {
             self.process.join_workers();
         }
 
@@ -1755,7 +1744,6 @@ impl RuntimeSession {
         })
     }
 
-
     /// Queues one deterministic USER32 message for the guest.
     pub fn post_window_message(
         &mut self,
@@ -1770,16 +1758,15 @@ impl RuntimeSession {
                 .next_message_time
                 .checked_add(1)
                 .context("runtime message timestamp overflow")?;
-            st.message_queue
-                .push(wie_winapi::QueuedWindowMessage {
-                    window_handle,
-                    message,
-                    word_parameter,
-                    long_parameter,
-                    time,
-                    point_x: 0,
-                    point_y: 0,
-                });
+            st.message_queue.push(wie_winapi::QueuedWindowMessage {
+                window_handle,
+                message,
+                word_parameter,
+                long_parameter,
+                time,
+                point_x: 0,
+                point_y: 0,
+            });
             Ok(())
         })
     }
@@ -1837,9 +1824,8 @@ impl RuntimeSession {
         guest_path: &str,
         host_path: impl AsRef<std::path::Path>,
     ) -> Result<()> {
-        self.process.with_mut(|_, st| {
-            wie_winapi::kernel32::mount_host_file(st, guest_path, host_path)
-        })
+        self.process
+            .with_mut(|_, st| wie_winapi::kernel32::mount_host_file(st, guest_path, host_path))
     }
 
     /// Opens a guest path with the same rules as `CreateFile*` (for smoke tests).
@@ -2038,10 +2024,7 @@ fn invalid_memory_diagnostic(
          rip={rip:#018x}; rsp={rsp:#018x}; rax={rax:#018x}; \
          rcx={rcx:#018x}; rdx={rdx:#018x}; \
          r8={r8:#018x}; r9={r9:#018x};{stack_slots};{this_info}",
-        access.access_type,
-        access.address,
-        access.size,
-        access.value,
+        access.access_type, access.address, access.size, access.value,
     )))
 }
 

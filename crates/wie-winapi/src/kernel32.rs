@@ -230,10 +230,7 @@ const GUEST_OS_PLATFORM_NT: u32 = 2;
 #[must_use]
 fn packed_get_version() -> u64 {
     // Low byte major, next minor, high word build; bit 31 set ⇒ Windows NT family.
-    let packed = GUEST_OS_MAJOR
-        | (GUEST_OS_MINOR << 8)
-        | (GUEST_OS_BUILD << 16)
-        | 0x8000_0000;
+    let packed = GUEST_OS_MAJOR | (GUEST_OS_MINOR << 8) | (GUEST_OS_BUILD << 16) | 0x8000_0000;
     u64::from(packed)
 }
 
@@ -374,7 +371,9 @@ pub fn handle_get_module_handle_w(
 
 /// Handles `KERNEL32.dll!lstrlenW`.
 pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let s = engine.read_rcx().context("failed to read RCX for lstrlenW")?;
+    let s = engine
+        .read_rcx()
+        .context("failed to read RCX for lstrlenW")?;
     let return_value = if s == 0 {
         0_u64
     } else {
@@ -403,8 +402,12 @@ pub fn handle_lstrlen_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 
 /// Handles `KERNEL32.dll!lstrcpyW` — copy wide string; returns dest.
 pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let dest = engine.read_rcx().context("failed to read RCX for lstrcpyW")?;
-    let src = engine.read_rdx().context("failed to read RDX for lstrcpyW")?;
+    let dest = engine
+        .read_rcx()
+        .context("failed to read RCX for lstrcpyW")?;
+    let src = engine
+        .read_rdx()
+        .context("failed to read RDX for lstrcpyW")?;
     if dest != 0 && src != 0 {
         let mut offset = 0_u64;
         loop {
@@ -431,8 +434,12 @@ pub fn handle_lstrcpy_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHan
 
 /// Handles `KERNEL32.dll!lstrcatW` — append wide string; returns dest.
 pub fn handle_lstrcat_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let dest = engine.read_rcx().context("failed to read RCX for lstrcatW")?;
-    let src = engine.read_rdx().context("failed to read RDX for lstrcatW")?;
+    let dest = engine
+        .read_rcx()
+        .context("failed to read RCX for lstrcatW")?;
+    let src = engine
+        .read_rdx()
+        .context("failed to read RDX for lstrcatW")?;
     if dest != 0 && src != 0 {
         // Find end of dest.
         let mut dest_end = 0_u64;
@@ -1055,9 +1062,9 @@ fn write_find_data_common(
     let attributes_address =
         checked_field_address(find_data_ptr, 0, "WIN32_FIND_DATA.dwFileAttributes")?;
     let file_size_high_address =
-        checked_field_address(find_data_ptr, 28, "WIN32_FIND_DATA.nFileSizeHigh")?;
+        checked_field_address(find_data_ptr, 32, "WIN32_FIND_DATA.nFileSizeHigh")?;
     let file_size_low_address =
-        checked_field_address(find_data_ptr, 32, "WIN32_FIND_DATA.nFileSizeLow")?;
+        checked_field_address(find_data_ptr, 36, "WIN32_FIND_DATA.nFileSizeLow")?;
 
     write_guest_u32(engine, attributes_address, attributes)?;
     write_guest_u32(engine, file_size_high_address, 0)?;
@@ -1078,8 +1085,7 @@ fn write_find_data_w(
         return Ok(());
     }
 
-    // WIN32_FIND_DATAW.cFileName offset is 44.
-    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAW.cFileName")?;
+    let file_name_address = checked_field_address(find_data_ptr, 48, "WIN32_FIND_DATAW.cFileName")?;
 
     let mut bytes = Vec::new();
     for unit in file_name.encode_utf16() {
@@ -1106,8 +1112,7 @@ fn write_find_data_a(
         return Ok(());
     }
 
-    // WIN32_FIND_DATAA.cFileName offset is also 44.
-    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAA.cFileName")?;
+    let file_name_address = checked_field_address(find_data_ptr, 48, "WIN32_FIND_DATAA.cFileName")?;
 
     let mut bytes = crate::vfs::encode_acp(file_name);
     bytes.push(0);
@@ -2789,8 +2794,8 @@ fn finish_find_next(
         write_find_data_a(engine, find_data_ptr, &next.name, next.attributes)?;
     }
     if find_data_ptr != 0 {
-        let high = checked_field_address(find_data_ptr, 28, "nFileSizeHigh")?;
-        let low = checked_field_address(find_data_ptr, 32, "nFileSizeLow")?;
+        let high = checked_field_address(find_data_ptr, 32, "nFileSizeHigh")?;
+        let low = checked_field_address(find_data_ptr, 36, "nFileSizeLow")?;
         write_guest_u32(engine, high, u32::try_from(next.size >> 32).unwrap_or(0))?;
         write_guest_u32(
             engine,
@@ -3548,14 +3553,8 @@ fn open_existing_guest_file(
         if truncate {
             drop(crate::vfs::host_set_len(host, 0));
         }
-        return allocate_open_file_ex(
-            state,
-            guest_path,
-            Vec::new(),
-            Some(host.clone()),
-            true,
-        )
-        .map_err(|_| ERROR_FILE_NOT_FOUND);
+        return allocate_open_file_ex(state, guest_path, Vec::new(), Some(host.clone()), true)
+            .map_err(|_| ERROR_FILE_NOT_FOUND);
     }
 
     let mut bytes =
@@ -4343,8 +4342,8 @@ pub fn handle_read_file(
         let streaming = find_open_file(state, handle).is_some_and(|f| f.streaming);
         if streaming {
             let (host_path, cursor_before, path) = {
-                let open_file = find_open_file(state, handle)
-                    .context("open file vanished during ReadFile")?;
+                let open_file =
+                    find_open_file(state, handle).context("open file vanished during ReadFile")?;
                 (
                     open_file.host_path.clone(),
                     open_file.cursor,
@@ -4369,14 +4368,11 @@ pub fn handle_read_file(
                 open_file.cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
             }
             if bytes_read_ptr != 0 {
-                write_guest_u32(
-                    engine,
-                    bytes_read_ptr,
-                    u32::try_from(n).unwrap_or(0),
-                )?;
+                write_guest_u32(engine, bytes_read_ptr, u32::try_from(n).unwrap_or(0))?;
             }
             if is_main_module_path(state, &path) {
-                state.executable_file_cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
+                state.executable_file_cursor =
+                    cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
             }
             state.last_error = 0;
         } else {
@@ -4387,8 +4383,8 @@ pub fn handle_read_file(
                         .context("open file vanished during ReadFile")?;
 
                     let cursor_before = open_file.cursor;
-                    let cursor_usize = usize::try_from(cursor_before)
-                        .context("file cursor does not fit usize")?;
+                    let cursor_usize =
+                        usize::try_from(cursor_before).context("file cursor does not fit usize")?;
                     let available = open_file.bytes.len().saturating_sub(cursor_usize);
                     let read_len = requested.min(available);
                     let end = cursor_usize
@@ -4805,8 +4801,7 @@ const ENABLE_LINE_INPUT: u32 = 0x0002;
 const ENABLE_ECHO_INPUT: u32 = 0x0004;
 const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
 const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
-const DEFAULT_CONSOLE_MODE_IN: u32 =
-    ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
+const DEFAULT_CONSOLE_MODE_IN: u32 = ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT;
 const DEFAULT_CONSOLE_MODE_OUT: u32 = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
 
 fn ret_bool_true(engine: &mut dyn wie_cpu::CpuEngine, api: &str) -> Result<WinApiHandlerResult> {
@@ -4912,9 +4907,7 @@ pub fn handle_set_file_apis_to_oem(
 pub fn handle_query_performance_frequency(
     engine: &mut dyn wie_cpu::CpuEngine,
 ) -> Result<WinApiHandlerResult> {
-    let ptr = engine
-        .read_rcx()
-        .context("QueryPerformanceFrequency RCX")?;
+    let ptr = engine.read_rcx().context("QueryPerformanceFrequency RCX")?;
     if ptr != 0 {
         write_guest_u64(engine, ptr, FIXED_PERFORMANCE_FREQUENCY)?;
     }
@@ -4956,9 +4949,7 @@ pub fn handle_get_system_info(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
         // level / revision
         buf[44..46].copy_from_slice(&6_u16.to_le_bytes());
         buf[46..48].copy_from_slice(&0x3c03_u16.to_le_bytes());
-        engine
-            .mem_write(ptr, &buf)
-            .context("GetSystemInfo write")?;
+        engine.mem_write(ptr, &buf).context("GetSystemInfo write")?;
     }
     ret_u64(engine, 0, "GetSystemInfo")
 }
@@ -5016,7 +5007,10 @@ pub fn handle_get_process_times(
     let exit_t = engine.read_r8().context("GetProcessTimes R8")?;
     let kernel = engine.read_r9().context("GetProcessTimes R9")?;
     let rsp = engine.read_rsp().context("GetProcessTimes RSP")?;
-    let user = read_guest_u64(engine, checked_address(rsp, 0x28, "GetProcessTimes lpUserTime")?)?;
+    let user = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x28, "GetProcessTimes lpUserTime")?,
+    )?;
     // Fixed synthetic times (100-ns ticks).
     if creation != 0 {
         write_guest_u64(engine, creation, FIXED_SYSTEM_FILETIME)?;
@@ -5193,8 +5187,10 @@ pub fn handle_get_disk_free_space_w(
     let bps = engine.read_r8()?; // bytes per sector
     let free_clusters = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    let total_clusters =
-        read_guest_u64(engine, checked_address(rsp, 0x28, "GetDiskFreeSpaceW total")?)?;
+    let total_clusters = read_guest_u64(
+        engine,
+        checked_address(rsp, 0x28, "GetDiskFreeSpaceW total")?,
+    )?;
     if spc != 0 {
         write_guest_u32(engine, spc, 8)?;
     }
@@ -5266,9 +5262,7 @@ pub fn handle_set_file_time(
 }
 
 /// Minimal `FormatMessageW` — empty string / return 0 for now.
-pub fn handle_format_message_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+pub fn handle_format_message_w(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let _flags = engine.read_rcx()?;
     let _source = engine.read_rdx()?;
     let _message_id = engine.read_r8()?;
@@ -5384,7 +5378,11 @@ pub fn handle_wait_for_multiple_objects(
     let count_usize = usize::try_from(count).unwrap_or(usize::MAX);
     if count == 0 || handles_ptr == 0 || count_usize > crate::MAXIMUM_WAIT_OBJECTS {
         state.last_error = ERROR_INVALID_PARAMETER;
-        return ret_u64(engine, u64::from(crate::WAIT_FAILED), "WaitForMultipleObjects");
+        return ret_u64(
+            engine,
+            u64::from(crate::WAIT_FAILED),
+            "WaitForMultipleObjects",
+        );
     }
 
     let mut handles = Vec::with_capacity(count_usize);
@@ -5402,12 +5400,20 @@ pub fn handle_wait_for_multiple_objects(
         }
     } else {
         state.last_error = ERROR_INVALID_HANDLE;
-        return ret_u64(engine, u64::from(crate::WAIT_FAILED), "WaitForMultipleObjects");
+        return ret_u64(
+            engine,
+            u64::from(crate::WAIT_FAILED),
+            "WaitForMultipleObjects",
+        );
     }
 
     if timeout_ms == 0 {
         state.last_error = 0;
-        return ret_u64(engine, u64::from(crate::WAIT_TIMEOUT), "WaitForMultipleObjects");
+        return ret_u64(
+            engine,
+            u64::from(crate::WAIT_TIMEOUT),
+            "WaitForMultipleObjects",
+        );
     }
 
     // Stash args per waiter TID; HostPark reason stays small/Copy.
@@ -5550,14 +5556,14 @@ pub fn dispatch_kernel32_extra(
         "interlockedincrement64" => Ok(Some(handle_interlocked_increment64(engine)?)),
         "interlockeddecrement64" => Ok(Some(handle_interlocked_decrement64(engine)?)),
         "interlockedexchange64" => Ok(Some(handle_interlocked_exchange64(engine)?)),
-        "interlockedcompareexchange64" => {
-            Ok(Some(handle_interlocked_compare_exchange64(engine)?))
-        }
+        "interlockedcompareexchange64" => Ok(Some(handle_interlocked_compare_exchange64(engine)?)),
         "interlockedexchangeadd64" => Ok(Some(handle_interlocked_exchange_add64(engine)?)),
         // Real-tool surface (7z / CRT-linked PE)
         "getversion" => Ok(Some(handle_get_version(engine)?)),
         "getmodulehandlew" => Ok(Some(handle_get_module_handle_w(
-            engine, environment, state,
+            engine,
+            environment,
+            state,
         )?)),
         "lstrlenw" => Ok(Some(handle_lstrlen_w(engine)?)),
         "lstrcpyw" => Ok(Some(handle_lstrcpy_w(engine)?)),
@@ -5566,17 +5572,11 @@ pub fn dispatch_kernel32_extra(
         "setconsolectrlhandler" => Ok(Some(handle_set_console_ctrl_handler(engine)?)),
         "getconsolemode" => Ok(Some(handle_get_console_mode(engine)?)),
         "setconsolemode" => Ok(Some(handle_set_console_mode(engine)?)),
-        "getconsolescreenbufferinfo" => {
-            Ok(Some(handle_get_console_screen_buffer_info(engine)?))
-        }
+        "getconsolescreenbufferinfo" => Ok(Some(handle_get_console_screen_buffer_info(engine)?)),
         "setfileapistooem" => Ok(Some(handle_set_file_apis_to_oem(engine)?)),
-        "queryperformancefrequency" => {
-            Ok(Some(handle_query_performance_frequency(engine)?))
-        }
+        "queryperformancefrequency" => Ok(Some(handle_query_performance_frequency(engine)?)),
         "getsysteminfo" => Ok(Some(handle_get_system_info(engine)?)),
-        "isprocessorfeaturepresent" => {
-            Ok(Some(handle_is_processor_feature_present(engine)?))
-        }
+        "isprocessorfeaturepresent" => Ok(Some(handle_is_processor_feature_present(engine)?)),
         "globalmemorystatusex" => Ok(Some(handle_global_memory_status_ex(engine)?)),
         "getprocesstimes" => Ok(Some(handle_get_process_times(engine)?)),
         "getlargepageminimum" => Ok(Some(handle_get_large_page_minimum(engine)?)),
@@ -5830,9 +5830,7 @@ fn handle_interlocked_decrement(
 }
 
 /// `InterlockedExchange` — returns **previous** value.
-fn handle_interlocked_exchange(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_interlocked_exchange(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     use std::sync::atomic::Ordering;
     let addr = engine.read_rcx().context("InterlockedExchange RCX")?;
     // RDX carries the new LONG (low 32 bits).
@@ -5863,8 +5861,7 @@ fn handle_interlocked_compare_exchange(
     let prev = interlocked_i32_prev(
         engine,
         addr,
-        |a| match a.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst)
-        {
+        |a| match a.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(v) | Err(v) => v,
         },
         |old| {
@@ -5970,8 +5967,7 @@ fn handle_interlocked_compare_exchange64(
     let prev = interlocked_i64_prev(
         engine,
         addr,
-        |a| match a.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst)
-        {
+        |a| match a.compare_exchange(comparand, exchange, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(v) | Err(v) => v,
         },
         |old| {
@@ -6193,8 +6189,7 @@ fn handle_get_exit_code_thread(
     let handle = engine.read_rcx()?;
     let out_ptr = engine.read_rdx()?;
     let code = if let Some(t) = state.sync.thread_by_handle(handle) {
-        t.exit_code
-            .load(std::sync::atomic::Ordering::Acquire)
+        t.exit_code.load(std::sync::atomic::Ordering::Acquire)
     } else {
         state.last_error = ERROR_INVALID_HANDLE;
         let return_address = engine.return_from_win64_api(0)?;
@@ -6270,10 +6265,7 @@ fn handle_wait_for_single_object(
 
     // Need to park host (drop CPU) then wait.
     Err(crate::WinApiControlSignal::HostPark {
-        reason: crate::HostParkReason::WaitObject {
-            handle,
-            timeout_ms,
-        },
+        reason: crate::HostParkReason::WaitObject { handle, timeout_ms },
     }
     .into())
 }
@@ -6374,9 +6366,7 @@ fn handle_reset_event(
 }
 
 /// `GetCurrentThread` — pseudo-handle `-2` (Microsoft Learn).
-fn handle_get_current_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
-) -> Result<WinApiHandlerResult> {
+fn handle_get_current_thread(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     // CURRENT_THREAD_PSEUDO_HANDLE = (HANDLE)-2
     let return_value = u64::MAX - 1;
     let return_address = engine.return_from_win64_api(return_value)?;
@@ -6454,14 +6444,7 @@ fn handle_virtual_alloc(
     match engine.virtual_alloc(addr, size_usize, alloc_type, protect) {
         Ok(base) => {
             state.last_error = 0;
-            tracing::debug!(
-                addr,
-                size,
-                alloc_type,
-                protect,
-                base,
-                "VirtualAlloc ok"
-            );
+            tracing::debug!(addr, size, alloc_type, protect, base, "VirtualAlloc ok");
             let return_address = engine.return_from_win64_api(base)?;
             Ok(WinApiHandlerResult {
                 return_address,
@@ -7202,10 +7185,9 @@ pub fn handle_get_full_path_name_a(
                 out.push(0);
                 engine.mem_write(output_buffer_ptr, &out)?;
                 if file_part_ptr_ptr != 0 {
-                    let file_off = full_path
-                        .rfind('\\')
-                        .map_or(0, |i| i.saturating_add(1));
-                    let file_part_ptr = output_buffer_ptr.saturating_add(u64::try_from(file_off).unwrap_or(0));
+                    let file_off = full_path.rfind('\\').map_or(0, |i| i.saturating_add(1));
+                    let file_part_ptr =
+                        output_buffer_ptr.saturating_add(u64::try_from(file_off).unwrap_or(0));
                     write_guest_u64(engine, file_part_ptr_ptr, file_part_ptr)?;
                 }
                 state.last_error = 0;
@@ -7232,7 +7214,8 @@ pub fn handle_get_current_directory_a(
     let bytes = crate::vfs::encode_acp(&directory);
     let character_count = u64::try_from(bytes.len()).unwrap_or(0);
     let required_with_nul = character_count.saturating_add(1);
-    let return_value = if buffer_ptr == 0 || buffer_length == 0 || buffer_length <= character_count {
+    let return_value = if buffer_ptr == 0 || buffer_length == 0 || buffer_length <= character_count
+    {
         required_with_nul
     } else {
         let mut out = bytes;
@@ -7932,12 +7915,7 @@ pub fn handle_set_end_of_file(
     let return_value = if is_open_file_handle(state, handle) {
         let (streaming, host, cursor, path) = {
             let f = find_open_file(state, handle).context("open file vanished")?;
-            (
-                f.streaming,
-                f.host_path.clone(),
-                f.cursor,
-                f.path.clone(),
-            )
+            (f.streaming, f.host_path.clone(), f.cursor, f.path.clone())
         };
         if streaming {
             if let Some(host) = host {
