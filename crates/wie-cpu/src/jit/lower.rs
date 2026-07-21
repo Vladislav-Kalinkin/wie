@@ -146,13 +146,19 @@ pub(super) const CHAIN_SLOTS: usize = 512;
 /// Shadow return-stack depth (power of two; modular index).
 pub(super) const SHADOW_DEPTH: usize = 32;
 /// Region-direct pin slots (stack + primary heap). Phase 4.1.
-pub(super) const PIN_SLOTS: usize = 2;
+/// Must match [`crate::mem::JIT_REGION_PIN_SLOTS`] (stack + heap + VA pins).
+pub(super) const PIN_SLOTS: usize = crate::mem::JIT_REGION_PIN_SLOTS;
+/// Multi sticky ways for inline IR (last-N pages before helper / multi-way TLB).
+///
+/// 2 balances 7za (large WS full-miss tax vs small-WS hit rate). 4 helps more
+/// on tiny working sets but pays 4 probes on every thrash miss.
+pub(super) const STICKY_WAYS: usize = 2;
 /// Bytes per [`MemPin`] (`repr(C)`: 5×u64).
 pub(super) const PIN_STRIDE: i32 = 40;
 /// Monomorphic edge inline-cache slots (Phase 4.2 data-plane chaining).
 pub(super) const EDGE_IC_SLOTS: usize = 4;
 
-/// Soft-translated region pin (stack / heap) for Phase 4.1 JIT.
+/// Soft-translated region pin (stack / heap / VirtualAlloc) for Phase 4.1 JIT.
 ///
 /// Empty pin: `host_base == 0`. Filled at each `run_compiled` from
 /// [`crate::mem::GuestMemory::jit_region_pins`]; gen must match `mem_gen`.
@@ -257,7 +263,7 @@ pub(super) struct JitCtx {
     pub mem_gen: u64,
     /// Generation recorded for the sticky hot page.
     pub tlb_hot_gen: u64,
-    /// Region-direct pins (stack / heap); empty when `host_base == 0`.
+    /// Region-direct pins (stack / heap / VA); empty when `host_base == 0`.
     pub pins: [MemPin; PIN_SLOTS],
     /// Phase 4.2 monomorphic edge IC: guest target VA (0 = empty).
     ///
@@ -270,6 +276,53 @@ pub(super) struct JitCtx {
     pub edge_ic_rr: u64,
     /// Dynamic XMM dirty mask written by compiled blocks (`bit i` → XMMi).
     pub xmm_dirty_bits: u64,
+    /// Helper mem-path breakdown for this `run_compiled` (not used from Cranelift IR).
+    pub mem_path: MemPathSlice,
+    /// Multi sticky page keys (`TLB_EMPTY` = cold). Appended after IR-stable fields.
+    pub sticky_page: [u64; STICKY_WAYS],
+    /// Host page bases parallel to [`Self::sticky_page`].
+    pub sticky_ptr: [*mut u8; STICKY_WAYS],
+    /// Software R/W bits per sticky way.
+    pub sticky_prot: [u64; STICKY_WAYS],
+    /// Generation per sticky way.
+    pub sticky_gen: [u64; STICKY_WAYS],
+    /// Round-robin victim for sticky install.
+    pub sticky_rr: u64,
+}
+
+/// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).
+///
+/// Classifies why the sticky IR path missed and how the helper resolved the access.
+/// Cheap saturating adds; accumulate into [`super::JitStats`] after each block.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct MemPathSlice {
+    /// Helper sticky hit (IR already missed — rare unless race/gen refresh).
+    pub sticky_hit: u64,
+    /// Multi-way set-assoc TLB hit after sticky miss.
+    pub multi_hit: u64,
+    /// Region pin soft-translate hit.
+    pub pin_hit: u64,
+    /// Full page-walk install hit.
+    pub walk_hit: u64,
+    /// Cross-page access (forces slow path).
+    pub cross_page: u64,
+    /// `tlb_page_ptr` returned `None` → GuestMemory::read/write.
+    pub slow: u64,
+    /// Sticky miss: page key / empty hot (working-set thrash).
+    pub sticky_miss_key: u64,
+    /// Sticky miss: `tlb_hot_gen != mem_gen`.
+    pub sticky_miss_gen: u64,
+    /// Sticky miss: R/W bit denied.
+    pub sticky_miss_prot: u64,
+    /// Times sticky hot page key was replaced.
+    pub sticky_swaps: u64,
+    /// Helper VA fell inside stack pin bounds (regardless of resolve path).
+    pub addr_in_stack_pin: u64,
+    /// Helper VA fell inside heap pin bounds.
+    pub addr_in_heap_pin: u64,
+    /// Helper VA outside both pins (VirtualAlloc / image / other).
+    pub addr_outside_pins: u64,
 }
 
 // Byte offsets into [`JitCtx`] used from Cranelift IR (must match `repr(C)`).
@@ -290,6 +343,10 @@ const OFF_EDGE_IC_VA: i32 = std::mem::offset_of!(JitCtx, edge_ic_va) as i32;
 const OFF_EDGE_IC_FN: i32 = std::mem::offset_of!(JitCtx, edge_ic_fn) as i32;
 const OFF_EDGE_IC_RR: i32 = std::mem::offset_of!(JitCtx, edge_ic_rr) as i32;
 const OFF_XMM_DIRTY: i32 = std::mem::offset_of!(JitCtx, xmm_dirty_bits) as i32;
+const OFF_STICKY_PAGE: i32 = std::mem::offset_of!(JitCtx, sticky_page) as i32;
+const OFF_STICKY_PTR: i32 = std::mem::offset_of!(JitCtx, sticky_ptr) as i32;
+const OFF_STICKY_PROT: i32 = std::mem::offset_of!(JitCtx, sticky_prot) as i32;
+const OFF_STICKY_GEN: i32 = std::mem::offset_of!(JitCtx, sticky_gen) as i32;
 
 // Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
 const _: () = {
@@ -309,6 +366,11 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, edge_ic_fn) as i32 == OFF_EDGE_IC_FN);
     assert!(std::mem::offset_of!(JitCtx, edge_ic_rr) as i32 == OFF_EDGE_IC_RR);
     assert!(std::mem::offset_of!(JitCtx, xmm_dirty_bits) as i32 == OFF_XMM_DIRTY);
+    assert!(std::mem::offset_of!(JitCtx, sticky_page) as i32 == OFF_STICKY_PAGE);
+    assert!(std::mem::offset_of!(JitCtx, sticky_ptr) as i32 == OFF_STICKY_PTR);
+    assert!(std::mem::offset_of!(JitCtx, sticky_prot) as i32 == OFF_STICKY_PROT);
+    assert!(std::mem::offset_of!(JitCtx, sticky_gen) as i32 == OFF_STICKY_GEN);
+    assert!(STICKY_WAYS > 0);
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
     assert!(std::mem::align_of::<XmmSlot>() >= 16);
@@ -385,12 +447,137 @@ fn set_fault(ctx: &mut JitCtx, insn_ip: u64, addr: u64, size: u64, access: u64) 
     ctx.fault_access = access;
 }
 
-/// Promote a mapped page into the sticky hot TLB (inline IR path) and multi-way cache.
+/// Promote a mapped page into multi sticky (IR) + last-hit mirror + multi-way cache warm.
+///
+/// Sticky ways are **MRU-ordered**: way 0 is always the last hit so sequential
+/// streams take one IR probe; thrash of ≤[`STICKY_WAYS`] pages stays in IR.
 fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, generation: u64) {
+    if ctx.tlb_hot_page != page_key && ctx.tlb_hot_page != TLB_EMPTY && !ctx.tlb_hot_ptr.is_null() {
+        ctx.mem_path.sticky_swaps = ctx.mem_path.sticky_swaps.saturating_add(1);
+    }
+    // Last-hit mirror (helper + diagnostics).
     ctx.tlb_hot_page = page_key;
     ctx.tlb_hot_ptr = page_base;
     ctx.tlb_hot_prot = u64::from(prot);
     ctx.tlb_hot_gen = generation;
+
+    // Find existing way (if any).
+    let mut found = None;
+    for w in 0..STICKY_WAYS {
+        if ctx.sticky_page.get(w).copied() == Some(page_key) {
+            found = Some(w);
+            break;
+        }
+    }
+    let prot_u = u64::from(prot);
+    if let Some(0) = found {
+        // Already MRU — refresh metadata only.
+        if let Some(p) = ctx.sticky_ptr.get_mut(0) {
+            *p = page_base;
+        }
+        if let Some(p) = ctx.sticky_prot.get_mut(0) {
+            *p = prot_u;
+        }
+        if let Some(g) = ctx.sticky_gen.get_mut(0) {
+            *g = generation;
+        }
+        return;
+    }
+    // Build new MRU list: [new, …previous without new…]
+    let mut pages = [TLB_EMPTY; STICKY_WAYS];
+    let mut ptrs = [std::ptr::null_mut(); STICKY_WAYS];
+    let mut prots = [0_u64; STICKY_WAYS];
+    let mut gens = [0_u64; STICKY_WAYS];
+    pages[0] = page_key;
+    ptrs[0] = page_base;
+    prots[0] = prot_u;
+    gens[0] = generation;
+    let mut dst = 1_usize;
+    for w in 0..STICKY_WAYS {
+        if Some(w) == found {
+            continue; // drop old slot; reinserted at 0
+        }
+        if dst >= STICKY_WAYS {
+            break;
+        }
+        let pk = ctx.sticky_page.get(w).copied().unwrap_or(TLB_EMPTY);
+        if pk == TLB_EMPTY {
+            continue;
+        }
+        pages[dst] = pk;
+        ptrs[dst] = ctx.sticky_ptr.get(w).copied().unwrap_or(std::ptr::null_mut());
+        prots[dst] = ctx.sticky_prot.get(w).copied().unwrap_or(0);
+        gens[dst] = ctx.sticky_gen.get(w).copied().unwrap_or(0);
+        dst = dst.saturating_add(1);
+    }
+    ctx.sticky_page = pages;
+    ctx.sticky_ptr = ptrs;
+    ctx.sticky_prot = prots;
+    ctx.sticky_gen = gens;
+    // sticky_rr unused with MRU; keep field for ABI stability / future policy.
+}
+
+/// Classify guest VA against filled pins (diagnostic only).
+///
+/// Slot 0 = stack; slots 1.. = process heap + VirtualAlloc data pins.
+fn classify_addr_vs_pins(ctx: &mut JitCtx, addr: u64, size: usize) {
+    let end = addr.saturating_add(u64::try_from(size).unwrap_or(0));
+    let mut in_stack = false;
+    let mut in_data = false;
+    for (i, pin) in ctx.pins.iter().enumerate() {
+        if pin.host_base == 0 {
+            continue;
+        }
+        if addr >= pin.guest_base && end <= pin.guest_end {
+            if i == 0 {
+                in_stack = true;
+            } else {
+                in_data = true;
+            }
+        }
+    }
+    if in_stack {
+        ctx.mem_path.addr_in_stack_pin = ctx.mem_path.addr_in_stack_pin.saturating_add(1);
+    } else if in_data {
+        ctx.mem_path.addr_in_heap_pin = ctx.mem_path.addr_in_heap_pin.saturating_add(1);
+    } else {
+        ctx.mem_path.addr_outside_pins = ctx.mem_path.addr_outside_pins.saturating_add(1);
+    }
+}
+
+/// Why multi sticky would miss (first failing predicate; exclusive buckets).
+fn classify_sticky_miss(ctx: &mut JitCtx, page_key: u64, write: bool) {
+    let cur_gen = ctx.mem_gen;
+    let mut saw_key = false;
+    let mut saw_gen = false;
+    for w in 0..STICKY_WAYS {
+        if ctx.sticky_page.get(w).copied() != Some(page_key) {
+            continue;
+        }
+        saw_key = true;
+        let host = ctx.sticky_ptr.get(w).copied().unwrap_or(std::ptr::null_mut());
+        if host.is_null() {
+            continue;
+        }
+        if ctx.sticky_gen.get(w).copied() != Some(cur_gen) {
+            saw_gen = true;
+            continue;
+        }
+        let prot = u8::try_from(ctx.sticky_prot.get(w).copied().unwrap_or(0)).unwrap_or(0);
+        if !tlb_prot_allows(prot, write) {
+            ctx.mem_path.sticky_miss_prot = ctx.mem_path.sticky_miss_prot.saturating_add(1);
+            return;
+        }
+        // Would have hit — should not reach classify after a real sticky miss.
+        return;
+    }
+    if saw_gen {
+        ctx.mem_path.sticky_miss_gen = ctx.mem_path.sticky_miss_gen.saturating_add(1);
+    } else {
+        // No matching way (or null host) → key thrash / cold.
+        let _ = saw_key;
+        ctx.mem_path.sticky_miss_key = ctx.mem_path.sticky_miss_key.saturating_add(1);
+    }
 }
 
 #[inline]
@@ -608,23 +795,45 @@ fn lane_eq_bit(v: std::arch::aarch64::uint64x2_t, lane: usize) -> u32 {
 /// Enforces software R/W bits and memory generation on every hit. Misses that
 /// lack the required permission return `None` so the slow path can set a fault
 /// via [`GuestMemory::read`] / [`GuestMemory::write`] (SPC oracle).
+///
+/// Updates [`JitCtx::mem_path`] counters: sticky IR already missed (caller is
+/// the host helper), so each call is one helper invocation to classify.
 unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) -> Option<*mut u8> {
+    classify_addr_vs_pins(ctx, addr, size);
     let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
     let page_cap = usize::try_from(PAGE_SIZE).unwrap_or(0x1000);
     if page_off.saturating_add(size) > page_cap {
+        ctx.mem_path.cross_page = ctx.mem_path.cross_page.saturating_add(1);
         return None; // cross-page → slow path
     }
     let page_key = addr >> 12; // PAGE_SIZE = 0x1000
     let cur_gen = ctx.mem_gen;
-    // Sticky hit first (matches inline IR fast path).
-    if ctx.tlb_hot_page == page_key
-        && !ctx.tlb_hot_ptr.is_null()
-        && ctx.tlb_hot_gen == cur_gen
-        && tlb_prot_allows(u8::try_from(ctx.tlb_hot_prot).unwrap_or(0), write)
-    {
-        // SAFETY: hot ptr is a mapped page base; access stays in-page; SPC bits match.
-        return Some(unsafe { ctx.tlb_hot_ptr.add(page_off) });
+    // Multi sticky hit first (matches inline IR fast path).
+    for w in 0..STICKY_WAYS {
+        if ctx.sticky_page.get(w).copied() != Some(page_key) {
+            continue;
+        }
+        let host = ctx.sticky_ptr.get(w).copied().unwrap_or(std::ptr::null_mut());
+        if host.is_null() {
+            continue;
+        }
+        if ctx.sticky_gen.get(w).copied() != Some(cur_gen) {
+            continue;
+        }
+        let prot = u8::try_from(ctx.sticky_prot.get(w).copied().unwrap_or(0)).unwrap_or(0);
+        if !tlb_prot_allows(prot, write) {
+            continue;
+        }
+        ctx.mem_path.sticky_hit = ctx.mem_path.sticky_hit.saturating_add(1);
+        // Keep last-hit mirror coherent with the way that hit.
+        ctx.tlb_hot_page = page_key;
+        ctx.tlb_hot_ptr = host;
+        ctx.tlb_hot_prot = u64::from(prot);
+        ctx.tlb_hot_gen = cur_gen;
+        // SAFETY: sticky ptr is a mapped page base; access stays in-page; SPC bits match.
+        return Some(unsafe { host.add(page_off) });
     }
+    classify_sticky_miss(ctx, page_key, write);
     let set = tlb_set_index(page_key);
     let hit = ctx
         .tlb_sets
@@ -632,28 +841,36 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) ->
         .zip(ctx.tlb_aux.get(set))
         .and_then(|(bucket, aux)| tlb_bucket_lookup(bucket, aux, page_key, write, cur_gen));
     if let Some((page_base, prot)) = hit {
+        ctx.mem_path.multi_hit = ctx.mem_path.multi_hit.saturating_add(1);
         tlb_set_hot(ctx, page_key, page_base, prot, cur_gen);
         // SAFETY: page mapped; access stays within the page.
         return Some(unsafe { page_base.add(page_off) });
     }
     // Region-direct pin (stack/heap arenas) before radix/page walk.
     if let Some(p) = pin_resolve(ctx, addr, size, write) {
+        ctx.mem_path.pin_hit = ctx.mem_path.pin_hit.saturating_add(1);
         return Some(p);
     }
     // Miss: resolve via GuestMemory (committed + protect meta + host ptr).
     // SAFETY: `mem` set by `run_compiled` to the live guest map.
     let mem = unsafe { &mut *ctx.mem };
-    let entry = mem
+    let Some(entry) = mem
         .page_tlb_entry_walk(page_key)
-        .or_else(|| mem.page_tlb_entry(page_key))?;
+        .or_else(|| mem.page_tlb_entry(page_key))
+    else {
+        ctx.mem_path.slow = ctx.mem_path.slow.saturating_add(1);
+        return None;
+    };
     // Install even if this access is denied so a later opposite access can hit;
     // but only return a pointer when the *current* access is allowed.
     let prot = pack_tlb_prot(entry.allow_r, entry.allow_w);
     tlb_install(ctx, page_key, entry.host, prot, entry.generation);
     tlb_set_hot(ctx, page_key, entry.host, prot, entry.generation);
     if !tlb_prot_allows(prot, write) {
+        ctx.mem_path.slow = ctx.mem_path.slow.saturating_add(1);
         return None;
     }
+    ctx.mem_path.walk_hit = ctx.mem_path.walk_hit.saturating_add(1);
     // SAFETY: page mapped; access stays within the page; permission checked.
     Some(unsafe { entry.host.add(page_off) })
 }
@@ -1101,16 +1318,27 @@ pub(super) fn compile_block(
         let pass_flags = needs_flags || self_loop;
 
         // Hoist pin descriptors on the **entry** block (once per run_compiled).
-        let (stack_pin, heap_pin) = if super::jit_mem_inline_enabled() {
+        // Slot 0 = stack. Slots 1.. = size-ranked data (heap + VirtualAlloc).
+        // Data-pin IR is opt-in via `WIE_JIT_MEM=pin` (see hoist below). Default
+        // sticky keeps stack + sticky only; helpers still `pin_resolve` all 8
+        // slots (VA/heaps) so walks collapse without IR cascade tax on 7za.
+        // Set `WIE_JIT_MEM=pin` to also probe top-2 data pins after sticky.
+        let (stack_pin, data_pins) = if super::jit_mem_inline_enabled() {
             let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
-            let heap = if super::jit_mem_pin_enabled() {
-                Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 1))
-            } else {
-                None
-            };
-            (stack, heap)
+            // Default sticky: no data-pin IR (helpers cover VA via pin_resolve).
+            // `WIE_JIT_MEM=pin`: top-2 size-ranked data pins after sticky.
+            let mut data = Vec::new();
+            if super::jit_mem_pin_enabled() {
+                const IR_DATA_PIN_SLOTS: usize = 2;
+                let end = 1_usize.saturating_add(IR_DATA_PIN_SLOTS).min(PIN_SLOTS);
+                data.reserve(IR_DATA_PIN_SLOTS);
+                for slot in 1..end {
+                    data.push(hoist_pin_slot(&mut bcx, ctx_ptr, flags, slot));
+                }
+            }
+            (stack, data)
         } else {
-            (None, None)
+            (None, Vec::new())
         };
 
         // Pre-compile scan: displacement range for block-wide stack pin guard.
@@ -1232,7 +1460,11 @@ pub(super) fn compile_block(
                     ucrt_refs,
                     // Super path: no per-access probes. Normal: hoisted pins.
                     stack_pin: if is_super { None } else { Some(spin) },
-                    heap_pin: if is_super { None } else { heap_pin },
+                    data_pins: if is_super {
+                        Vec::new()
+                    } else {
+                        data_pins.clone()
+                    },
                     super_stack: if is_super {
                         Some(SuperStack { bias })
                     } else {
@@ -1347,7 +1579,7 @@ pub(super) fn compile_block(
                 exit,
                 ucrt_refs,
                 stack_pin,
-                heap_pin,
+                data_pins,
                 super_stack: None,
             };
 
@@ -1943,8 +2175,8 @@ struct MemEnv {
     ucrt_refs: [Option<FuncRef>; 7],
     /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
     stack_pin: Option<HoistedPin>,
-    /// Primary heap pin (slot 1), only when `WIE_JIT_MEM=pin`.
-    heap_pin: Option<HoistedPin>,
+    /// Data pins (slots 1..): process heap + VirtualAlloc spans, after sticky.
+    data_pins: Vec<HoistedPin>,
     /// When set, load/store use `bias + addr` with **no** per-access bounds checks.
     super_stack: Option<SuperStack>,
 }
@@ -2565,6 +2797,14 @@ fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) -> bool {
                 | Mnemonic::Sar
                 | Mnemonic::Rol
                 | Mnemonic::Ror
+                | Mnemonic::Bt
+                | Mnemonic::Bts
+                | Mnemonic::Btr
+                | Mnemonic::Btc
+                | Mnemonic::Cld
+                | Mnemonic::Std
+                | Mnemonic::Pushfq
+                | Mnemonic::Popfq
                 | Mnemonic::Cmove
                 | Mnemonic::Cmovne
                 | Mnemonic::Cmova
@@ -2606,7 +2846,13 @@ fn block_has_mem(insns: &[DecodedInsn]) -> bool {
         let m = d.instr.mnemonic();
         if matches!(
             m,
-            Mnemonic::Push | Mnemonic::Pop | Mnemonic::Call | Mnemonic::Ret
+            Mnemonic::Push
+                | Mnemonic::Pop
+                | Mnemonic::Pushfq
+                | Mnemonic::Popfq
+                | Mnemonic::Leave
+                | Mnemonic::Call
+                | Mnemonic::Ret
         ) {
             return true;
         }
@@ -2661,9 +2907,30 @@ fn mark_insn_gprs(instr: &Instruction, live: &mut [bool; 16]) {
     // RSP always live for stack ops / call / ret.
     if matches!(
         instr.mnemonic(),
-        Mnemonic::Push | Mnemonic::Pop | Mnemonic::Call | Mnemonic::Ret
+        Mnemonic::Push
+            | Mnemonic::Pop
+            | Mnemonic::Pushfq
+            | Mnemonic::Popfq
+            | Mnemonic::Leave
+            | Mnemonic::Call
+            | Mnemonic::Ret
     ) {
         live[4] = true; // RSP
+    }
+    // Leave: RSP←RBP then pop RBP.
+    if matches!(instr.mnemonic(), Mnemonic::Leave) {
+        live[5] = true; // RBP
+    }
+    // Cbw/Cwd/Cwde/Cdqe: implicit accumulator (and DX for Cwd).
+    match instr.mnemonic() {
+        Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe => {
+            live[0] = true; // RAX
+        }
+        Mnemonic::Cwd => {
+            live[0] = true; // RAX (AX)
+            live[2] = true; // RDX (DX)
+        }
+        _ => {}
     }
     // String ops touch RAX/RCX/RSI/RDI implicitly (not always in operands).
     if is_string_op(instr) {
@@ -2929,15 +3196,41 @@ fn lower_insn(
         Mnemonic::Movsx | Mnemonic::Movsxd => {
             lower_movx(bcx, instr, gpr, dirty, *rflags, mem, true)
         }
-        // Cwde: sign-extend AX(16)→EAX(32), Cdqe: sign-extend EAX(32)→RAX(64).
+        // Sign-extend helpers on the accumulator family.
         Mnemonic::Cwde | Mnemonic::Cdqe => lower_cwde_cdqe(bcx, instr, gpr, dirty),
+        Mnemonic::Cbw => lower_cbw(bcx, gpr, dirty),
+        Mnemonic::Cwd => lower_cwd(bcx, gpr, dirty),
         Mnemonic::Lea => lower_lea(bcx, instr, gpr, dirty),
         Mnemonic::Push => lower_push(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Pop => lower_pop(bcx, instr, gpr, dirty, *rflags, mem),
+        // PUSHFQ/POPFQ/LEAVE: need live flags (push) or overwrite them (pop).
+        Mnemonic::Pushfq => {
+            flush_pending(bcx, rflags, pending);
+            lower_pushfq(bcx, gpr, dirty, *rflags, mem, instr.ip())
+        }
+        Mnemonic::Popfq => {
+            // Overwrites full RFLAGS — drop pending without materializing.
+            *pending = PendingFlags::None;
+            lower_popfq(bcx, gpr, dirty, rflags, mem, instr.ip())
+        }
+        Mnemonic::Leave => lower_leave(bcx, gpr, dirty, *rflags, mem, instr.ip()),
+        Mnemonic::Cld => {
+            // DF only; pending ALU flags stay deferred.
+            *rflags = clear_flags(bcx, *rflags, rflags::DF);
+            Ok(())
+        }
+        Mnemonic::Std => {
+            // Set DF; preserve all other flags (including deferred pending).
+            let bit = iconst_u64(bcx, rflags::DF);
+            let cleared = clear_flags(bcx, *rflags, rflags::DF);
+            *rflags = bcx.ins().bor(cleared, bit);
+            Ok(())
+        }
+        Mnemonic::Bswap => lower_bswap(bcx, instr, gpr, dirty),
         Mnemonic::Xchg => lower_xchg(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Not => lower_not(bcx, instr, gpr, dirty, *rflags, mem),
         // Bit test ops: flush pending flags, set CF directly.
-        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr => {
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
             flush_pending(bcx, rflags, pending);
             lower_bit_test_op(bcx, instr, gpr, dirty, rflags, mem)
         }
@@ -3909,9 +4202,10 @@ fn read_op_mem(
     }
 }
 
-/// Probe sticky hot TLB: same page_key, in-page, matching gen, and R or W bit.
+/// Probe multi sticky TLB (last [`STICKY_WAYS`] pages): key, in-page, gen, R|W.
 ///
 /// Returns `(ok_i1, host_ptr)` where `host_ptr` is only valid when `ok` is true.
+/// Cascades ways with CFG (first hit wins) so a 2–4 page working set stays in IR.
 fn sticky_tlb_probe(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
@@ -3929,29 +4223,72 @@ fn sticky_tlb_probe(
     let page_sz = iconst_u64(bcx, PAGE_SIZE);
     let in_page = bcx.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, page_sz);
 
-    let hot_key_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PAGE));
-    let hot_ptr_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PTR));
-    let hot_prot_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_PROT));
-    let hot_gen_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_TLB_HOT_GEN));
     let mem_gen_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_MEM_GEN));
-    let hot_key = bcx.ins().load(types::I64, mem.flags, hot_key_p, 0);
-    let hot_base = bcx.ins().load(types::I64, mem.flags, hot_ptr_p, 0);
-    let hot_prot = bcx.ins().load(types::I64, mem.flags, hot_prot_p, 0);
-    let hot_gen = bcx.ins().load(types::I64, mem.flags, hot_gen_p, 0);
     let mem_gen = bcx.ins().load(types::I64, mem.flags, mem_gen_p, 0);
-    let key_ok = bcx.ins().icmp(IntCC::Equal, hot_key, page_key);
-    let base_nz = bcx.ins().icmp_imm(IntCC::NotEqual, hot_base, 0);
-    let gen_ok = bcx.ins().icmp(IntCC::Equal, hot_gen, mem_gen);
     let need = if write { TLB_PROT_W } else { TLB_PROT_R };
     let need_v = iconst_u64(bcx, need);
-    let prot_bits = bcx.ins().band(hot_prot, need_v);
-    let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, prot_bits, 0);
-    let ok1 = bcx.ins().band(key_ok, base_nz);
-    let ok2 = bcx.ins().band(ok1, gen_ok);
-    let ok3 = bcx.ins().band(ok2, prot_ok);
-    let ok = bcx.ins().band(ok3, in_page);
-    let host = bcx.ins().iadd(hot_base, page_off);
-    (ok, host)
+
+    // Merge block: (ok_i8_as_i64? use i1 as i64 via select — Cranelift brif uses i8/i1)
+    let merge = bcx.create_block();
+    bcx.append_block_param(merge, types::I8); // ok
+    bcx.append_block_param(merge, types::I64); // host
+
+    let zero = iconst_u64(bcx, 0);
+    let zero_i8 = bcx.ins().iconst(types::I8, 0);
+
+    // Probe way 0..N-1; on miss fall through to next / final miss.
+    for way in 0..STICKY_WAYS {
+        let off = i64::try_from(way.saturating_mul(8)).unwrap_or(0);
+        let key_p = bcx
+            .ins()
+            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_PAGE) + off);
+        let ptr_p = bcx
+            .ins()
+            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_PTR) + off);
+        let prot_p = bcx
+            .ins()
+            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_PROT) + off);
+        let gen_p = bcx
+            .ins()
+            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_GEN) + off);
+        let hot_key = bcx.ins().load(types::I64, mem.flags, key_p, 0);
+        let hot_base = bcx.ins().load(types::I64, mem.flags, ptr_p, 0);
+        let hot_prot = bcx.ins().load(types::I64, mem.flags, prot_p, 0);
+        let hot_gen = bcx.ins().load(types::I64, mem.flags, gen_p, 0);
+        let key_ok = bcx.ins().icmp(IntCC::Equal, hot_key, page_key);
+        let base_nz = bcx.ins().icmp_imm(IntCC::NotEqual, hot_base, 0);
+        let gen_ok = bcx.ins().icmp(IntCC::Equal, hot_gen, mem_gen);
+        let prot_bits = bcx.ins().band(hot_prot, need_v);
+        let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, prot_bits, 0);
+        let ok1 = bcx.ins().band(key_ok, base_nz);
+        let ok2 = bcx.ins().band(ok1, gen_ok);
+        let ok3 = bcx.ins().band(ok2, prot_ok);
+        let ok = bcx.ins().band(ok3, in_page);
+        let host = bcx.ins().iadd(hot_base, page_off);
+
+        let hit = bcx.create_block();
+        let miss = bcx.create_block();
+        bcx.ins().brif(ok, hit, &[], miss, &[]);
+        bcx.switch_to_block(hit);
+        bcx.seal_block(hit);
+        let one_i8 = bcx.ins().iconst(types::I8, 1);
+        bcx.ins().jump(
+            merge,
+            &[BlockArg::Value(one_i8), BlockArg::Value(host)],
+        );
+        bcx.switch_to_block(miss);
+        bcx.seal_block(miss);
+    }
+
+    // All ways missed.
+    bcx.ins().jump(
+        merge,
+        &[BlockArg::Value(zero_i8), BlockArg::Value(zero)],
+    );
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
+    let params = bcx.block_params(merge);
+    (params[0], params[1])
 }
 
 /// Body + terminator for one compiled path (super-fast or normal probes).
@@ -4376,8 +4713,10 @@ fn call_load(
         return Ok(load_guest_bytes(bcx, host, size));
     }
 
-    // CFG-ordered probes (not `select`): pin hit skips sticky IR entirely.
-    // Order: stack pin → sticky → heap pin (`pin` mode) → helper.
+    // CFG-ordered probes (not `select`).
+    // Order: stack → sticky → largest data pin → helper.
+    // Sticky first keeps single-page streams free of pin-bounds IR; the data
+    // pin catches multi-page thrash inside VirtualAlloc / heap after sticky miss.
     let merge = bcx.create_block();
     bcx.append_block_param(merge, types::I64);
 
@@ -4394,7 +4733,6 @@ fn call_load(
         bcx.seal_block(miss);
     }
 
-    // Sticky (page-precise after TLB warm; only reached on stack-pin miss).
     {
         let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, false);
         let hit = bcx.create_block();
@@ -4408,7 +4746,7 @@ fn call_load(
         bcx.seal_block(miss);
     }
 
-    if let Some(ref pin) = mem.heap_pin {
+    for pin in &mem.data_pins {
         let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, false);
         let hit = bcx.create_block();
         let miss = bcx.create_block();
@@ -4477,7 +4815,7 @@ fn call_store(
         return Ok(());
     }
 
-    // Same CFG order as `call_load`: stack pin → sticky → heap pin → helper.
+    // Same CFG order as `call_load`: stack → sticky → data pin → helper.
     let merge = bcx.create_block();
 
     if let Some(ref pin) = mem.stack_pin {
@@ -4506,7 +4844,7 @@ fn call_store(
         bcx.seal_block(miss);
     }
 
-    if let Some(ref pin) = mem.heap_pin {
+    for pin in &mem.data_pins {
         let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, true);
         let hit = bcx.create_block();
         let miss = bcx.create_block();
@@ -4680,6 +5018,119 @@ fn lower_cwde_cdqe(
         bcx.ins().sextend(types::I64, low32)
     };
     write_gpr(bcx, gpr, dirty, Register::RAX, val)
+}
+
+/// Cbw: sign-extend AL → AX (upper bytes of RAX unchanged above AX).
+fn lower_cbw(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+) -> Result<(), String> {
+    let rax = gpr[0];
+    let al = bcx.ins().ireduce(types::I8, rax);
+    let ax = bcx.ins().sextend(types::I16, al);
+    let ax64 = bcx.ins().uextend(types::I64, ax);
+    write_gpr(bcx, gpr, dirty, Register::AX, ax64)
+}
+
+/// Cwd: sign-extend AX → DX:AX (write DX only; AX unchanged).
+fn lower_cwd(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+) -> Result<(), String> {
+    let rax = gpr[0];
+    let ax = bcx.ins().ireduce(types::I16, rax);
+    // DX = 0xFFFF if AX < 0, else 0.
+    let ax_s = bcx.ins().sextend(types::I32, ax);
+    let is_neg = bcx.ins().icmp_imm(IntCC::SignedLessThan, ax_s, 0);
+    let ffff = iconst_u64(bcx, 0xffff);
+    let zero = iconst_u64(bcx, 0);
+    let dx = bcx.ins().select(is_neg, ffff, zero);
+    write_gpr(bcx, gpr, dirty, Register::DX, dx)
+}
+
+/// Bswap r32/r64: reverse bytes. r32 write zero-extends into the full GPR.
+fn lower_bswap(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+) -> Result<(), String> {
+    let reg = instr.op_register(0);
+    let bits = reg_size_bits(reg);
+    let val = read_gpr(gpr, reg)?;
+    let swapped = match bits {
+        32 => {
+            let lo = bcx.ins().ireduce(types::I32, val);
+            let s = bcx.ins().bswap(lo);
+            bcx.ins().uextend(types::I64, s)
+        }
+        64 => bcx.ins().bswap(val),
+        _ => return Err(format!("bswap size {bits}")),
+    };
+    write_gpr(bcx, gpr, dirty, reg, swapped)
+}
+
+/// Leave: RSP ← RBP; RBP ← [RSP]; RSP += 8 (pop frame).
+fn lower_leave(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    ip: u64,
+) -> Result<(), String> {
+    // MOV RSP, RBP
+    gpr[4] = gpr[5];
+    mark_dirty(dirty, 4);
+    // POP RBP
+    let rsp = gpr[4];
+    let val = call_load(bcx, mem, gpr, rflags, rsp, 8, ip)?;
+    let new_rsp = bcx.ins().iadd_imm(rsp, 8);
+    gpr[4] = new_rsp;
+    mark_dirty(dirty, 4);
+    gpr[5] = val;
+    mark_dirty(dirty, 5);
+    Ok(())
+}
+
+/// Pushfq: push full RFLAGS (64-bit) onto the stack.
+fn lower_pushfq(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    ip: u64,
+) -> Result<(), String> {
+    let rsp = gpr[4];
+    let new_rsp = bcx.ins().iadd_imm(rsp, -8);
+    call_store(bcx, mem, gpr, rflags, new_rsp, 8, rflags, ip)?;
+    gpr[4] = new_rsp;
+    mark_dirty(dirty, 4);
+    Ok(())
+}
+
+/// Popfq: pop into RFLAGS; force reserved bit 1 (ALWAYS1).
+fn lower_popfq(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+    ip: u64,
+) -> Result<(), String> {
+    let rsp = gpr[4];
+    let val = call_load(bcx, mem, gpr, *rflags, rsp, 8, ip)?;
+    let new_rsp = bcx.ins().iadd_imm(rsp, 8);
+    gpr[4] = new_rsp;
+    mark_dirty(dirty, 4);
+    // Keep ALWAYS1 set; clear it first then OR so the bit is definite.
+    let cleared = clear_flags(bcx, val, rflags::ALWAYS1);
+    let always1 = iconst_u64(bcx, rflags::ALWAYS1);
+    *rflags = bcx.ins().bor(cleared, always1);
+    Ok(())
 }
 
 fn lower_lea(
@@ -4980,9 +5431,13 @@ fn lower_imul(
     Ok(())
 }
 
-/// Lower Bt/Bts/Btr (bit test/set/reset) with direct flag write.
+/// Lower Bt/Bts/Btr/Btc (bit test / set / reset / complement) with direct flag write.
 /// Flushes pending flags first, then reads the dest, computes the bit,
-/// sets CF in rflags, and for Bts/Btr writes the modified value back.
+/// sets CF in rflags, and for Bts/Btr/Btc writes the modified value back.
+///
+/// Note: register forms mask the bit index by operand width. Memory forms use the
+/// same simple EA+width path as the rest of the ALU JIT (full bit-string address
+/// with large signed offsets remains on the iced path when not lowerable).
 fn lower_bit_test_op(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -5020,20 +5475,26 @@ fn lower_bit_test_op(
     let cf_on = select_flag(bcx, is_set, rflags::CF);
     *rflags = replace_flag(bcx, *rflags, rflags::CF, cf_on);
 
-    // For Bts/Btr, write back the modified value.
+    // For Bts/Btr/Btc, write back the modified value.
     let mnemonic = instr.mnemonic();
-    if mnemonic == Mnemonic::Bts || mnemonic == Mnemonic::Btr {
+    if matches!(
+        mnemonic,
+        Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc
+    ) {
         let bit_mask = bcx.ins().ishl(one, idx_masked);
         let new_val = if mnemonic == Mnemonic::Bts {
             // Set the bit: val | (1 << idx)
             bcx.ins().bor(val, bit_mask)
-        } else {
+        } else if mnemonic == Mnemonic::Btr {
             // Clear the bit: val & !(1 << idx)
             let not_mask = bcx.ins().bnot(bit_mask);
             bcx.ins().band(val, not_mask)
+        } else {
+            // Complement the bit: val ^ (1 << idx)
+            bcx.ins().bxor(val, bit_mask)
         };
         let new_val_full = if bits < 64 {
-            // Preserve upper bits
+            // Preserve upper bits of the full register/mem cell when partial.
             let full_mask = iconst_u64(bcx, (1_u64 << bits) - 1);
             let not_full = bcx.ins().bnot(full_mask);
             let cleared = bcx.ins().band(val_raw, not_full);

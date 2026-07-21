@@ -17,9 +17,7 @@ use crate::CpuError;
 use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
-#[cfg(debug_assertions)]
 use std::sync::LazyLock;
-#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Access type codes matching Unicorn-ish invalid-memory reporting (0=read,1=write,2=fetch).
@@ -45,14 +43,13 @@ pub(crate) enum StepResult {
     InvalidMemory(InvalidMem),
 }
 
-/// Iced-interpreter mnemonic counters (activated by WIE_EXEC_TRACE=1).
-#[cfg(debug_assertions)]
+/// Iced-interpreter mnemonic counters (activated by `WIE_EXEC_TRACE=1`).
+/// Works in release too — 7za residual discovery should not require a debug build.
 static ICED_COUNTERS: LazyLock<Box<[AtomicU64]>> = LazyLock::new(|| {
     std::iter::repeat_with(|| AtomicU64::new(0))
         .take(2048)
         .collect()
 });
-#[cfg(debug_assertions)]
 static ICED_TRACE_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var("WIE_EXEC_TRACE").is_ok_and(|v| v == "1"));
 
@@ -97,8 +94,7 @@ pub(crate) fn step(
     }
 
     // Tracer: count how many times each mnemonic hits the interpreter.
-    // Activated by WIE_EXEC_TRACE=1 in debug builds only.
-    #[cfg(debug_assertions)]
+    // Activated by WIE_EXEC_TRACE=1 (release + debug).
     if *ICED_TRACE_ENABLED {
         let m = instr.mnemonic() as usize;
         if m < ICED_COUNTERS.len() {
@@ -2165,31 +2161,47 @@ fn write_accumulator(regs: &mut RegFile, size: usize, value: u64) -> Result<(), 
     }
 }
 
-/// Dump iced-interpreter mnemonic counters to stderr (top N by count).
-/// Activated by the `WIE_EXEC_TRACE` env var. Call after a guest session ends
-/// to see which x86-64 instructions keep code in the interpreter.
-/// Dump iced-interpreter mnemonic counters to stderr.
-/// Only available in debug builds; activated by `WIE_EXEC_TRACE=1`.
-#[cfg(debug_assertions)]
-#[allow(dead_code)]
-pub(crate) fn dump_iced_counters() {
-    use std::sync::atomic::Ordering;
-
-    let mut pairs: Vec<(u64, u16)> = Vec::new();
+/// Dump iced-interpreter mnemonic counters to stderr (sorted by count).
+/// Activated by `WIE_EXEC_TRACE=1`. Call after a guest session ends.
+pub fn dump_iced_counters() {
+    if !*ICED_TRACE_ENABLED {
+        return;
+    }
+    let mut pairs: Vec<(u64, usize)> = Vec::new();
     for (i, c) in ICED_COUNTERS.iter().enumerate() {
         let count = c.load(Ordering::Relaxed);
         if count == 0 {
             continue;
         }
-        pairs.push((count, i as u16));
+        pairs.push((count, i));
     }
     pairs.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let total: u64 = pairs.iter().map(|(c, _)| c).sum();
+    let total: u64 = pairs.iter().map(|(c, _)| *c).sum();
     eprintln!("--- iced-interp mnemonic counts (total={total}) ---");
-    for (count, idx) in &pairs {
-        eprintln!("{count:>8} Mnemonic({idx})");
+    let show = pairs.len().min(60);
+    for (count, idx) in pairs.iter().take(show) {
+        let name = Mnemonic::try_from(*idx)
+            .map_or_else(|_| format!("Mnemonic({idx})"), |m| format!("{m:?}"));
+        // Integer tenths of a percent (avoid f64 cast_precision_loss).
+        let pct = count.saturating_mul(1000).checked_div(total).unwrap_or(0);
+        let pct_whole = pct / 10;
+        let pct_frac = pct % 10;
+        eprintln!("{count:>10}  {pct_whole:3}.{pct_frac}%  {name}");
+    }
+    if pairs.len() > show {
+        eprintln!("  … {} more mnemonics", pairs.len() - show);
     }
     eprintln!("--- end ---");
+}
+
+/// Zero counters (for multi-run tooling). No-op when trace is disabled.
+pub fn reset_iced_counters() {
+    if !*ICED_TRACE_ENABLED {
+        return;
+    }
+    for c in ICED_COUNTERS.iter() {
+        c.store(0, Ordering::Relaxed);
+    }
 }
 
 fn branch_target(

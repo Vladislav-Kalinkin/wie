@@ -17,7 +17,7 @@
 
 The WinAPI surface is intentionally incomplete: many handlers are stubs sufficient for the micro-suite and engine bring-up, not a final product surface.
 
-**Status (post great cleanup):** Soft-translate guest memory is **mmap-only** (no hash/hybrid fallback). Software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / sticky + set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`. CLI compressed to `inspect` / `run` / `trace`. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
+**Status (post great cleanup):** Soft-translate guest memory is **mmap-only** (no hash/hybrid fallback). Software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / **2-way multi sticky** + 8-slot region pins (helper always; data pin IR opt-in) / set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`. CLI compressed to `inspect` / `run` / `trace`. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
 **Real console 7-Zip (`7za`):** WIE runs the **Windows PE64** standalone console from 7-Zip Extra (not macOS `7za`, not GUI). The PE is **not** committed (`/real_exes` is gitignored) — download once, then create/list/extract `.7z` under JIT or iced. See [7-Zip console status](#7-zip-console-status-7za).
 
@@ -70,7 +70,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 # JIT / CPU A/B
 WIE_CPU=iced  ./scripts/run-micro-suite.sh          # interpreter only (long_loop may hit slice limit)
 WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh       # helper-only loads/stores
-WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh       # sticky + heap pin IR
+WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh       # sticky + top-2 data pin IR
 WIE_JIT_CHAIN=0  ./scripts/run-micro-suite.sh
 WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 ```
@@ -283,11 +283,11 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 - **Hotness**: compile after **100** visits (tests: 0; pure self-loops: **16**; UCRT call sites: 2).
 - **Chaining**: self-loops become IR back-edges; open-addressing chain table + monomorphic **edge IC** + shadow stack for call/ret. Kill-switch: `WIE_JIT_CHAIN=0`.
 - **Memory lower** (`WIE_JIT_MEM`):
-  - **`sticky` (default)** — sticky multi-way TLB with SPC R/W bits + `mem_gen`; **stack `MemPin`**; block-wide super path on **self-loops** by default (`WIE_JIT_SUPER=all` opts into non-loop super).
-  - **`pin`** — sticky + stack pin + **heap** region pin IR.
+  - **`sticky` (default)** — **2-way multi sticky** (last-2 MRU pages, SPC R/W + `mem_gen`); **stack `MemPin`**; block-wide super path on **self-loops** by default (`WIE_JIT_SUPER=all` opts into non-loop super). Helpers always try **all 8 region pins** (stack + size-ranked heaps/VirtualAlloc) before a page walk.
+  - **`pin`** — same as sticky + **top-2 data pin IR** after multi sticky (opt-in; full pin cascade taxes thrashy paths).
   - **`slow`** — helper-only `wie_jit_load` / `wie_jit_store` (oracle / bisect).
 - **SSE2**: common XMM moves / bitwise / scalar+packed FP lowered with Cranelift SIMD (`I8X16`/`F32X4`/…) → host Neon when `WIE_JIT_SIMD≠0`; pure GPR blocks **skip XMM bank**; live/dirty masks selective sync.
-- **TLB**: sticky page + **16×4 set-associative** multi-way (Neon tag compare on aarch64; `WIE_TLB_NEON=0` scalar).
+- **TLB**: multi sticky (IR) + **16×4 set-associative** multi-way helper TLB (Neon tag compare on aarch64; `WIE_TLB_NEON=0` scalar) + region pins.
 - **Strings**: REP MOVS/STOS (DF=0) — inline unrolled `I8X16` for 16–64 B (`WIE_STRING_INLINE`), else soft-translated host spans (`WIE_STRING_BULK=0` disables bulk). Overlap / DF=1 stay element-loop.
 - **Fallback**: anything not lowerable → iced `step`.
 
@@ -307,7 +307,8 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 | ----------------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `WIE_CPU=jit` \| `iced`                   | CPU backend (default **jit**)                                                                       |
 | `WIE_MPROTECT=0`                          | Disable optional host `mprotect` dual-protection on arenas (SPC remains on)                         |
-| `WIE_JIT_MEM=sticky` \| `pin` \| `slow`   | JIT mem lower mode (default **sticky** = sticky TLB + stack pin)                                    |
+| `WIE_JIT_MEM=sticky` \| `pin` \| `slow`   | JIT mem lower (default **sticky** = 2-way multi sticky + stack pin; helpers always pin-resolve)     |
+| `WIE_JIT_MEM_TRACE=1`                     | Dump helper mem-path histogram (sticky / multi / pin / walk) on finalize                            |
 | `WIE_JIT_SUPER=loop` \| `0` \| `all`      | Block-wide stack super path: default **loop** (self-loops only); `0` off; `all` experimental        |
 | `WIE_JIT_CHAIN=0`                         | Disable FuncRef chaining / chain table / edge IC                                                    |
 | `WIE_STRING_BULK=0`                       | Disable host-span bulk REP MOVS/STOS                                                                |
@@ -358,7 +359,7 @@ Phases 0–5 landed; baselines and design notes:
 | [`docs/phase2-mmap-backend.md`](docs/phase2-mmap-backend.md)           | Mmap arena storage (historical dual-backend notes) |
 | [`docs/phase3-permissions.md`](docs/phase3-permissions.md)             | SPC, PageMap/VAD, `Virtual*`                       |
 | [`docs/phase4-foundation.md`](docs/phase4-foundation.md)               | Sticky TLB + kill-switches                         |
-| [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md)             | Stack/heap pins + block-wide super path            |
+| [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md)             | Stack/heap/VA pins, multi sticky, super path       |
 | [`docs/phase4-jit-coherency.md`](docs/phase4-jit-coherency.md)         | Chaining / edge IC / I$ policy                     |
 | [`docs/phase4-string-bulk.md`](docs/phase4-string-bulk.md)             | REP MOVS/STOS host spans                           |
 | [`docs/phase4-code-invalidation.md`](docs/phase4-code-invalidation.md) | Selective JIT drop on X-loss / SMC / free          |
@@ -415,7 +416,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 
 Early work targeted an alternate way to run FuSoYa's Lunar Magic and used Unicorn Engine. After full init sequences proved feasible, Unicorn-specific paths were removed in favour of iced-x86 + Cranelift. Pre-removal Lunar-specific runs were already ~2s faster than Unicorn on the same workload.
 
-Global optimisation (2026-07): memory backends + SPC/VAD, JIT sticky/pin/super-path and bulk strings, expanded guest stubs — documented under `docs/phase*.md` and the roadmap.
+Global optimisation (2026-07): memory backends + SPC/VAD, JIT multi sticky / region pins / super-path and bulk strings, expanded guest stubs — documented under `docs/phase*.md` and the roadmap.
 
 ## AI-Usage
 

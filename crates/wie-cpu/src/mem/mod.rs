@@ -224,19 +224,39 @@ impl GuestMemory {
     /// whole pin). Slow path [`Self::read`]/[`Self::write`] remains authoritative.
     #[must_use]
     pub(crate) fn region_pin(&self, region: &GuestRegion) -> Option<RegionPinInfo> {
-        let host_u = region.host_base?;
-        if host_u == 0 {
-            return None;
-        }
-        let guest_base = region.base;
-        let guest_end = region.end();
+        self.span_pin(region.base, region.end())
+    }
+
+    /// Pin an arbitrary guest VA span that lives in one mmap arena.
+    ///
+    /// Soft-translate base is the host pointer of `guest_base` (not necessarily
+    /// the arena start), so sub-ranges of a VirtualAlloc reservation pin correctly.
+    #[must_use]
+    pub(crate) fn span_pin(&self, guest_base: u64, guest_end: u64) -> Option<RegionPinInfo> {
         if guest_end <= guest_base {
             return None;
         }
-        // SAFETY: host_base was stored from a live arena mapping; pin is
-        // non-owning and invalidated via generation / invalidate_tlb on unmap.
+        // One arena must cover first and last byte (contiguous soft translate).
+        let arena_base = self.backend.arena_guest_base_for_va(guest_base)?;
+        let arena_base_last = self
+            .backend
+            .arena_guest_base_for_va(guest_end.saturating_sub(1))?;
+        if arena_base != arena_base_last {
+            return None;
+        }
+        let host_arena_u = self.backend.arena_host_base_for_va(guest_base)?;
+        if host_arena_u == 0 {
+            return None;
+        }
+        let off = guest_base.checked_sub(arena_base)?;
+        let host_u = host_arena_u.checked_add(off)?;
+        // SAFETY: host is arena soft-translate of guest_base; pin is non-owning
+        // and invalidated via generation / invalidate_tlb on unmap.
         #[allow(clippy::as_conversions)] // u64 host address → non-owning data pointer
         let host_base = host_u as *mut u8;
+        if host_base.is_null() {
+            return None;
+        }
 
         let first_page = guest_base >> backend::PAGE_SHIFT;
         let last_page = guest_end.saturating_sub(1) >> backend::PAGE_SHIFT;
@@ -249,7 +269,7 @@ impl GuestMemory {
             if run.state != PageState::Committed {
                 return None;
             }
-            // Gap inside the region (lookup jumped past a free hole).
+            // Gap inside the span (lookup jumped past a free hole).
             if page < run.start_page || page >= run.end_page {
                 return None;
             }
@@ -277,20 +297,156 @@ impl GuestMemory {
         })
     }
 
-    /// Pin slots for JIT: stack then primary heap (registration order).
+    /// Collect maximal committed homogeneous-protect runs inside `[base, end)`.
+    fn committed_runs_in_span(&self, base: u64, end: u64) -> Vec<(u64, u64)> {
+        if end <= base {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut page = base >> backend::PAGE_SHIFT;
+        let last = end.saturating_sub(1) >> backend::PAGE_SHIFT;
+        while page <= last {
+            let Some(run) = self.pages.lookup(page) else {
+                page = page.saturating_add(1);
+                continue;
+            };
+            if run.state != PageState::Committed {
+                page = run.end_page.max(page.saturating_add(1));
+                continue;
+            }
+            // Clip run to the requested span.
+            let start_p = run.start_page.max(page).max(base >> backend::PAGE_SHIFT);
+            let end_p = run.end_page.min(last.saturating_add(1));
+            if end_p > start_p {
+                let g0 = start_p.saturating_mul(backend::PAGE_SIZE).max(base);
+                let g1 = end_p.saturating_mul(backend::PAGE_SIZE).min(end);
+                if g1 > g0 {
+                    out.push((g0, g1));
+                }
+            }
+            let next = run.end_page;
+            if next <= page {
+                page = page.saturating_add(1);
+            } else {
+                page = next;
+            }
+        }
+        // Merge adjacent (same-protect runs may already be separate PageRuns).
+        out.sort_by_key(|&(a, _)| a);
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (a, b) in out {
+            if let Some(last) = merged.last_mut()
+                && last.1 == a
+            {
+                last.1 = b;
+            } else {
+                merged.push((a, b));
+            }
+        }
+        merged
+    }
+
+    /// Whether `[lo, hi)` overlaps any already-chosen pin span.
+    fn pin_overlaps(chosen: &[(u64, u64)], lo: u64, hi: u64) -> bool {
+        chosen.iter().any(|&(a, b)| lo < b && hi > a)
+    }
+
+    /// True when a named layout region fully covers `[lo, hi)` and is **not** a
+    /// heap (bootstrap `guest_file_data` / image / TEB would otherwise win size
+    /// ranking over hot VirtualAlloc LZMA dicts).
+    fn covered_by_bootstrap_named(&self, lo: u64, hi: u64) -> bool {
+        self.regions.iter().any(|r| {
+            if matches!(r.kind, RegionKind::Heap | RegionKind::Stack) {
+                return false;
+            }
+            r.base <= lo && r.end() >= hi
+        })
+    }
+
+    /// Pin slots for JIT: stack, then hottest data spans (heaps + VirtualAlloc).
     ///
     /// Empty slots are `None`. Callers copy into `JitCtx` at `run_compiled`.
+    /// Helper `pin_resolve` always sees every filled slot. Cranelift IR probes a
+    /// capped prefix of data slots (see `IR_DATA_PIN_SLOTS` in lower.rs), so
+    /// **largest live RW heaps/VA must fill early slots**.
     #[must_use]
-    pub(crate) fn jit_region_pins(&self) -> [Option<RegionPinInfo>; 2] {
-        let stack = self
+    pub(crate) fn jit_region_pins(&self) -> [Option<RegionPinInfo>; JIT_REGION_PIN_SLOTS] {
+        let mut out = [None; JIT_REGION_PIN_SLOTS];
+        let mut chosen_spans: Vec<(u64, u64)> = Vec::new();
+
+        // Slot 0: stack (super-path + hot locals).
+        if let Some(pin) = self
             .regions
             .find_by_kind(RegionKind::Stack)
-            .and_then(|r| self.region_pin(r));
-        let heap = self
-            .regions
-            .find_by_kind(RegionKind::Heap)
-            .and_then(|r| self.region_pin(r));
-        [stack, heap]
+            .and_then(|r| self.region_pin(r))
+        {
+            chosen_spans.push((pin.guest_base, pin.guest_end));
+            out[0] = Some(pin);
+        }
+
+        // Data candidates: all named heaps + private VAD runs that are not
+        // bootstrap layout (file mirror, image, TEB, …). Size-rank RW first so
+        // IR's data pin hits LZMA VirtualAlloc rather than 64 MiB file arena.
+        let mut candidates: Vec<(u64, RegionPinInfo)> = Vec::new();
+        for r in self.regions.iter() {
+            if r.kind != RegionKind::Heap {
+                continue;
+            }
+            let Some(pin) = self.region_pin(r) else {
+                continue;
+            };
+            let size = pin.guest_end.saturating_sub(pin.guest_base);
+            // RO spans score at 1/4 (bit-shift, not div) so RW VirtualAlloc wins.
+            let score = if pin.allow_w { size } else { size >> 2 };
+            candidates.push((score, pin));
+        }
+        for node in self.vad.iter() {
+            if node.mem_type != MemType::Private {
+                continue;
+            }
+            let base = node.allocation_base;
+            let end = node.end();
+            for (g0, g1) in self.committed_runs_in_span(base, end) {
+                if Self::pin_overlaps(&chosen_spans, g0, g1) {
+                    continue;
+                }
+                if self.covered_by_bootstrap_named(g0, g1) {
+                    continue;
+                }
+                if candidates
+                    .iter()
+                    .any(|(_, p)| p.guest_base == g0 && p.guest_end == g1)
+                {
+                    continue;
+                }
+                let Some(pin) = self.span_pin(g0, g1) else {
+                    continue;
+                };
+                let size = pin.guest_end.saturating_sub(pin.guest_base);
+                if size < backend::PAGE_SIZE {
+                    continue;
+                }
+                let score = if pin.allow_w { size } else { size >> 2 };
+                candidates.push((score, pin));
+            }
+        }
+        candidates.sort_by_key(|b| std::cmp::Reverse(b.0));
+
+        let mut slot = 1_usize;
+        for (_, pin) in candidates {
+            if slot >= JIT_REGION_PIN_SLOTS {
+                break;
+            }
+            if Self::pin_overlaps(&chosen_spans, pin.guest_base, pin.guest_end) {
+                continue;
+            }
+            chosen_spans.push((pin.guest_base, pin.guest_end));
+            if let Some(slot_ref) = out.get_mut(slot) {
+                *slot_ref = Some(pin);
+            }
+            slot = slot.saturating_add(1);
+        }
+        out
     }
 
     /// Map `[address, address+size)` with Unicorn-style `perms` (r/w/x).
@@ -1264,7 +1420,13 @@ pub(crate) struct PageTlbEntry {
     pub generation: u64,
 }
 
-/// Soft-translated region pin for Phase 4.1 JIT (stack / heap arenas).
+/// Number of soft-translate pin slots filled for JIT (`JitCtx.pins`).
+///
+/// Layout: `[0]=stack`, `[1]=primary process heap`, `[2..]=largest private
+/// VirtualAlloc / committed spans` (Phase 4.1 + VA pin expansion).
+pub(crate) const JIT_REGION_PIN_SLOTS: usize = 8;
+
+/// Soft-translated region pin for Phase 4.1 JIT (stack / heap / VA arenas).
 ///
 /// `allow_*` is the **intersection** of software rights over the whole range —
 /// never more permissive than the slow path for any byte in the pin.
@@ -1333,6 +1495,73 @@ mod tests {
         mem.map(0x2000_0000, 0x1_0000, 7).expect("map stack");
         assert_eq!(mem.find_region(0x2000_0800).expect("found").name, "stack");
         assert_eq!(mem.backend_name(), "mmap");
+    }
+
+    #[test]
+    fn span_pin_and_va_slots_from_private_vad() {
+        let mut mem = GuestMemory::new();
+        // Stack + heap named regions (slots 0/1).
+        mem.map(
+            0x2000_0000,
+            0x1_0000,
+            crate::perm::READ | crate::perm::WRITE,
+        )
+        .expect("stack");
+        mem.register_region(GuestRegion::new(
+            "stack",
+            RegionKind::Stack,
+            0x2000_0000,
+            0x1_0000,
+            crate::perm::READ | crate::perm::WRITE,
+        ));
+        mem.map(
+            0x1600_0000_0000,
+            0x10_0000,
+            crate::perm::READ | crate::perm::WRITE,
+        )
+        .expect("heap");
+        mem.register_region(GuestRegion::new(
+            "process_heap",
+            RegionKind::Heap,
+            0x1600_0000_0000,
+            0x10_0000,
+            crate::perm::READ | crate::perm::WRITE,
+        ));
+        // Separate VirtualAlloc-like private span (should fill a VA pin slot).
+        let va_base = 0x0000_0001_2000_0000_u64;
+        let va_size = 0x40_0000_usize; // 4 MiB
+        mem.map(va_base, va_size, crate::perm::READ | crate::perm::WRITE)
+            .expect("va");
+
+        let pins = mem.jit_region_pins();
+        assert!(pins.first().is_some_and(Option::is_some), "stack pin");
+        // Data slots 1.. are size-ranked: 4 MiB VA should outrank 1 MiB heap.
+        let data: Vec<_> = pins.iter().skip(1).flatten().collect();
+        assert!(
+            data.iter().any(|p| p.guest_base == 0x1600_0000_0000),
+            "heap among data pins"
+        );
+        let va_size_u64 = u64::try_from(va_size).expect("va_size fits u64");
+        let va_pin = data
+            .iter()
+            .find(|p| p.guest_base == va_base)
+            .expect("VA pin among data slots");
+        assert_eq!(va_pin.guest_end, va_base.saturating_add(va_size_u64));
+        assert!(va_pin.allow_r && va_pin.allow_w);
+        assert!(!va_pin.host_base.is_null());
+        // Largest data pin should be the VA span (first data slot).
+        assert_eq!(
+            pins.get(1).and_then(|p| p.as_ref()).map(|p| p.guest_base),
+            Some(va_base)
+        );
+
+        // Soft-translate mid-span: pin covers VA and page walk succeeds.
+        let mid = va_base.saturating_add(0x1234);
+        let pin = mem
+            .span_pin(va_base, va_base.saturating_add(va_size_u64))
+            .expect("span");
+        assert!(mid >= pin.guest_base && mid < pin.guest_end);
+        assert!(mem.page_data_ptr_walk(mid >> 12).is_some());
     }
 
     #[test]

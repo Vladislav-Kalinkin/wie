@@ -134,17 +134,18 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 
 ### 4.1 Region‑Direct Load/Store Path ✅
 
-- `MemPin` slots (stack + primary heap) filled each `run_compiled` from `RegionTable.host_base` + PageMap **intersection** R/W + `mem_gen`.
-- Helper `pin_resolve` on TLB miss (always); Cranelift pin IR only under `WIE_JIT_MEM=pin` (sticky still preferred).
+- `MemPin` slots (`JIT_REGION_PIN_SLOTS = 8`): stack + size-ranked heaps / private VirtualAlloc spans (bootstrap image/file/TEB excluded from data ranking).
+- Filled when `mem_gen` changes (cached on `JitCpu`); PageMap **intersection** R/W + `mem_gen` on each pin.
+- Helper `pin_resolve` on TLB miss (always, all slots); Cranelift **data** pin IR only under `WIE_JIT_MEM=pin` (top-2; sticky still preferred default).
 - Docs: [`docs/phase4-region-pins.md`](docs/phase4-region-pins.md).
 
-**DoD:** Micro-suite green with `WIE_JIT_MEM=pin` on hybrid/mmap; RO/mixed protect cannot silent-write via pin; hash backend degrades to empty pins. ✅
+**DoD:** Micro-suite green with `WIE_JIT_MEM=pin`; RO/mixed protect cannot silent-write via pin. ✅
 
-**Status (2026-07-18):** Done (PR1). Default remains sticky; full heap pin IR opt-in.
+**Status (2026-07-18 / 2026-07-21):** Done. Default remains sticky; full data pin IR opt-in. VA pins collapse helper walk% on 7za LZMA.
 
 ### 4.1b Stack pin + block-wide super-fast path ✅
 
-- Stack `MemPin` hoisted once on block entry; normal path: CFG pin → sticky → helper.
+- Stack `MemPin` hoisted once on block entry; normal path: CFG pin → multi sticky → helper.
 - **Block-wide guard:** pre-compile scan of all load/store displacements; one prologue check that `[base+min_disp, base+max_end)` ⊆ pin; then dual path:
   - **Super:** `host = bias + guest_va` — bare host load/store, **no** per-access bounds IR
   - **Normal:** hoisted pin / sticky probes (guard miss / mixed protect)
@@ -152,6 +153,14 @@ Headline: `long_loop` is **~100% track (A)** under JIT (~1.4s wall); iced cannot
 - **Perf (`long_loop` 100M volatile stack ops, release):** ~1.4s sticky-only → ~0.54s hoist → **~0.28–0.32s** block-wide super.
 
 **DoD:** Micro-suite green; pure stack loops use super path; guard fail stays correct. ✅
+
+### 4.1c Multi sticky IR ✅
+
+- `STICKY_WAYS = 2` last-MRU pages inlined in load/store IR (way 0 hottest).
+- Cuts A↔B page thrash helper traffic (~2× fewer helpers on 7za); wall ~parity vs single sticky (full-miss cascade tax caps ways at 2).
+- Opt-in histogram: `WIE_JIT_MEM_TRACE=1` (or `WIE_EXEC_TRACE=1`).
+
+**DoD:** Micro-suite green; sticky miss diagnostics available. ✅
 
 ### 4.2 Chaining / I-cache policy (data plane) ✅
 

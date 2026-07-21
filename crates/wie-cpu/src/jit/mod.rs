@@ -37,7 +37,8 @@ use fast_api::{
     wie_ucrt_malloc, wie_ucrt_memcpy, wie_ucrt_strlen,
 };
 use lower::{
-    CHAIN_SLOTS, CompiledBlock, JitCtx, MemPin, PIN_SLOTS, TLB_EMPTY, TLB_SETS, TlbBucket,
+    CHAIN_SLOTS, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY,
+    TLB_SETS, TlbBucket,
     TlbBucketAux, XmmSlot, chain_table_clear, chain_table_insert, compile_block, empty_tlb_aux,
     empty_tlb_bucket, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_host_span,
     wie_jit_load, wie_jit_store, wie_jit_string,
@@ -46,22 +47,47 @@ use std::collections::HashMap;
 use trampolines::match_micro_stub;
 
 /// Compile after this many visits to the same guest entry (skip cold code).
-/// Higher values cut compile tax on open-rom (mem/push coverage widens Pure set).
-/// Tests use 0 (eager compile on first Pure decode).
+///
+/// Default **100**: lower values (e.g. 12) cut residual iced but thrash short
+/// non-loop blocks on 7za and **increase** wall (sweep 2026-07-21: thr=100 best).
+/// Residual iced under thr=100 is almost all already-lowerable warmup (Mov/Call/…).
+/// Override: `WIE_JIT_HOTNESS=N` (`0` = eager first visit). Tests use 0.
 fn hotness_threshold() -> u32 {
-    if cfg!(test) { 0 } else { 100 }
+    use std::sync::OnceLock;
+    static THR: OnceLock<u32> = OnceLock::new();
+    *THR.get_or_init(|| {
+        if cfg!(test) {
+            return 0;
+        }
+        match std::env::var("WIE_JIT_HOTNESS") {
+            Ok(v) => v.parse::<u32>().unwrap_or(100),
+            Err(_) => 100,
+        }
+    })
 }
 
 /// Known pure self-loops: compile sooner (trade one Cranelift pass vs iced warmup).
+/// Override: `WIE_JIT_LOOP_HOTNESS=N` (default 8; tests 0).
 fn pure_loop_hotness() -> u32 {
-    if cfg!(test) { 0 } else { 16 }
+    use std::sync::OnceLock;
+    static THR: OnceLock<u32> = OnceLock::new();
+    *THR.get_or_init(|| {
+        if cfg!(test) {
+            return 0;
+        }
+        match std::env::var("WIE_JIT_LOOP_HOTNESS") {
+            Ok(v) => v.parse::<u32>().unwrap_or(8),
+            Err(_) => 8,
+        }
+    })
 }
 
 /// JIT memory lower mode (`WIE_JIT_MEM`).
 ///
-/// - unset / `sticky` — sticky-TLB IR + **stack pin** (4.1b) + helper fallback
+/// - unset / `sticky` — sticky-TLB IR + **stack pin** (4.1b); helpers use all
+///   pin slots (stack / heaps / VirtualAlloc) via `pin_resolve`
 /// - `slow` — helper-only loads/stores (oracle / bisect; no host ptr in IR)
-/// - `pin` — sticky + stack pin + heap region pin IR (Phase 4.1 full)
+/// - `pin` — sticky + stack + **top-2 data pin IR** (heaps/VA); helpers same
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JitMemMode {
     Slow,
@@ -89,9 +115,26 @@ pub(super) fn jit_mem_inline_enabled() -> bool {
     !matches!(jit_mem_mode(), JitMemMode::Slow)
 }
 
-/// Whether Cranelift may emit region-pin IR in addition to sticky (`WIE_JIT_MEM=pin`).
+/// Whether Cranelift may emit **data** pin IR (heap + VirtualAlloc) after sticky.
+///
+/// Default sticky still fills all pin slots for helper `pin_resolve`; only
+/// `WIE_JIT_MEM=pin` adds IR probes (can help some heaps, tax on thrashy paths).
 pub(super) fn jit_mem_pin_enabled() -> bool {
     matches!(jit_mem_mode(), JitMemMode::Pin)
+}
+
+/// Opt-in mem helper resolution histogram (`WIE_JIT_MEM_TRACE=1`).
+fn mem_path_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("WIE_JIT_MEM_TRACE") {
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") => true,
+        // Also dump when residual iced trace is on (profiling runs).
+        _ => matches!(
+            std::env::var("WIE_EXEC_TRACE"),
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")
+        ),
+    })
 }
 
 /// Block-wide stack super path (`WIE_JIT_SUPER`).
@@ -161,11 +204,17 @@ pub struct JitCpu {
     /// Persistent set-associative page TLB across chained blocks (invalidate on protect/free).
     tlb_sets: [TlbBucket; TLB_SETS],
     tlb_aux: [TlbBucketAux; TLB_SETS],
-    /// Sticky last-hit page for inline IR mem path.
+    /// Sticky last-hit page for inline IR mem path (mirror of multi sticky).
     tlb_hot_page: u64,
     tlb_hot_ptr: *mut u8,
     tlb_hot_prot: u64,
     tlb_hot_gen: u64,
+    /// Multi sticky ways (last-N pages for IR probes).
+    sticky_page: [u64; STICKY_WAYS],
+    sticky_ptr: [*mut u8; STICKY_WAYS],
+    sticky_prot: [u64; STICKY_WAYS],
+    sticky_gen: [u64; STICKY_WAYS],
+    sticky_rr: u64,
     /// Region-direct pins (rebuilt each `run_compiled` from layout + PageMap).
     pins: [MemPin; PIN_SLOTS],
     /// Fake-API VA → fast UCRT kind (dense pairs; compile-time lookup).
@@ -183,6 +232,10 @@ pub struct JitCpu {
     /// Phase 4.x: guest page keys (`va >> 12`) covered by at least one Ready block.
     /// Refcount = number of Ready blocks spanning that page (overlapping blocks).
     code_pages: HashMap<u64, u32>,
+    /// Previous `GuestMemory::generation` at last `run_compiled` (gen-bump diag).
+    last_mem_gen: u64,
+    /// Generation at which [`Self::pins`] was last rebuilt (skip fill when stable).
+    pins_gen: u64,
 }
 
 // SAFETY: TLB/pin raw pointers are non-owning views of guest mmap arenas.
@@ -252,6 +305,63 @@ impl UcrtImportIds {
     }
 }
 
+/// Dump helper mem-path histogram when `WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`.
+pub fn dump_mem_path_stats(s: &JitStats) {
+    if !mem_path_trace_enabled() {
+        return;
+    }
+    let helpers = s.load_calls.saturating_add(s.store_calls);
+    eprintln!(
+        "[wie] mem_path helpers={helpers} load={} store={}",
+        s.load_calls, s.store_calls
+    );
+    eprintln!(
+        "[wie]   resolve: sticky={} multi={} pin={} walk={} cross={} slow={}",
+        s.mem_sticky_hit,
+        s.mem_multi_hit,
+        s.mem_pin_hit,
+        s.mem_walk_hit,
+        s.mem_cross_page,
+        s.mem_slow
+    );
+    eprintln!(
+        "[wie]   sticky_miss: key={} gen={} prot={} swaps={}",
+        s.mem_sticky_miss_key,
+        s.mem_sticky_miss_gen,
+        s.mem_sticky_miss_prot,
+        s.mem_sticky_swaps
+    );
+    eprintln!(
+        "[wie]   addr_vs_pin: stack={} heap={} outside={}",
+        s.mem_addr_stack_pin, s.mem_addr_heap_pin, s.mem_addr_outside
+    );
+    eprintln!(
+        "[wie]   gen: bumps={} peak={}  pins: stack_bytes={:#x} heap_bytes={:#x} allow={:#x}",
+        s.mem_gen_bumps,
+        s.mem_gen_peak,
+        s.pin_stack_bytes,
+        s.pin_heap_bytes,
+        s.pin_allow_bits
+    );
+    if helpers > 0 {
+        let pct10 = |n: u64| -> u64 {
+            n.saturating_mul(1000).checked_div(helpers).unwrap_or(0)
+        };
+        let fmt = |n: u64| {
+            let t = pct10(n);
+            format!("{}.{}", t.checked_div(10).unwrap_or(0), t % 10)
+        };
+        eprintln!(
+            "[wie]   resolve%: multi={}% pin={}% walk={}% key_miss={}% outside={}%",
+            fmt(s.mem_multi_hit),
+            fmt(s.mem_pin_hit),
+            fmt(s.mem_walk_hit),
+            fmt(s.mem_sticky_miss_key),
+            fmt(s.mem_addr_outside),
+        );
+    }
+}
+
 /// Lightweight counters for `WIE_CPU=jit` diagnostics / Phase 0 baselines.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct JitStats {
@@ -271,6 +381,42 @@ pub struct JitStats {
     pub store_calls: u64,
     /// Phase 4.x: selective code-cache invalidations (SMC / X-loss / unmap).
     pub code_invs: u64,
+    /// Helper sticky hit after IR miss.
+    pub mem_sticky_hit: u64,
+    /// Helper multi-way TLB hit.
+    pub mem_multi_hit: u64,
+    /// Helper region-pin hit.
+    pub mem_pin_hit: u64,
+    /// Helper page-walk install hit.
+    pub mem_walk_hit: u64,
+    /// Helper cross-page (slow).
+    pub mem_cross_page: u64,
+    /// Helper full slow path (`GuestMemory::{read,write}`).
+    pub mem_slow: u64,
+    /// Sticky miss reason: wrong/empty page key.
+    pub mem_sticky_miss_key: u64,
+    /// Sticky miss reason: generation mismatch.
+    pub mem_sticky_miss_gen: u64,
+    /// Sticky miss reason: R/W denied.
+    pub mem_sticky_miss_prot: u64,
+    /// Sticky hot-page replacements.
+    pub mem_sticky_swaps: u64,
+    /// Helper VA inside stack pin.
+    pub mem_addr_stack_pin: u64,
+    /// Helper VA inside heap pin.
+    pub mem_addr_heap_pin: u64,
+    /// Helper VA outside both pins.
+    pub mem_addr_outside: u64,
+    /// Times `GuestMemory::generation` increased between `run_compiled` entries.
+    pub mem_gen_bumps: u64,
+    /// Peak `mem_gen` observed.
+    pub mem_gen_peak: u64,
+    /// Last stack pin guest span size (0 if empty).
+    pub pin_stack_bytes: u64,
+    /// Last heap pin guest span size (0 if empty).
+    pub pin_heap_bytes: u64,
+    /// Last pin allow bits: bit0 stack R, bit1 stack W, bit2 heap R, bit3 heap W.
+    pub pin_allow_bits: u64,
 }
 
 impl JitCpu {
@@ -301,6 +447,11 @@ impl JitCpu {
             tlb_hot_ptr: std::ptr::null_mut(),
             tlb_hot_prot: 0,
             tlb_hot_gen: 0,
+            sticky_page: [TLB_EMPTY; STICKY_WAYS],
+            sticky_ptr: [std::ptr::null_mut(); STICKY_WAYS],
+            sticky_prot: [0; STICKY_WAYS],
+            sticky_gen: [0; STICKY_WAYS],
+            sticky_rr: 0,
             pins: [MemPin::EMPTY; PIN_SLOTS],
             fast_api: Vec::new(),
             chain_va: Box::new([0; CHAIN_SLOTS]),
@@ -311,6 +462,8 @@ impl JitCpu {
             shadow_sp: 0,
             shadow_ret: [0; lower::SHADOW_DEPTH],
             code_pages: HashMap::new(),
+            last_mem_gen: 0,
+            pins_gen: u64::MAX, // force first fill
         }
     }
 
@@ -319,6 +472,8 @@ impl JitCpu {
     pub fn stats(&self) -> JitStats {
         self.stats
     }
+
+
 
     /// Install UCRT/heap fast-path config (called once after fake-API table build).
     pub fn configure_fast_path(&mut self, cfg: JitFastPathConfig) {
@@ -725,13 +880,53 @@ impl JitCpu {
 
     /// Returns `Some(InvalidMem)` when a host mem helper faulted.
     fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
-        // Refresh pins from live layout + PageMap (gen + conservative R/W).
-        // Safe even when IR pin path is off: helpers still use pin_resolve.
-        {
-            let infos = self.iced.guest_mem_mut().jit_region_pins();
-            self.pins = [MemPin::from_info(infos[0]), MemPin::from_info(infos[1])];
-        }
+        // Refresh pins only when GuestMemory generation changes (map/protect/free).
+        // Rebuilding VAD-ranked pins every block was measurable on 7za.
         let mem_gen = self.iced.guest_mem_mut().generation();
+        if self.pins_gen != mem_gen {
+            let infos = self.iced.guest_mem_mut().jit_region_pins();
+            self.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            self.pins_gen = mem_gen;
+        }
+        // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
+        if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
+            self.stats.mem_gen_bumps = self
+                .stats
+                .mem_gen_bumps
+                .saturating_add(mem_gen.saturating_sub(self.last_mem_gen));
+        }
+        self.last_mem_gen = mem_gen;
+        if mem_gen > self.stats.mem_gen_peak {
+            self.stats.mem_gen_peak = mem_gen;
+        }
+        {
+            let stack = self.pins[0];
+            self.stats.pin_stack_bytes = if stack.host_base != 0 {
+                stack.guest_end.saturating_sub(stack.guest_base)
+            } else {
+                0
+            };
+            // Sum of data pin spans (process heap + VirtualAlloc slots 1..).
+            let mut data_bytes = 0_u64;
+            let mut bits = 0_u64;
+            if stack.host_base != 0 {
+                bits |= stack.allow & 0b11;
+            }
+            for (i, pin) in self.pins.iter().enumerate().skip(1) {
+                if pin.host_base == 0 {
+                    continue;
+                }
+                data_bytes = data_bytes
+                    .saturating_add(pin.guest_end.saturating_sub(pin.guest_base));
+                // Pack first two data pins' allow into bits 2..5 for compact dump.
+                if i <= 2 {
+                    let shift = (i.saturating_sub(1).saturating_add(1)) * 2;
+                    bits |= (pin.allow & 0b11) << shift;
+                }
+            }
+            self.stats.pin_heap_bytes = data_bytes;
+            self.stats.pin_allow_bits = bits;
+        }
         let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
         let regs = self.iced.regs_mut();
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
@@ -792,6 +987,12 @@ impl JitCpu {
             edge_ic_fn: self.edge_ic_fn,
             edge_ic_rr: self.edge_ic_rr,
             xmm_dirty_bits: 0,
+            mem_path: MemPathSlice::default(),
+            sticky_page: self.sticky_page,
+            sticky_ptr: self.sticky_ptr,
+            sticky_prot: self.sticky_prot,
+            sticky_gen: self.sticky_gen,
+            sticky_rr: self.sticky_rr,
         };
         // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
         unsafe {
@@ -799,6 +1000,23 @@ impl JitCpu {
         }
         self.stats.load_calls = self.stats.load_calls.saturating_add(ctx.load_calls);
         self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
+        {
+            let m = &ctx.mem_path;
+            let s = &mut self.stats;
+            s.mem_sticky_hit = s.mem_sticky_hit.saturating_add(m.sticky_hit);
+            s.mem_multi_hit = s.mem_multi_hit.saturating_add(m.multi_hit);
+            s.mem_pin_hit = s.mem_pin_hit.saturating_add(m.pin_hit);
+            s.mem_walk_hit = s.mem_walk_hit.saturating_add(m.walk_hit);
+            s.mem_cross_page = s.mem_cross_page.saturating_add(m.cross_page);
+            s.mem_slow = s.mem_slow.saturating_add(m.slow);
+            s.mem_sticky_miss_key = s.mem_sticky_miss_key.saturating_add(m.sticky_miss_key);
+            s.mem_sticky_miss_gen = s.mem_sticky_miss_gen.saturating_add(m.sticky_miss_gen);
+            s.mem_sticky_miss_prot = s.mem_sticky_miss_prot.saturating_add(m.sticky_miss_prot);
+            s.mem_sticky_swaps = s.mem_sticky_swaps.saturating_add(m.sticky_swaps);
+            s.mem_addr_stack_pin = s.mem_addr_stack_pin.saturating_add(m.addr_in_stack_pin);
+            s.mem_addr_heap_pin = s.mem_addr_heap_pin.saturating_add(m.addr_in_heap_pin);
+            s.mem_addr_outside = s.mem_addr_outside.saturating_add(m.addr_outside_pins);
+        }
         // Phase 4.x: guest stores via `GuestMemory::write` leave a pending range;
         // apply selective code invalidation only after the native frame returns.
         // Persist set-associative TLB + sticky hot page + shadow stack across chained blocks.
@@ -808,6 +1026,11 @@ impl JitCpu {
         self.tlb_hot_ptr = ctx.tlb_hot_ptr;
         self.tlb_hot_prot = ctx.tlb_hot_prot;
         self.tlb_hot_gen = ctx.tlb_hot_gen;
+        self.sticky_page = ctx.sticky_page;
+        self.sticky_ptr = ctx.sticky_ptr;
+        self.sticky_prot = ctx.sticky_prot;
+        self.sticky_gen = ctx.sticky_gen;
+        self.sticky_rr = ctx.sticky_rr;
         self.edge_ic_va = ctx.edge_ic_va;
         self.edge_ic_fn = ctx.edge_ic_fn;
         self.edge_ic_rr = ctx.edge_ic_rr;
@@ -888,9 +1111,15 @@ impl JitCpu {
         self.tlb_hot_ptr = std::ptr::null_mut();
         self.tlb_hot_prot = 0;
         self.tlb_hot_gen = 0;
+        self.sticky_page = [TLB_EMPTY; STICKY_WAYS];
+        self.sticky_ptr = [std::ptr::null_mut(); STICKY_WAYS];
+        self.sticky_prot = [0; STICKY_WAYS];
+        self.sticky_gen = [0; STICKY_WAYS];
+        self.sticky_rr = 0;
         // Pins are rebuilt on next run_compiled; clear host bases so a stale
         // mid-flight ctx (if any) cannot soft-translate after protect/free.
         self.pins = [MemPin::EMPTY; PIN_SLOTS];
+        self.pins_gen = u64::MAX;
     }
 
     fn invalidate_chain_and_shadow(&mut self) {

@@ -1059,14 +1059,22 @@ impl RuntimeSession {
     ///
     /// Called by micro runners after `run_until_stop` when profiling is enabled.
     pub fn finalize_profile(&mut self, wall_ns: u128, cpu_user_us: u64, cpu_sys_us: u64) {
-        if !self.profile_enabled {
-            return;
+        if self.profile_enabled {
+            self.profile.wall_ns = wall_ns;
+            self.profile.cpu_user_us = cpu_user_us;
+            self.profile.cpu_sys_us = cpu_sys_us;
+            self.profile.jit = self.process.with_mut(|e, _| e.cpu_stats());
+            self.profile.mem_backend =
+                self.process.with_mut(|e, _| e.mem_backend_name().to_owned());
         }
-        self.profile.wall_ns = wall_ns;
-        self.profile.cpu_user_us = cpu_user_us;
-        self.profile.cpu_sys_us = cpu_sys_us;
-        self.profile.jit = self.process.with_mut(|e, _| e.cpu_stats());
-        self.profile.mem_backend = self.process.with_mut(|e, _| e.mem_backend_name().to_owned());
+        // Residual iced histogram (opt-in via `WIE_EXEC_TRACE=1`).
+        wie_cpu::dump_iced_counters();
+        // Mem helper path breakdown (`WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`).
+        if let Some(ref j) = self.profile.jit {
+            wie_cpu::dump_mem_path_stats(j);
+        } else if let Some(j) = self.process.with_mut(|e, _| e.cpu_stats()) {
+            wie_cpu::dump_mem_path_stats(&j);
+        }
     }
 
     /// Returns the PE entry-point address associated with this session.

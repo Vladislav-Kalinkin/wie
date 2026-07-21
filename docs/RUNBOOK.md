@@ -21,6 +21,7 @@ One-page playbook for regressions after Phases 0–7 and the **great cleanup** (
 | Idle guest burns 100% CPU (message wait) | `WIE_IDLE=park` (interactive `run --persistent` defaults to park) |
 | `Sleep(n)` ignored / too fast | Ensure not forced busy: `WIE_IDLE=park` or legacy `WIE_HOST_SLEEP=1` |
 | Micros suddenly slow | Avoid `WIE_IDLE=park` on suite; default micro idle is **yield** |
+| Memory-heavy guest slow / high helpers | Profile with `WIE_JIT_MEM_TRACE=1`; expect pin hits on VA heaps; bisect `WIE_JIT_MEM=slow` |
 | String / SIMD wrong results | `WIE_STRING_BULK=0`, `WIE_STRING_INLINE=0`, `WIE_JIT_SIMD=0` |
 | TLB Neon issues on aarch64 | `WIE_TLB_NEON=0` |
 | Host mprotect noise / faults | `WIE_MPROTECT=0` (SPC still enforces) |
@@ -44,6 +45,9 @@ WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh
 ```bash
 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/long_loop.exe
 # expect ~100% CPU on pure loops; mem_backend=mmap
+
+WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run real_exes/7za.exe -- …
+# mem_path helpers=… resolve: sticky= multi= pin= walk= …
 ```
 
 ## Docs map
@@ -53,6 +57,7 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run micro-exes/out/long_loop.exe
 | Idle park | [`phase6-idle.md`](phase6-idle.md) |
 | Hardening / cutover | [`phase7-hardening.md`](phase7-hardening.md) |
 | Code invalidation | [`phase4-code-invalidation.md`](phase4-code-invalidation.md) |
+| Region pins / multi sticky | [`phase4-region-pins.md`](phase4-region-pins.md) |
 | Memory backends (historical) | [`phase2-mmap-backend.md`](phase2-mmap-backend.md) |
 | Full roadmap | [`../Optimization ROADMAP.md`](../Optimization%20ROADMAP.md) |
 | Multithreading | [`mt-threads.md`](mt-threads.md) |

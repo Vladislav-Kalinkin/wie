@@ -32,7 +32,7 @@
 | ---- | ------ |
 | Geometry | `TLB_SETS=16` × `TLB_WAYS_PER_SET=4` |
 | Layout | `TlbBucket` (`tags[4]`, `host[4]`, align 16); `TlbBucketAux` (`generation[4]`, `prot[4]`, `rr`) |
-| Lookup order | sticky → set-assoc probe → pin → page walk |
+| Lookup order | multi sticky (2 MRU IR) → set-assoc probe → region pins → page walk |
 | Neon | `vdupq_n_u64` + 2× `vceqq_u64` → way bitmask (`cfg(aarch64)`) |
 | Tags | full `u64` page keys (no 32-bit compress) |
 
@@ -79,7 +79,7 @@ WIE_STRING_BULK=0       # Phase 4.3 host-span bulk off
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p wie-cpu
-WIE_MEM=hybrid ./scripts/run-micro-suite.sh
+./scripts/run-micro-suite.sh
 WIE_JIT_SIMD=0 WIE_TLB_NEON=0 WIE_STRING_INLINE=0 ./scripts/run-micro-suite.sh
 ```
 

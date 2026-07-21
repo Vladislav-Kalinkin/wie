@@ -218,9 +218,9 @@ pub fn run_micro_exe_with_options(
     let (cpu1_user, cpu1_sys) = wie_cpu::process_cpu_times_us();
     let cpu_user_us = cpu1_user.saturating_sub(cpu0_user);
     let cpu_sys_us = cpu1_sys.saturating_sub(cpu0_sys);
-    if session.profile_enabled() {
-        session.finalize_profile(wall_ns, cpu_user_us, cpu_sys_us);
-    }
+    // Always finalize: fills profile when enabled and dumps iced residual when
+    // `WIE_EXEC_TRACE=1` (even without `WIE_RUNTIME_PROFILE`).
+    session.finalize_profile(wall_ns, cpu_user_us, cpu_sys_us);
     let profile = if session.profile_enabled() {
         Some(session.profile().clone())
     } else {

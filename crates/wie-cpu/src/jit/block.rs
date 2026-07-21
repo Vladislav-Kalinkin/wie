@@ -7,7 +7,9 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKin
 /// Raised to capture longer pure loop bodies in one native frame.
 pub(super) const MAX_BLOCK_INSNS: usize = 96;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
-pub(super) const MIN_BLOCK_INSNS: usize = 4;
+/// 2 keeps tiny fallthrough fragments eligible once hot (was 4; 7za residual was
+/// dominated by already-lowerable Mov/Add fragments that never reached min=4).
+pub(super) const MIN_BLOCK_INSNS: usize = 2;
 
 /// One decoded guest insn kept for the lowerer.
 #[derive(Debug, Clone)]
@@ -202,16 +204,28 @@ fn is_near_branch(instr: &Instruction) -> bool {
 
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
-        // Nop, endbranch, sign-extension: always lowerable.
-        Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Cwde | Mnemonic::Cdqe => {
-            true
-        }
+        // Nop, endbranch, sign-extension / DF / rflags stack: always lowerable.
+        Mnemonic::Nop
+        | Mnemonic::Endbr64
+        | Mnemonic::Endbr32
+        | Mnemonic::Cwde
+        | Mnemonic::Cdqe
+        | Mnemonic::Cbw
+        | Mnemonic::Cwd
+        | Mnemonic::Cld
+        | Mnemonic::Std
+        | Mnemonic::Pushfq
+        | Mnemonic::Popfq
+        | Mnemonic::Leave => true,
         Mnemonic::Lea => lea_is_simple(instr),
         Mnemonic::Mov => mov_is_lowerable(instr),
         Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => movx_is_lowerable(instr),
         // Push/pop: r64, imm, and simple memory operands.
         Mnemonic::Push => push_is_lowerable(instr),
         Mnemonic::Pop => pop_is_lowerable(instr),
+        // Bswap: r32 / r64 only (no memory form).
+        Mnemonic::Bswap => matches!(instr.op0_kind(), OpKind::Register)
+            && matches!(instr.op_register(0).size(), 4 | 8),
         Mnemonic::Add
         | Mnemonic::Adc
         | Mnemonic::Sub
@@ -223,7 +237,8 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Test
         | Mnemonic::Bt
         | Mnemonic::Bts
-        | Mnemonic::Btr => alu_is_lowerable(instr),
+        | Mnemonic::Btr
+        | Mnemonic::Btc => alu_is_lowerable(instr),
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
         Mnemonic::Imul => imul_is_lowerable(instr),
         Mnemonic::Xchg => xchg_is_lowerable(instr),

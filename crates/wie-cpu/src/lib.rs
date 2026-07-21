@@ -14,8 +14,12 @@ mod jit;
 mod mem;
 mod regs;
 
+/// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
+pub use exec::{dump_iced_counters, reset_iced_counters};
 pub use iced_cpu::IcedCpu;
-pub use jit::{FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats};
+pub use jit::{
+    FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats, dump_mem_path_stats,
+};
 /// Windows `PAGE_*` constants and software access checks (Phase 3).
 pub use mem::protect;
 pub use mem::{

@@ -32,15 +32,15 @@ TLB / sticky entries store `generation` at install. Hit requires `entry.generati
 Install uses `GuestMemory::page_tlb_entry` / `page_tlb_entry_walk` (committed + protect meta + host ptr).  
 Load requires R; store requires W. Deny → miss → slow path → SPC fault.
 
-Inline sticky IR (`sticky_tlb_probe`) checks key, non-null base, in-page, **gen match**, and **R or W bit** before trusted host load/store.
+Inline multi sticky IR (`sticky_tlb_probe`, `STICKY_WAYS = 2`) checks key, non-null base, in-page, **gen match**, and **R or W bit** per way before trusted host load/store.
 
 ## Kill-switches
 
 | Env                            | Effect                                            |
 | ------------------------------ | ------------------------------------------------- |
-| `WIE_JIT_MEM=slow`             | No sticky IR; every load/store is a helper call   |
-| `WIE_JIT_MEM=sticky` (default) | Sticky IR + helper fallback                       |
-| `WIE_JIT_MEM=pin`              | Sticky + region-direct pin IR (Phase 4.1; opt-in) |
+| `WIE_JIT_MEM=slow`             | No sticky IR; every load/store is a helper call              |
+| `WIE_JIT_MEM=sticky` (default) | Multi sticky IR (2 MRU) + stack pin; helpers pin-resolve all |
+| `WIE_JIT_MEM=pin`              | Sticky + top-2 data pin IR (Phase 4.1; opt-in)               |
 | `WIE_JIT_CHAIN=0`              | No direct FuncRef chain, no chain-table publish   |
 | `WIE_CPU=iced`                 | Full interpreter escape hatch                     |
 
@@ -59,16 +59,16 @@ WIE_CPU=iced ./scripts/run-micro-suite.sh
 ```bash
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-WIE_MEM=hash ./scripts/run-micro-suite.sh
-WIE_MEM=mmap ./scripts/run-micro-suite.sh
-WIE_MEM=hybrid ./scripts/run-micro-suite.sh
+./scripts/run-micro-suite.sh                 # mmap-only storage
 WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
+WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh
 ```
 
 ## Next / status
 
-- **4.1** ✅ Region pin slots — see [`phase4-region-pins.md`](phase4-region-pins.md).
+- **4.1** ✅ Region pin slots (stack + ranked heaps/VA) — see [`phase4-region-pins.md`](phase4-region-pins.md).
 - **4.1b** ✅ Stack pin + block-wide super-fast path (one entry guard, bare host mem in body).
+- **4.1c** ✅ Multi sticky IR (`STICKY_WAYS = 2`) + gen-cached pins.
 - **4.2** ✅ I-cache policy + edge IC — see [`phase4-jit-coherency.md`](phase4-jit-coherency.md).
 - **4.3** ✅ REP MOVS/STOS host-span bulk — see [`phase4-string-bulk.md`](phase4-string-bulk.md).
 - **Phase 4 core frozen.**
