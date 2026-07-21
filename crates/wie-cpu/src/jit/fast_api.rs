@@ -8,6 +8,7 @@
 
 use super::lower::JitCtx;
 use crate::mem::GuestMemory;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Which UCRT/CRT import to accelerate from JIT code.
@@ -97,13 +98,27 @@ const SIZE_CLASSES: [u64; 24] = [
     16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192,
     12288, 16384, 24576, 32768, 49152, 65536,
 ];
+
+/// Must match `wie_winapi::guest_heap::LARGE_THRESHOLD` (65 536).
+///
+/// Historically this was 16 MiB, which made `round_up_size(65537..=16MiB)` return a full
+/// 16 MiB slab on every medium `malloc` — progressive process-heap burn during 7za/LZMA.
 const LARGE_THRESHOLD: u64 = 65_536;
+
+/// Host-side large free list for JIT `malloc`/`free` when size > [`LARGE_THRESHOLD`].
+/// Guest control block only stores size-class heads; large blocks need a host list
+/// (same role as `GuestHeap::large_free` on the WinAPI path).
+static LARGE_FREE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Install heap layout for JIT UCRT helpers (and optionally the VA map is kept on `JitCpu`).
 pub(super) fn install_heap_layout(heap: JitHeapLayout) {
     HEAP_CTRL.store(heap.ctrl_va, Ordering::Relaxed);
     HEAP_BASE.store(heap.base, Ordering::Relaxed);
     HEAP_END.store(heap.end, Ordering::Relaxed);
+    // New session → discard stale large freelist entries (VAs are heap-region relative).
+    if let Ok(mut list) = LARGE_FREE.lock() {
+        list.clear();
+    }
 }
 
 fn heap_layout() -> JitHeapLayout {
@@ -137,7 +152,9 @@ fn round_up_size(size: u64) -> u64 {
                 return c;
             }
         }
-        LARGE_THRESHOLD
+        // size is in (last class, LARGE_THRESHOLD] — should not happen with classes
+        // ending at LARGE_THRESHOLD; keep exact 16-byte align as a safe fallback.
+        size.wrapping_add(15) & !15_u64
     } else {
         size.wrapping_add(15) & !15_u64
     }
@@ -157,6 +174,39 @@ fn head_va(ctrl: u64, class: usize) -> u64 {
         .wrapping_add(u64::try_from(class).unwrap_or(0).wrapping_mul(8))
 }
 
+fn find_large_fit(list: &[(u64, u64)], need: u64) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    for (i, &(_, size)) in list.iter().enumerate() {
+        if size >= need {
+            match best {
+                None => best = Some((i, size)),
+                Some((_, best_size)) if size < best_size => best = Some((i, size)),
+                _ => {}
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
+/// Large allocation: best-fit on host freelist, else bump (mirrors `GuestHeap`).
+fn large_alloc(mem: &mut GuestMemory, heap: &JitHeapLayout, rounded: u64) -> u64 {
+    if let Ok(mut list) = LARGE_FREE.lock()
+        && let Some(best_i) = find_large_fit(&list, rounded)
+    {
+        let (addr, size) = list.swap_remove(best_i);
+        if size >= rounded.saturating_add(LARGE_THRESHOLD) {
+            let residual_addr = addr.saturating_add(rounded);
+            let residual_size = size.saturating_sub(rounded);
+            if residual_addr > addr && residual_size >= 16 {
+                list.push((residual_addr, residual_size));
+            }
+        }
+        let _ = write_u64(mem, addr.wrapping_sub(8), rounded);
+        return addr;
+    }
+    bump_alloc(mem, heap, rounded)
+}
+
 /// `malloc(size)` — freelist / bump via guest heap control block.
 pub(super) unsafe extern "C" fn wie_ucrt_malloc(ctx: *mut JitCtx, size: u64) -> u64 {
     let ctx = unsafe { &mut *ctx };
@@ -172,9 +222,11 @@ pub(super) unsafe extern "C" fn wie_ucrt_malloc(ctx: *mut JitCtx, size: u64) -> 
     }
     let mem = mem_mut(ctx);
     let rounded = round_up_size(size);
-    if rounded == 0 || rounded > LARGE_THRESHOLD {
-        // Large: bump only (rare for CRT hello paths).
-        return bump_alloc(mem, &heap, rounded);
+    if rounded == 0 {
+        return 0;
+    }
+    if rounded > LARGE_THRESHOLD {
+        return large_alloc(mem, &heap, rounded);
     }
     let class = size_class_index(rounded);
     let hva = head_va(heap.ctrl_va, class);
@@ -230,7 +282,15 @@ pub(super) unsafe extern "C" fn wie_ucrt_free(ctx: *mut JitCtx, ptr: u64) {
     let Some(size) = read_u64(mem, ptr.wrapping_sub(8)) else {
         return;
     };
-    if size == 0 || size > LARGE_THRESHOLD {
+    if size == 0 {
+        return;
+    }
+    // Poison header so double-free is a no-op (matches host free_coherent).
+    let _ = write_u64(mem, ptr.wrapping_sub(8), 0);
+    if size > LARGE_THRESHOLD {
+        if let Ok(mut list) = LARGE_FREE.lock() {
+            list.push((ptr, size));
+        }
         return;
     }
     let class = size_class_index(size);
@@ -341,18 +401,32 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
     if total_usize == 0 {
         return 0;
     }
-    let mem = mem_mut(ctx);
-    let mut bytes = vec![0_u8; total_usize];
-    if buf != 0 && mem.read(buf, &mut bytes).is_err() {
-        ctx.fault = 1;
-        ctx.fault_addr = buf;
-        ctx.fault_size = total;
-        ctx.fault_access = 0;
-        return 0;
+    // Only console streams write to the host; other FILE* cookies are no-ops
+    // (same as the previous full-buffer path which only wrote stdout/stderr).
+    if stream != FILE_STDOUT && stream != FILE_STDERR {
+        return count;
     }
-    // Fast-path: direct `libc::write` for stdout/stderr — skips Rust stdio mutex.
-    if stream == FILE_STDOUT || stream == FILE_STDERR {
-        write_host_console(stream, &bytes);
+    if buf == 0 {
+        return count;
+    }
+    let mem = mem_mut(ctx);
+    // Chunked host write — avoid a single heap allocation the size of the whole
+    // transfer (large `fwrite` was a host-RSS spike on the JIT path).
+    let mut remaining = total_usize;
+    let mut src = buf;
+    let mut chunk_buf = [0_u8; 4096];
+    while remaining > 0 {
+        let chunk = remaining.min(chunk_buf.len());
+        if mem.read(src, &mut chunk_buf[..chunk]).is_err() {
+            ctx.fault = 1;
+            ctx.fault_addr = src;
+            ctx.fault_size = u64::try_from(chunk).unwrap_or(0);
+            ctx.fault_access = 0;
+            return 0;
+        }
+        write_host_console(stream, &chunk_buf[..chunk]);
+        src = src.wrapping_add(u64::try_from(chunk).unwrap_or(0));
+        remaining -= chunk;
     }
     count
 }

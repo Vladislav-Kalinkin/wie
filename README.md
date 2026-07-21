@@ -247,46 +247,39 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 3. **JIT dual_super GPR writeback** — only store live GPRs on block exit (do not zero callee-saved).
 4. **Default `WIE_JIT_SUPER=loop`** — non-loop stack super can host-fault on some real tools (`7za a`); self-loop super keeps `long_loop` fast. Opt in with `WIE_JIT_SUPER=all` only when bisecting.
 5. **CRT/WinAPI MT** — `_beginthreadex`, semaphores, events, `WaitForMultipleObjects`, save-before-switch on the shared engine (see Multithreading above).
+6. **`WIN32_FIND_DATA` layout** — sizes at 28/32, `cFileName` at **44** (not BY_HANDLE offsets); wrong names made `7za a` recurse forever on empty path components.
 
 ### Not claimed yet
 
 - GUI 7-Zip / `7zFM` / full installer PE.
 - Password / crypto, solid multi-file update, or every format beyond default `.7z` LZMA2.
 
-### Known issue: multi‑GiB / many‑file `7za a` “super-test” (open)
+### Heavy / multi‑GiB `7za a` (local stress)
 
-Small and medium `7za` create/list/extract gates (README universal example, MT micros) **work**. A **heavy** create over a large host tree via `--drive-d` is **not** green yet.
+Small and medium create/list/extract (README universal example, including ~140 KiB payloads) **work** under default JIT. Prefer compact method switches where noted below.
 
-**Target command** (local stress only; not CI):
+**Fixed (was a false “heap too small” failure):** `WIN32_FIND_DATA{A,W}` used the wrong field offsets (`cFileName` at 48 instead of **44**, sizes mixed up with `BY_HANDLE_FILE_INFORMATION`). Every FindFirst/Next name looked empty → 7za recursive scan looped, burned millions of tiny `malloc`s, then `std::bad_alloc` / `_CxxThrowException`. Correct layout + `FILETIME` fill; scan is now O(entries), not OOM.
+
+**Still open / caveats**
+
+| Topic | Notes |
+| ----- | ----- |
+| Dictionary switch form | Prefer **`-md64k`** (compact). **`-md=64k`** / **`-m0=…`** (equals form) can still hit `_CxxThrowException` during method setup (not scan OOM). |
+| Multi‑GiB tree via `--drive-d` | Not claimed end-to-end yet. Raise `--max-api` and optionally `WIE_PROCESS_HEAP_MB`; use `WIE_RUNTIME_PROFILE=1` / `WIE_JIT_CHAIN=0` / `WIE_CPU=iced` to bisect. |
+| C++ EH | `_CxxThrowException` is not implemented; any real C++ throw still aborts with an explicit message. |
+
+**Example stress command** (local only; not CI):
 
 ```bash
 B="/tmp/w7z_heavy_$$" && mkdir -p "$B/drive_c/App"
 time env WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run \
   --root "$B" \
-  --drive-d "/path/to/large_tree" \   # e.g. ~10 GiB, tens of thousands of files
-  --max-api 2000000 \
+  --drive-d "/path/to/large_tree" \
+  --max-api 20000000 \
   real_exes/7za.exe -- \
-  a -mmt4 -mx=1 -md=64k -bd 'C:\App\huge_cache.7z' 'D:\'
+  a -mmt4 -mx=1 -md64k -bd 'C:\App\huge_cache.7z' 'D:\'
 rm -rf "$B"
 ```
-
-| Stage | Symptom | Status / notes |
-| ----- | ------- | -------------- |
-| Directory scan (~60k files) | `malloc` → `0` → `msvcrt!_CxxThrowException` → `unimplemented mnemonic Int3` | **Mitigated:** default process heap raised to **512 MiB** (was 16 MiB); override with `WIE_PROCESS_HEAP_MB`. `_CxxThrowException` now fails with an explicit OOM/EH message instead of bare Int3. |
-| Same scan, large heap, **JIT** | Host `thread 'main' has overflowed its stack` | **Mitigated:** JIT block chaining nests host C frames; **`MAX_CHAIN_DEPTH` (48)** returns to the dispatcher instead of unbounded nesting. |
-| After scan / early archive create | `invalid memory access … address=0x7f…` (guest read of unmapped VA) | **Open.** Scan can finish and print folder/file counts; create then faults. Needs more isolation (heap vs JIT chain vs VFS timestamps / file APIs). |
-| Full 10 GiB compress + roundtrip | Successful super-test + README claim | **Not done** — left for a dedicated session (long wall time). |
-
-**Related knobs**
-
-| Knob | Role |
-| ---- | ---- |
-| `WIE_PROCESS_HEAP_MB` | Process-heap size in MiB (default **512**; mmap demand-zero, RSS grows on use). Raise further if huge scans still OOM. |
-| `WIE_JIT_CHAIN=0` | Disable late-bound block chaining (debug / bisect host-stack vs correctness). |
-| `WIE_CPU=iced` | Interpreter-only; useful to separate JIT chain issues from WinAPI/VFS bugs. |
-| `--max-api` | Must be large (`2e6`–`2e7+`); scan alone is hundreds of thousands of charged APIs. |
-
-When this path exits `0` end-to-end under default JIT, document it here as a successful super-test (command + measured wall/profile).
 
 ## Core Components
 

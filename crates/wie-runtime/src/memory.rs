@@ -101,7 +101,7 @@ impl RuntimeMemoryLayout {
             resource_data_base: 0x0000_0000_6400_0000,
             resource_data_size: 0x0001_0000,
             stack_base: 0x0000_0000_2000_0000,
-            stack_size: 0x0001_0000,
+            stack_size: 0x0080_0000,
             env_data_base: 0x0000_0000_3000_0000,
             env_data_size: 0x1000,
             // Larger slices cut emu_start restart overhead; still bounded so a
@@ -159,7 +159,8 @@ impl RuntimeMemoryLayout {
                     Ok(mb) if mb > 0 => {
                         // Cap at 16 GiB — enough for heavy tools, avoids absurd maps.
                         let mb = mb.min(16 * 1024);
-                        let bytes = usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(self.process_heap_size);
+                        let bytes = usize::try_from(mb.saturating_mul(1024 * 1024))
+                            .unwrap_or(self.process_heap_size);
                         // Keep at least 1 MiB so freelist math stays sane.
                         self.process_heap_size = bytes.max(1024 * 1024);
                     }

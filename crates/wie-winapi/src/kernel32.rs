@@ -1050,10 +1050,21 @@ fn collect_find_entries(state: &WinApiState, full_pattern: &str) -> Vec<crate::v
     crate::vfs::list_dir_filtered(&ctx, &dir, &mask)
 }
 
+/// Write shared `WIN32_FIND_DATA{A,W}` header fields (not the name).
+///
+/// Layout (minwinbase.h) — **not** `BY_HANDLE_FILE_INFORMATION`:
+/// ```text
+/// 0  dwFileAttributes
+/// 4  ftCreationTime / 12 ftLastAccessTime / 20 ftLastWriteTime
+/// 28 nFileSizeHigh / 32 nFileSizeLow
+/// 36 dwReserved0 / 40 dwReserved1
+/// 44 cFileName[MAX_PATH]
+/// ```
 fn write_find_data_common(
     engine: &mut dyn wie_cpu::CpuEngine,
     find_data_ptr: u64,
     attributes: u32,
+    file_size: u64,
 ) -> Result<()> {
     if find_data_ptr == 0 {
         return Ok(());
@@ -1061,14 +1072,37 @@ fn write_find_data_common(
 
     let attributes_address =
         checked_field_address(find_data_ptr, 0, "WIN32_FIND_DATA.dwFileAttributes")?;
+    let creation_time_address =
+        checked_field_address(find_data_ptr, 4, "WIN32_FIND_DATA.ftCreationTime")?;
+    let last_access_time_address =
+        checked_field_address(find_data_ptr, 12, "WIN32_FIND_DATA.ftLastAccessTime")?;
+    let last_write_time_address =
+        checked_field_address(find_data_ptr, 20, "WIN32_FIND_DATA.ftLastWriteTime")?;
     let file_size_high_address =
-        checked_field_address(find_data_ptr, 32, "WIN32_FIND_DATA.nFileSizeHigh")?;
+        checked_field_address(find_data_ptr, 28, "WIN32_FIND_DATA.nFileSizeHigh")?;
     let file_size_low_address =
-        checked_field_address(find_data_ptr, 36, "WIN32_FIND_DATA.nFileSizeLow")?;
+        checked_field_address(find_data_ptr, 32, "WIN32_FIND_DATA.nFileSizeLow")?;
+    let reserved0_address =
+        checked_field_address(find_data_ptr, 36, "WIN32_FIND_DATA.dwReserved0")?;
+    let reserved1_address =
+        checked_field_address(find_data_ptr, 40, "WIN32_FIND_DATA.dwReserved1")?;
 
     write_guest_u32(engine, attributes_address, attributes)?;
-    write_guest_u32(engine, file_size_high_address, 0)?;
-    write_guest_u32(engine, file_size_low_address, 0)?;
+    write_guest_u64(engine, creation_time_address, FIXED_SYSTEM_FILETIME)?;
+    write_guest_u64(engine, last_access_time_address, FIXED_SYSTEM_FILETIME)?;
+    write_guest_u64(engine, last_write_time_address, FIXED_SYSTEM_FILETIME)?;
+    write_guest_u32(
+        engine,
+        file_size_high_address,
+        u32::try_from(file_size >> 32).unwrap_or(0),
+    )?;
+    write_guest_u32(
+        engine,
+        file_size_low_address,
+        u32::try_from(file_size & 0xffff_ffff).unwrap_or(0),
+    )?;
+    write_guest_u32(engine, reserved0_address, 0)?;
+    write_guest_u32(engine, reserved1_address, 0)?;
 
     Ok(())
 }
@@ -1078,14 +1112,19 @@ fn write_find_data_w(
     find_data_ptr: u64,
     file_name: &str,
     attributes: u32,
+    file_size: u64,
 ) -> Result<()> {
-    write_find_data_common(engine, find_data_ptr, attributes)?;
+    write_find_data_common(engine, find_data_ptr, attributes, file_size)?;
 
     if find_data_ptr == 0 {
         return Ok(());
     }
 
-    let file_name_address = checked_field_address(find_data_ptr, 48, "WIN32_FIND_DATAW.cFileName")?;
+    // cFileName is at offset 44 (after dwReserved1), not 48.
+    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAW.cFileName")?;
+    // cAlternateFileName[14] starts at 44 + MAX_PATH*2 = 564.
+    let alt_name_address =
+        checked_field_address(find_data_ptr, 564, "WIN32_FIND_DATAW.cAlternateFileName")?;
 
     let mut bytes = Vec::new();
     for unit in file_name.encode_utf16() {
@@ -1096,6 +1135,7 @@ fn write_find_data_w(
     engine
         .mem_write(file_name_address, &bytes)
         .context("failed to write WIN32_FIND_DATAW.cFileName")?;
+    write_guest_u16(engine, alt_name_address, 0)?;
 
     Ok(())
 }
@@ -1105,14 +1145,18 @@ fn write_find_data_a(
     find_data_ptr: u64,
     file_name: &str,
     attributes: u32,
+    file_size: u64,
 ) -> Result<()> {
-    write_find_data_common(engine, find_data_ptr, attributes)?;
+    write_find_data_common(engine, find_data_ptr, attributes, file_size)?;
 
     if find_data_ptr == 0 {
         return Ok(());
     }
 
-    let file_name_address = checked_field_address(find_data_ptr, 48, "WIN32_FIND_DATAA.cFileName")?;
+    // Same header as W; cFileName is CHAR[MAX_PATH] at offset 44.
+    let file_name_address = checked_field_address(find_data_ptr, 44, "WIN32_FIND_DATAA.cFileName")?;
+    let alt_name_address =
+        checked_field_address(find_data_ptr, 304, "WIN32_FIND_DATAA.cAlternateFileName")?;
 
     let mut bytes = crate::vfs::encode_acp(file_name);
     bytes.push(0);
@@ -1120,6 +1164,9 @@ fn write_find_data_a(
     engine
         .mem_write(file_name_address, &bytes)
         .context("failed to write WIN32_FIND_DATAA.cFileName")?;
+    engine
+        .mem_write(alt_name_address, &[0_u8])
+        .context("failed to write WIN32_FIND_DATAA.cAlternateFileName")?;
 
     Ok(())
 }
@@ -2685,19 +2732,20 @@ fn finish_find_first(
 
     let first = entries.remove(0);
     if unicode {
-        write_find_data_w(engine, find_data_ptr, &first.name, first.attributes)?;
-    } else {
-        write_find_data_a(engine, find_data_ptr, &first.name, first.attributes)?;
-    }
-    // Fill size fields.
-    if find_data_ptr != 0 {
-        let high = checked_field_address(find_data_ptr, 28, "nFileSizeHigh")?;
-        let low = checked_field_address(find_data_ptr, 32, "nFileSizeLow")?;
-        write_guest_u32(engine, high, u32::try_from(first.size >> 32).unwrap_or(0))?;
-        write_guest_u32(
+        write_find_data_w(
             engine,
-            low,
-            u32::try_from(first.size & 0xffff_ffff).unwrap_or(0),
+            find_data_ptr,
+            &first.name,
+            first.attributes,
+            first.size,
+        )?;
+    } else {
+        write_find_data_a(
+            engine,
+            find_data_ptr,
+            &first.name,
+            first.attributes,
+            first.size,
         )?;
     }
 
@@ -2789,18 +2837,20 @@ fn finish_find_next(
 
     let next = slot.remaining.remove(0);
     if unicode {
-        write_find_data_w(engine, find_data_ptr, &next.name, next.attributes)?;
-    } else {
-        write_find_data_a(engine, find_data_ptr, &next.name, next.attributes)?;
-    }
-    if find_data_ptr != 0 {
-        let high = checked_field_address(find_data_ptr, 32, "nFileSizeHigh")?;
-        let low = checked_field_address(find_data_ptr, 36, "nFileSizeLow")?;
-        write_guest_u32(engine, high, u32::try_from(next.size >> 32).unwrap_or(0))?;
-        write_guest_u32(
+        write_find_data_w(
             engine,
-            low,
-            u32::try_from(next.size & 0xffff_ffff).unwrap_or(0),
+            find_data_ptr,
+            &next.name,
+            next.attributes,
+            next.size,
+        )?;
+    } else {
+        write_find_data_a(
+            engine,
+            find_data_ptr,
+            &next.name,
+            next.attributes,
+            next.size,
         )?;
     }
     state.last_error = 0;
@@ -3575,7 +3625,10 @@ fn create_new_guest_file(
             std::fs::create_dir_all(parent).map_err(|_| ERROR_PATH_NOT_FOUND)?;
         }
         std::fs::write(host, []).map_err(|_| ERROR_PATH_NOT_FOUND)?;
-        return allocate_open_file(state, guest_path, Vec::new(), Some(host.clone()))
+        // Host-backed creates always stream: a new archive starts at size 0, so the
+        // size-threshold check would otherwise keep the entire growing file in RAM
+        // (7za compression of hundreds of MiB was a classic progressive host-RSS leak).
+        return allocate_open_file_ex(state, guest_path, Vec::new(), Some(host.clone()), true)
             .map_err(|_| ERROR_PATH_NOT_FOUND);
     }
 
@@ -3745,6 +3798,56 @@ fn persist_open_file_to_host(state: &WinApiState, handle: u64) {
             error = %error,
             "failed to persist open file to host"
         );
+    }
+}
+
+/// If a buffered host-backed file has grown past [`crate::vfs::BUFFER_SIZE_THRESHOLD`],
+/// spill once to disk and switch to streaming so further writes do not retain a full
+/// in-memory copy (and do not clone it into `virtual_files` on every close).
+fn maybe_promote_open_file_to_streaming(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+    handle: u64,
+) {
+    let host_path = {
+        let Some(open_file) = find_open_file(state, handle) else {
+            return;
+        };
+        if open_file.streaming {
+            return;
+        }
+        let size_u64 = u64::try_from(open_file.bytes.len()).unwrap_or(0);
+        if size_u64 <= crate::vfs::BUFFER_SIZE_THRESHOLD {
+            return;
+        }
+        let Some(host) = open_file.host_path.as_ref() else {
+            return;
+        };
+        host.clone()
+    };
+    if let Some(parent) = host_path.parent() {
+        drop(std::fs::create_dir_all(parent));
+    }
+    {
+        let Some(open_file) = find_open_file(state, handle) else {
+            return;
+        };
+        if let Err(error) = std::fs::write(&host_path, &open_file.bytes) {
+            tracing::debug!(
+                handle,
+                path = %host_path.display(),
+                error = %error,
+                "failed to spill buffered file to host for streaming promote"
+            );
+            return;
+        }
+    }
+    // Drop any guest I/O mirror (streaming stays on host path only).
+    let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
+    if let Some(open_file) = find_open_file_mut(state, handle) {
+        open_file.bytes.clear();
+        open_file.bytes.shrink_to_fit();
+        open_file.streaming = true;
     }
 }
 
@@ -4583,10 +4686,13 @@ pub fn handle_write_file(
             (path, cursor_before, cursor_after, file_size)
         };
 
-        // Persist writes into the virtual-file store and bottle host path.
+        // Do **not** full-clone / full-rewrite the file on every WriteFile.
+        // That was O(n²) host I/O and a 2× temporary RAM spike while the archive
+        // grew (classic progressive leak during 7za create). Buffered host files
+        // spill once when they cross the streaming threshold; durable flush is
+        // CloseHandle / FlushFileBuffers / SetEndOfFile.
         if !streaming {
-            sync_open_bytes_to_virtual(state, &path, handle);
-            persist_open_file_to_host(state, handle);
+            maybe_promote_open_file_to_streaming(engine, state, handle);
         }
 
         if is_main_module_path(state, &path) {
@@ -4636,10 +4742,36 @@ pub fn handle_write_file(
 }
 
 /// Copies the open handle's buffer into `virtual_files` for the same path.
+///
+/// **Host-backed / streaming files are never mirrored.** Bottle volume paths
+/// (WIE_ROOT / drive-D) used to land here on every CloseHandle because they are
+/// not `host_file_mounts` entries — so opening+closing every source file during
+/// a 7za scan permanently retained full contents in `virtual_files` (session-long
+/// RAM growth proportional to scanned data).
 fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) {
-    let Some(bytes) = find_open_file(state, handle).map(|file| file.bytes.clone()) else {
+    let Some(open_file) = find_open_file(state, handle) else {
         return;
     };
+    // Host path or streaming ⇒ content lives on disk; never retain a second copy.
+    if open_file.host_path.is_some() || open_file.streaming {
+        return;
+    }
+    if is_main_module_path(state, path) {
+        return;
+    }
+    // Volume-mapped paths without an open host_path still must not accumulate.
+    if crate::vfs::guest_path_to_host(&state.volumes, path).is_some() {
+        return;
+    }
+    if state
+        .host_file_mounts
+        .iter()
+        .any(|mount| paths_match_guest(path, &mount.guest_path))
+    {
+        return;
+    }
+
+    let bytes = open_file.bytes.clone();
 
     if let Some(virtual_file) = state
         .virtual_files
@@ -4650,19 +4782,11 @@ fn sync_open_bytes_to_virtual(state: &mut WinApiState, path: &str, handle: u64) 
         return;
     }
 
-    // Host-mounted files stay host-backed on re-open; still keep a virtual overlay so
-    // same-session re-opens of written companions work if mount is absent.
-    if !state
-        .host_file_mounts
-        .iter()
-        .any(|mount| paths_match_guest(path, &mount.guest_path))
-        && !is_main_module_path(state, path)
-    {
-        state.virtual_files.push(crate::VirtualGuestFile {
-            guest_path: path.to_owned(),
-            bytes,
-        });
-    }
+    // Pure in-session virtual files only (no bottle/mount/volume backing).
+    state.virtual_files.push(crate::VirtualGuestFile {
+        guest_path: path.to_owned(),
+        bytes,
+    });
 }
 
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
