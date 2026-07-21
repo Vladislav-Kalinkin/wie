@@ -21,8 +21,9 @@ pub fn dispatch_oleaut32(
         "sysfreestring" | "ordinal 6" => "sysfreestring",
         "sysstringlen" | "ordinal 7" => "sysstringlen",
         "sysstringbyteslen" | "ordinal 8" => "sysstringbyteslen",
-        "variantclear" | "ordinal 9" => "variantclear",
-        "variantcopy" | "ordinal 10" => "variantcopy",
+        "variantinit" | "ordinal 9" => "variantinit", // Исправлено!
+        "variantclear" | "ordinal 10" => "variantclear", // Исправлено!
+        "variantcopy" | "ordinal 11" => "variantcopy", // Исправлено!
         other => other,
     };
     match key {
@@ -33,7 +34,8 @@ pub fn dispatch_oleaut32(
         "sysfreestring" => Ok(Some(handle_sys_free_string(engine, state)?)),
         "sysstringlen" => Ok(Some(handle_sys_string_len(engine)?)),
         "sysstringbyteslen" => Ok(Some(handle_sys_string_byte_len(engine)?)),
-        "variantclear" => Ok(Some(handle_variant_clear(engine)?)),
+        "variantinit" => Ok(Some(handle_variant_init(engine)?)), // Добавлено!
+        "variantclear" => Ok(Some(handle_variant_clear(engine, state)?)),
         "variantcopy" => Ok(Some(handle_variant_copy(engine)?)),
         _ => Ok(None),
     }
@@ -161,12 +163,37 @@ fn handle_sys_string_byte_len(engine: &mut dyn wie_cpu::CpuEngine) -> Result<Win
     ret(engine, u64::from(u32::from_le_bytes(len_bytes)))
 }
 
-/// `HRESULT VariantClear(VARIANTARG*)` — mark empty.
-fn handle_variant_clear(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+/// `void VariantInit(VARIANTARG*)` — set VT_EMPTY.
+fn handle_variant_init(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let pvar = engine.read_rcx()?;
     if pvar != 0 {
-        // VARIANT: vt at offset 0 (2 bytes). VT_EMPTY = 0.
-        engine.mem_write(pvar, &[0_u8; 16])?;
+        engine.mem_write(pvar, &[0_u8; 24])?;
+    }
+    ret(engine, 0)
+}
+
+/// `HRESULT VariantClear(VARIANTARG*)` — mark empty.
+fn handle_variant_clear(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let pvar = engine.read_rcx()?;
+    if pvar != 0 {
+        // 1. Читаем тип варианта (первые 2 байта)
+        let mut vt_bytes = [0_u8; 2];
+        engine.mem_read(pvar, &mut vt_bytes)?;
+        let vt = u16::from_le_bytes(vt_bytes);
+
+        if vt == 8 {
+            let mut bstr_bytes = [0_u8; 8];
+            engine.mem_read(pvar.wrapping_add(8), &mut bstr_bytes)?;
+            let bstr = u64::from_le_bytes(bstr_bytes);
+
+            if bstr != 0 {
+                let _ = state.heap.free_coherent(engine, bstr.wrapping_sub(4));
+            }
+        }
+        engine.mem_write(pvar, &[0_u8; 24])?;
     }
     ret(engine, 0) // S_OK
 }
@@ -176,7 +203,8 @@ fn handle_variant_copy(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHand
     let dest = engine.read_rcx()?;
     let src = engine.read_rdx()?;
     if dest != 0 && src != 0 {
-        let mut buf = [0_u8; 16];
+        // Копируем честные 24 байта x64 структуры VARIANT
+        let mut buf = [0_u8; 24];
         engine.mem_read(src, &mut buf)?;
         engine.mem_write(dest, &buf)?;
     }

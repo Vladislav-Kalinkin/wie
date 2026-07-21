@@ -91,7 +91,10 @@ impl RuntimeMemoryLayout {
             // Must not collide with common PE ImageBase values (0x400000 and
             // modern 0x140000000). Formerly 0x140000000 — broke micro-PEs on Unicorn.
             process_heap_base: 0x0000_0001_6000_0000,
-            process_heap_size: 0x0100_0000,
+            // 512 MiB: 16 MiB exhausted while 7za scanned ~60k-file trees (malloc→0
+            // → CRT `_CxxThrowException` → Int3). mmap is demand-zero; RSS grows on use.
+            // Override with `WIE_PROCESS_HEAP_MB`. Room before shadow at base+1GiB.
+            process_heap_size: 0x2000_0000,
             process_heap_shadow_delta: 0x0000_0001_0000_0000,
             teb_low_base: 0x0000_0000_0000_0000,
             teb_low_size: 0x1000,
@@ -141,6 +144,41 @@ impl RuntimeMemoryLayout {
     #[must_use]
     pub const fn fast_void_return_stub_va(self) -> u64 {
         self.fast_api_stub_base
+    }
+
+    /// Apply environment overrides (`WIE_PROCESS_HEAP_MB`).
+    ///
+    /// Heap size is fixed at session start (contiguous mmap arena). Raise it for
+    /// large guest workloads (directory scans that pin many CRT allocations).
+    #[must_use]
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(raw) = std::env::var("WIE_PROCESS_HEAP_MB") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                match trimmed.parse::<u64>() {
+                    Ok(mb) if mb > 0 => {
+                        // Cap at 16 GiB — enough for heavy tools, avoids absurd maps.
+                        let mb = mb.min(16 * 1024);
+                        let bytes = usize::try_from(mb.saturating_mul(1024 * 1024)).unwrap_or(self.process_heap_size);
+                        // Keep at least 1 MiB so freelist math stays sane.
+                        self.process_heap_size = bytes.max(1024 * 1024);
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            value = %raw,
+                            "WIE_PROCESS_HEAP_MB must be > 0; keeping default process heap size"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            value = %raw,
+                            "invalid WIE_PROCESS_HEAP_MB; keeping default process heap size"
+                        );
+                    }
+                }
+            }
+        }
+        self
     }
 }
 

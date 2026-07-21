@@ -253,6 +253,41 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 - GUI 7-Zip / `7zFM` / full installer PE.
 - Password / crypto, solid multi-file update, or every format beyond default `.7z` LZMA2.
 
+### Known issue: multi‑GiB / many‑file `7za a` “super-test” (open)
+
+Small and medium `7za` create/list/extract gates (README universal example, MT micros) **work**. A **heavy** create over a large host tree via `--drive-d` is **not** green yet.
+
+**Target command** (local stress only; not CI):
+
+```bash
+B="/tmp/w7z_heavy_$$" && mkdir -p "$B/drive_c/App"
+time env WIE_RUNTIME_PROFILE=1 ./target/release/wie-cli run \
+  --root "$B" \
+  --drive-d "/path/to/large_tree" \   # e.g. ~10 GiB, tens of thousands of files
+  --max-api 2000000 \
+  real_exes/7za.exe -- \
+  a -mmt4 -mx=1 -md=64k -bd 'C:\App\huge_cache.7z' 'D:\'
+rm -rf "$B"
+```
+
+| Stage | Symptom | Status / notes |
+| ----- | ------- | -------------- |
+| Directory scan (~60k files) | `malloc` → `0` → `msvcrt!_CxxThrowException` → `unimplemented mnemonic Int3` | **Mitigated:** default process heap raised to **512 MiB** (was 16 MiB); override with `WIE_PROCESS_HEAP_MB`. `_CxxThrowException` now fails with an explicit OOM/EH message instead of bare Int3. |
+| Same scan, large heap, **JIT** | Host `thread 'main' has overflowed its stack` | **Mitigated:** JIT block chaining nests host C frames; **`MAX_CHAIN_DEPTH` (48)** returns to the dispatcher instead of unbounded nesting. |
+| After scan / early archive create | `invalid memory access … address=0x7f…` (guest read of unmapped VA) | **Open.** Scan can finish and print folder/file counts; create then faults. Needs more isolation (heap vs JIT chain vs VFS timestamps / file APIs). |
+| Full 10 GiB compress + roundtrip | Successful super-test + README claim | **Not done** — left for a dedicated session (long wall time). |
+
+**Related knobs**
+
+| Knob | Role |
+| ---- | ---- |
+| `WIE_PROCESS_HEAP_MB` | Process-heap size in MiB (default **512**; mmap demand-zero, RSS grows on use). Raise further if huge scans still OOM. |
+| `WIE_JIT_CHAIN=0` | Disable late-bound block chaining (debug / bisect host-stack vs correctness). |
+| `WIE_CPU=iced` | Interpreter-only; useful to separate JIT chain issues from WinAPI/VFS bugs. |
+| `--max-api` | Must be large (`2e6`–`2e7+`); scan alone is hundreds of thousands of charged APIs. |
+
+When this path exits `0` end-to-end under default JIT, document it here as a successful super-test (command + measured wall/profile).
+
 ## Core Components
 
 | Crate             | Role                                                                                                                                                                                                                             |
@@ -318,6 +353,7 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 | `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**)                                                             |
 | `WIE_JIT_VERIFY=1`                        | Enable Cranelift IR verifier outside tests                                                          |
 | `WIE_RUNTIME_PROFILE=1`                   | Wall/CPU%, host stops, JIT load/store counts, `mem_backend`                                         |
+| `WIE_PROCESS_HEAP_MB`                     | Guest process-heap size in MiB (default **512**; large `7za` scans used to OOM at 16 MiB)           |
 | `WIE_API_JOURNAL=path`                    | Per-API journal for backend A/B diffs                                                               |
 | `WIE_ROOT` / `--root`                     | Bottle root for guest `C:\` file APIs                                                               |
 | `WIE_DRIVE_D` / `--drive-d`               | Host root for guest `D:\` bridge (`auto` = host cwd); unset = no D:                                 |

@@ -864,7 +864,15 @@ fn handle_type_info_dtor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
 }
 
 fn handle_cxx_throw_exception(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
-    let _ = (engine.read_rcx()?, engine.read_rdx()?);
-    // No C++ EH — return and hope caller doesn't depend on catch.
-    ret(engine, 0)
+    let pexception_object = engine.read_rcx()?;
+    let pthrow_info = engine.read_rdx()?;
+    // No C++ EH / SEH unwinding yet. Returning into the thrower used to hit
+    // `int3` and an opaque "unimplemented mnemonic Int3". Surface a stop with
+    // context instead — common trigger is CRT `operator new` after `malloc`
+    // returned NULL (process heap exhausted; raise `WIE_PROCESS_HEAP_MB`).
+    anyhow::bail!(
+        "msvcrt!_CxxThrowException (no C++ EH): pExceptionObject={pexception_object:#x} \
+         pThrowInfo={pthrow_info:#x}; often std::bad_alloc after process-heap OOM \
+         (default heap is large; try WIE_PROCESS_HEAP_MB=1024 if scans are huge)"
+    )
 }

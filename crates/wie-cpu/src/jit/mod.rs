@@ -993,6 +993,8 @@ impl JitCpu {
             sticky_prot: self.sticky_prot,
             sticky_gen: self.sticky_gen,
             sticky_rr: self.sticky_rr,
+            // Fresh dispatcher entry always starts a new host-chain budget.
+            chain_depth: 0,
         };
         // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
         unsafe {

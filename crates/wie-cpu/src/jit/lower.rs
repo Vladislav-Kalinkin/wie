@@ -288,6 +288,13 @@ pub(super) struct JitCtx {
     pub sticky_gen: [u64; STICKY_WAYS],
     /// Round-robin victim for sticky install.
     pub sticky_rr: u64,
+    /// Host call-chain depth for block chaining (`emit_chain_or_exit`).
+    ///
+    /// Each chain hop is a host `call` into the next compiled block. Unbounded
+    /// depth overflows the host stack on long guest call trees (7za large scans).
+    /// When this hits [`MAX_CHAIN_DEPTH`], chaining returns to the Rust dispatcher
+    /// with RIP already set so the next block re-enters without nesting.
+    pub chain_depth: u64,
 }
 
 /// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).
@@ -347,6 +354,14 @@ const OFF_STICKY_PAGE: i32 = std::mem::offset_of!(JitCtx, sticky_page) as i32;
 const OFF_STICKY_PTR: i32 = std::mem::offset_of!(JitCtx, sticky_ptr) as i32;
 const OFF_STICKY_PROT: i32 = std::mem::offset_of!(JitCtx, sticky_prot) as i32;
 const OFF_STICKY_GEN: i32 = std::mem::offset_of!(JitCtx, sticky_gen) as i32;
+const OFF_CHAIN_DEPTH: i32 = std::mem::offset_of!(JitCtx, chain_depth) as i32;
+
+/// Max nested host frames for JIT block chaining.
+///
+/// Guest `call`/`jmp`/`ret` chain via host C `call` into the successor block.
+/// ~48 keeps most hot chains in-process while staying well under default host
+/// stacks even with large Cranelift frames (seen: stack overflow on 7za scan).
+pub(super) const MAX_CHAIN_DEPTH: u64 = 48;
 
 // Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
 const _: () = {
@@ -370,6 +385,7 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, sticky_ptr) as i32 == OFF_STICKY_PTR);
     assert!(std::mem::offset_of!(JitCtx, sticky_prot) as i32 == OFF_STICKY_PROT);
     assert!(std::mem::offset_of!(JitCtx, sticky_gen) as i32 == OFF_STICKY_GEN);
+    assert!(std::mem::offset_of!(JitCtx, chain_depth) as i32 == OFF_CHAIN_DEPTH);
     assert!(STICKY_WAYS > 0);
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
@@ -1790,7 +1806,8 @@ fn shadow_pop_check(
 /// Writeback + set RIP + call successor (direct or late-bound), then return.
 ///
 /// Uses host C ABI `call`/`call_indirect` (not Tail/`return_call`) so blocks stay
-/// callable from Rust as `extern "C"`.
+/// callable from Rust as `extern "C"`. Nesting is capped by [`MAX_CHAIN_DEPTH`]:
+/// past the limit we return to the Rust dispatcher with RIP already advanced.
 fn emit_chain_or_exit(
     bcx: &mut FunctionBuilder<'_>,
     ctx_ptr: Value,
@@ -1821,8 +1838,31 @@ fn emit_chain_or_exit(
         rflags_ptr,
         store_flags,
     );
+
+    // Host-stack guard: each hop nests a C frame. Cap and re-enter from Rust.
+    let depth_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_DEPTH));
+    let depth = bcx.ins().load(types::I64, flags, depth_ptr, 0);
+    let max_d = iconst_u64(bcx, MAX_CHAIN_DEPTH);
+    let too_deep = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, depth, max_d);
+    let deep_blk = bcx.create_block();
+    let chain_blk = bcx.create_block();
+    bcx.ins().brif(too_deep, deep_blk, &[], chain_blk, &[]);
+
+    bcx.switch_to_block(deep_blk);
+    bcx.seal_block(deep_blk);
+    // RIP + GPRs already written; pop back to the dispatcher.
+    bcx.ins().return_(&[]);
+
+    bcx.switch_to_block(chain_blk);
+    bcx.seal_block(chain_blk);
+    let depth1 = bcx.ins().iadd_imm(depth, 1);
+    bcx.ins().store(flags, depth1, depth_ptr, 0);
+
     if let Some(f) = href {
         bcx.ins().call(f, &[ctx_ptr]);
+        bcx.ins().store(flags, depth, depth_ptr, 0);
         bcx.ins().return_(&[]);
         return;
     }
@@ -1854,6 +1894,7 @@ fn emit_chain_or_exit(
     bcx.switch_to_block(ic_hit_blk);
     bcx.seal_block(ic_hit_blk);
     bcx.ins().call_indirect(block_sig_ref, ic_fn, &[ctx_ptr]);
+    bcx.ins().store(flags, depth, depth_ptr, 0);
     bcx.ins().return_(&[]);
 
     bcx.switch_to_block(ic_miss_blk);
@@ -1868,9 +1909,12 @@ fn emit_chain_or_exit(
     bcx.switch_to_block(hit_blk);
     bcx.seal_block(hit_blk);
     bcx.ins().call_indirect(block_sig_ref, fn_ptr, &[ctx_ptr]);
+    bcx.ins().store(flags, depth, depth_ptr, 0);
     bcx.ins().return_(&[]);
     bcx.switch_to_block(miss_blk);
     bcx.seal_block(miss_blk);
+    // No nested call — restore depth before the ordinary exit path.
+    bcx.ins().store(flags, depth, depth_ptr, 0);
     jump_exit(bcx, exit, gpr, rflags);
 }
 

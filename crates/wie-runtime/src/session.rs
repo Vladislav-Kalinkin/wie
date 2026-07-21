@@ -562,6 +562,7 @@ impl RuntimeSession {
         path: &std::path::Path,
         idle_policy: wie_winapi::MessageQueueIdlePolicy,
     ) -> Result<Self> {
+        // `new_with_options` applies `RuntimeMemoryLayout::with_env_overrides`.
         Self::new_with_options(path, idle_policy, DEFAULT_LAYOUT, SessionOptions::default())
     }
 
@@ -582,6 +583,10 @@ impl RuntimeSession {
         options: SessionOptions,
     ) -> Result<Self> {
         let t_init = Instant::now();
+        // Env heap override applies even when callers pass `DEFAULT_LAYOUT` explicitly
+        // (CLI / tests). Callers that need a fixed size should set a non-default size
+        // after `with_env_overrides`, or clear the env var.
+        let layout = layout.with_env_overrides();
         let mut soft_apis = SoftApiTable::default();
         // MT.4: plant Interlocked* (and other soft-only GPA targets) at fixed
         // soft indices 0..N so GetProcAddress encode_unresolved matches.
