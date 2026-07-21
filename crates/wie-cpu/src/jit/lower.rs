@@ -2724,6 +2724,8 @@ enum ShiftKind {
     Sar,
     Rol,
     Ror,
+    Rcl,
+    Rcr,
 }
 
 /// Deferred flag computation from the last flag-writing ALU (lazy flags).
@@ -2822,6 +2824,8 @@ fn materialize_shift_flags(
     let is_one = bcx.ins().icmp_imm(IntCC::Equal, count_mod, 1);
     let sign = iconst_u64(bcx, 1_u64 << bits.saturating_sub(1).min(63));
     let sb = iconst_u64(bcx, u64::from(bits.saturating_sub(1)));
+    // Capture old CF before the match (needed by Rcl/Rcr).
+    let old_cf = flag_bit(bcx, old_rflags, rflags::CF);
 
     let cf_bit = match kind {
         ShiftKind::Shl => {
@@ -2845,6 +2849,17 @@ fn materialize_shift_flags(
         ShiftKind::Ror => {
             let cf = bcx.ins().ushr(result, sb);
             bcx.ins().band(cf, one)
+        }
+        ShiftKind::Rcl => {
+            // Rcl CF = old CF when count_mod==0, else low bit of result
+            let rbit = bcx.ins().band(result, one);
+            bcx.ins().select(is_zero, old_cf, rbit)
+        }
+        ShiftKind::Rcr => {
+            // Rcr CF = old CF when count_mod==0, else high bit of result
+            let rbit = bcx.ins().ushr(result, sb);
+            let rbit = bcx.ins().band(rbit, one);
+            bcx.ins().select(is_zero, old_cf, rbit)
         }
     };
 
@@ -2873,6 +2888,12 @@ fn materialize_shift_flags(
             let b2 = bcx.ins().band(lo_sh, one);
             bcx.ins().icmp(IntCC::NotEqual, b1, b2)
         }
+        ShiftKind::Rcl | ShiftKind::Rcr => {
+            // Rcl/Rcr OF = (CF XOR result[63]) when count_mod==1
+            let hi = bcx.ins().ushr(result, sb);
+            let hi_bit = bcx.ins().band(hi, one);
+            bcx.ins().icmp(IntCC::NotEqual, cf_bit, hi_bit)
+        }
     };
     let of_new = select_flag(bcx, of_cond, rflags::OF);
     let old_of = flag_bit(bcx, old_rflags, rflags::OF);
@@ -2883,7 +2904,7 @@ fn materialize_shift_flags(
     let cf_on = select_flag(bcx, cf_set, rflags::CF);
     new_flags = replace_flag(bcx, new_flags, rflags::CF, cf_on);
     new_flags = replace_flag(bcx, new_flags, rflags::OF, of_merged);
-    if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar) {
+    if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar | ShiftKind::Rcl | ShiftKind::Rcr) {
         new_flags = flags_zs_pf(bcx, new_flags, result, bits);
     }
     // count_mod == 0: architectural flags unchanged
@@ -2908,11 +2929,33 @@ fn lower_insn(
         Mnemonic::Movsx | Mnemonic::Movsxd => {
             lower_movx(bcx, instr, gpr, dirty, *rflags, mem, true)
         }
+        // Cwde: sign-extend AX(16)→EAX(32), Cdqe: sign-extend EAX(32)→RAX(64).
+        Mnemonic::Cwde | Mnemonic::Cdqe => lower_cwde_cdqe(bcx, instr, gpr, dirty),
         Mnemonic::Lea => lower_lea(bcx, instr, gpr, dirty),
         Mnemonic::Push => lower_push(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Pop => lower_pop(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Xchg => lower_xchg(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Not => lower_not(bcx, instr, gpr, dirty, *rflags, mem),
+        // Bit test ops: flush pending flags, set CF directly.
+        Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr => {
+            flush_pending(bcx, rflags, pending);
+            lower_bit_test_op(bcx, instr, gpr, dirty, rflags, mem)
+        }
+        // Xadd: exchange and add — flush flags, swap dst↔src, set flags as ADD.
+        Mnemonic::Xadd => {
+            flush_pending(bcx, rflags, pending);
+            lower_xadd(bcx, instr, gpr, dirty, rflags, mem)
+        }
+        // CmpXchg: compare and exchange — flush flags, atomically compare with accumulator.
+        Mnemonic::Cmpxchg => {
+            flush_pending(bcx, rflags, pending);
+            lower_cmpxchg(bcx, instr, gpr, dirty, rflags, mem)
+        }
+        // Bsr: bit scan reverse — flush flags, find most significant set bit.
+        Mnemonic::Bsr => {
+            flush_pending(bcx, rflags, pending);
+            lower_bsr(bcx, instr, gpr, dirty, rflags, mem)
+        }
         // Lazy-capable ALU (overwrite pending without materializing).
         Mnemonic::Add => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Add),
         Mnemonic::Sub => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Sub),
@@ -2964,6 +3007,12 @@ fn lower_insn(
         }
         Mnemonic::Ror => {
             lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Ror)
+        }
+        Mnemonic::Rcl => {
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Rcl)
+        }
+        Mnemonic::Rcr => {
+            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Rcr)
         }
         m @ (Mnemonic::Cmove
         | Mnemonic::Cmovne
@@ -3595,6 +3644,26 @@ fn lower_shift_lazy(
             let left_amt = bcx.ins().isub(bits_v, count_mod);
             let left = bcx.ins().ishl(dst, left_amt);
             bcx.ins().bor(left, right)
+        }
+        ShiftKind::Rcl => {
+            // Rcl: CF into LSB, shift left by count, MSB into CF
+            let cf_val = flag_bit(bcx, *rflags, rflags::CF);
+            let left = bcx.ins().ishl(dst, count_mod);
+            let right_amt = bcx.ins().isub(bits_v, count_mod);
+            let right = bcx.ins().ushr(dst, right_amt);
+            let cf_shift = bcx.ins().ishl(cf_val, right_amt);
+            let tmp = bcx.ins().bor(left, right);
+            bcx.ins().bor(tmp, cf_shift)
+        }
+        ShiftKind::Rcr => {
+            // Rcr: CF into MSB, shift right by count
+            let cf_val = flag_bit(bcx, *rflags, rflags::CF);
+            let right = bcx.ins().ushr(dst, count_mod);
+            let left_amt = bcx.ins().isub(bits_v, count_mod);
+            let left = bcx.ins().ishl(dst, left_amt);
+            let cf_shift = bcx.ins().ishl(cf_val, left_amt);
+            let tmp = bcx.ins().bor(left, right);
+            bcx.ins().bor(tmp, cf_shift)
         }
     };
     let result = mask_width(bcx, result_raw, bits);
@@ -4582,6 +4651,37 @@ fn extend_value(bcx: &mut FunctionBuilder<'_>, src: Value, src_bits: u32, signed
     }
 }
 
+/// Cwde: sign-extend AX (16-bit) to EAX (32-bit).
+/// Cdqe: sign-extend EAX (32-bit) to RAX (64-bit).
+/// Both are implicit-accumulator, register-only operations.
+fn lower_cwde_cdqe(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+) -> Result<(), String> {
+    let rax = gpr[0]; // RAX
+    let val = if instr.mnemonic() == Mnemonic::Cwde {
+        // Cwde: sign-extend AX (bottom 16 bits) to 32-bit EAX (bottom 32 bits).
+        // Read RAX, ireduce to I16, sextend to I64 (which zeros upper 32 bits
+        // in Cranelift's 64-bit representation), then mask into RAX.
+        let low16 = bcx.ins().ireduce(types::I16, rax);
+        let ext = bcx.ins().sextend(types::I64, low16);
+        // Merge: keep RAX[63:32] unchanged, replace RAX[31:0] with ext[31:0].
+        // Since ext is sign-extended, its upper 32 bits are copies of bit 31.
+        // But x86 Cwde zero-extends into EAX (upper 32 bits of RAX unchanged).
+        // Actually on x86-64, Cwde writes to EAX which zero-extends to RAX.
+        // So RAX = zero_extend(sign_extend(AX)).
+        ext
+    } else {
+        // Cdqe: sign-extend EAX (bottom 32 bits) to RAX (full 64 bits).
+        // On x86-64, Cdqe writes to RAX (full 64-bit dest).
+        let low32 = bcx.ins().ireduce(types::I32, rax);
+        bcx.ins().sextend(types::I64, low32)
+    };
+    write_gpr(bcx, gpr, dirty, Register::RAX, val)
+}
+
 fn lower_lea(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -4877,6 +4977,197 @@ fn lower_imul(
     let of_on = select_flag(bcx, overflow, rflags::OF);
     let f = replace_flag(bcx, *rflags, rflags::CF, cf_on);
     *rflags = replace_flag(bcx, f, rflags::OF, of_on);
+    Ok(())
+}
+
+/// Lower Bt/Bts/Btr (bit test/set/reset) with direct flag write.
+/// Flushes pending flags first, then reads the dest, computes the bit,
+/// sets CF in rflags, and for Bts/Btr writes the modified value back.
+fn lower_bit_test_op(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let bits = op_width_bits(instr, 0)?;
+    let val_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
+    let val = mask_width(bcx, val_raw, bits);
+
+    // Compute bit index from operand 1 (register or immediate).
+    let bit_idx = if instr.op1_kind() == OpKind::Register {
+        let idx_raw = read_gpr(gpr, instr.op_register(1))?;
+        mask_width(bcx, idx_raw, 32) // x86 masks to 5/6/7 bits depending on size
+    } else {
+        let imm = read_imm(bcx, instr, 1);
+        mask_width(bcx, imm, 32)
+    };
+
+    // Mask bit index by operand size (x86: 5 bits for 32-bit, 6 for 64-bit).
+    let max_bits = if bits == 64 {
+        iconst_u64(bcx, 63)
+    } else {
+        iconst_u64(bcx, 31) // 32-bit: 5-bit mask
+    };
+    let idx_masked = bcx.ins().band(bit_idx, max_bits);
+
+    // Compute the bit value at `idx_masked` -> CF = (val >> idx_masked) & 1
+    let shifted = bcx.ins().ushr(val, idx_masked);
+    let one = iconst_u64(bcx, 1);
+    let bit_val = bcx.ins().band(shifted, one);
+    let is_set = bcx.ins().icmp_imm(IntCC::NotEqual, bit_val, 0);
+    let cf_on = select_flag(bcx, is_set, rflags::CF);
+    *rflags = replace_flag(bcx, *rflags, rflags::CF, cf_on);
+
+    // For Bts/Btr, write back the modified value.
+    let mnemonic = instr.mnemonic();
+    if mnemonic == Mnemonic::Bts || mnemonic == Mnemonic::Btr {
+        let bit_mask = bcx.ins().ishl(one, idx_masked);
+        let new_val = if mnemonic == Mnemonic::Bts {
+            // Set the bit: val | (1 << idx)
+            bcx.ins().bor(val, bit_mask)
+        } else {
+            // Clear the bit: val & !(1 << idx)
+            let not_mask = bcx.ins().bnot(bit_mask);
+            bcx.ins().band(val, not_mask)
+        };
+        let new_val_full = if bits < 64 {
+            // Preserve upper bits
+            let full_mask = iconst_u64(bcx, (1_u64 << bits) - 1);
+            let not_full = bcx.ins().bnot(full_mask);
+            let cleared = bcx.ins().band(val_raw, not_full);
+            bcx.ins().bor(cleared, new_val)
+        } else {
+            new_val
+        };
+        write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, new_val_full, bits)?;
+    }
+
+    Ok(())
+}
+
+/// Lower Xadd (exchange and add): temp = dst; dst = dst + src; src = temp.
+/// Sets ADD flags. Flushes pending flags before operation.
+fn lower_xadd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let bits = op_width_bits(instr, 0)?;
+    let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
+    let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
+    let dst_val = mask_width(bcx, dst_raw, bits);
+    let src_val = mask_width(bcx, src_raw, bits);
+
+    // sum = dst + src (for flags)
+    let sum = if bits == 64 {
+        bcx.ins().iadd(dst_val, src_val)
+    } else {
+        let d = bcx.ins().ireduce(types::I32, dst_val);
+        let s = bcx.ins().ireduce(types::I32, src_val);
+        bcx.ins().iadd(d, s)
+    };
+    let sum_ext = sext_to_i64(bcx, sum, bits.min(32));
+
+    // Write sum to dst (operand 0)
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, sum_ext, bits)?;
+
+    // Write original dst to src (operand 1) — src is always a register
+    write_gpr(bcx, gpr, dirty, instr.op_register(1), dst_val)?;
+
+    // Set ADD flags
+    *rflags = flags_add(bcx, *rflags, dst_val, src_val, sum_ext, bits.min(32));
+    Ok(())
+}
+
+/// Lower CmpXchg (compare and exchange):
+/// Compare dst with accumulator (AL/AX/EAX/RAX). If equal, dst = src, else accumulator = dst.
+/// Sets ZF based on the comparison. Flushes pending flags before operation.
+fn lower_cmpxchg(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let bits = op_width_bits(instr, 0)?;
+    let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
+    let dst_val = mask_width(bcx, dst_raw, bits);
+    let src_val = read_gpr(gpr, instr.op_register(1))?;
+    let acc_val = mask_width(bcx, gpr[0], bits); // RAX/EAX/AX/AL
+
+    // Compare dst with acc: ZF = (dst == acc)
+    let eq = bcx.ins().icmp(IntCC::Equal, dst_val, acc_val);
+
+    // Compute result: if equal, new_dst = src, else accumulator = dst
+    let new_dst = bcx.ins().select(eq, src_val, dst_val);
+
+    // Write to dst
+    write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, new_dst, bits)?;
+
+    // Write to accumulator (RAX) when not equal
+    let old_rax = gpr[0];
+    let ext_dst = sext_to_i64(bcx, dst_val, bits);
+    let new_rax = bcx.ins().select(eq, old_rax, ext_dst);
+    write_gpr(bcx, gpr, dirty, Register::RAX, new_rax)?;
+
+    // Set ZF based on comparison
+    let zf_on = select_flag(bcx, eq, rflags::ZF);
+    *rflags = replace_flag(bcx, *rflags, rflags::ZF, zf_on);
+    // Architectural: CF, OF, SF, AF, PF may be set based on the comparison but
+    // Intel docs mark them as undefined for CmpXchg.
+    Ok(())
+}
+
+/// Lower Bsr (bit scan reverse): scan src for most significant 1 bit.
+/// If src == 0: ZF=1, dst undefined.
+/// If src != 0: ZF=0, dst = index of most significant set bit.
+fn lower_bsr(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: &mut Value,
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let bits = op_width_bits(instr, 1)?;
+    let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
+    let src_val = mask_width(bcx, src_raw, bits);
+
+    // Use Cranelift ctlz (count leading zeros) to find MSB position.
+    // Bsr result = bit_width - 1 - ctlz(val) when val != 0
+    let bit_width: u32 = if bits <= 32 { 32 } else { 64 };
+    let src_ext = if bits < 64 {
+        if bits <= 32 {
+            let reduced = bcx.ins().ireduce(types::I32, src_val);
+            bcx.ins().uextend(types::I64, reduced)
+        } else {
+            src_val
+        }
+    } else {
+        src_val
+    };
+
+    let bw_val = iconst_u64(bcx, u64::from(bit_width.saturating_sub(1)));
+    let clz = bcx.ins().clz(src_ext);
+    let msb = bcx.ins().isub(bw_val, clz);
+
+    // ZF = (src == 0)
+    let zero_c = iconst_u64(bcx, 0);
+    let is_zero = bcx.ins().icmp(IntCC::Equal, src_ext, zero_c);
+
+    // Result: if zero, undefined (write 0); else write MSB index
+    let result = bcx.ins().select(is_zero, zero_c, msb);
+    write_gpr(bcx, gpr, dirty, instr.op_register(0), result)?;
+
+    // Set ZF flag
+    let zf_on = select_flag(bcx, is_zero, rflags::ZF);
+    *rflags = replace_flag(bcx, *rflags, rflags::ZF, zf_on);
     Ok(())
 }
 

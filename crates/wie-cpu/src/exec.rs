@@ -17,6 +17,10 @@ use crate::CpuError;
 use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
+#[cfg(debug_assertions)]
+use std::sync::LazyLock;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Access type codes matching Unicorn-ish invalid-memory reporting (0=read,1=write,2=fetch).
 pub(crate) const ACCESS_READ: i32 = 0;
@@ -41,7 +45,23 @@ pub(crate) enum StepResult {
     InvalidMemory(InvalidMem),
 }
 
+/// Iced-interpreter mnemonic counters (activated by WIE_EXEC_TRACE=1).
+#[cfg(debug_assertions)]
+static ICED_COUNTERS: LazyLock<Box<[AtomicU64]>> = LazyLock::new(|| {
+    std::iter::repeat_with(|| AtomicU64::new(0))
+        .take(2048)
+        .collect()
+});
+#[cfg(debug_assertions)]
+static ICED_TRACE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("WIE_EXEC_TRACE").is_ok_and(|v| v == "1"));
+
 /// Decode + execute one instruction at `regs.rip`.
+///
+/// Lightweight tracer: the first time each non-JIT mnemonic is interpreted,
+/// it is logged once at `info` level (opt-in: `WIE_EXEC_TRACE=1`).  Run with
+/// `WIE_EXEC_TRACE=1 7za …` to discover which instructions keep code in the
+/// interpreter rather than the JIT.
 pub(crate) fn step(
     mem: &mut GuestMemory,
     regs: &mut RegFile,
@@ -74,6 +94,16 @@ pub(crate) fn step(
         return Err(CpuError::Message(format!(
             "invalid instruction at {rip:#x}"
         )));
+    }
+
+    // Tracer: count how many times each mnemonic hits the interpreter.
+    // Activated by WIE_EXEC_TRACE=1 in debug builds only.
+    #[cfg(debug_assertions)]
+    if *ICED_TRACE_ENABLED {
+        let m = instr.mnemonic() as usize;
+        if m < ICED_COUNTERS.len() {
+            ICED_COUNTERS[m].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let next_ip = instr.next_ip();
@@ -656,9 +686,7 @@ fn exec_arith(
             regs.set_flag(rflags::CF, u128::from(d) < wide_src);
             let d_s = i128::from(sign_extend(d, size));
             let s_s = i128::from(sign_extend(s, size));
-            let expected = d_s
-                .wrapping_sub(s_s)
-                .wrapping_sub(i128::from(cf != 0));
+            let expected = d_s.wrapping_sub(s_s).wrapping_sub(i128::from(cf != 0));
             let got = i128::from(sign_extend(r, size));
             regs.set_flag(rflags::OF, expected != got);
             write_op(mem, regs, instr, 0, r)?;
@@ -2135,6 +2163,33 @@ fn write_accumulator(regs: &mut RegFile, size: usize, value: u64) -> Result<(), 
             Ok(())
         }
     }
+}
+
+/// Dump iced-interpreter mnemonic counters to stderr (top N by count).
+/// Activated by the `WIE_EXEC_TRACE` env var. Call after a guest session ends
+/// to see which x86-64 instructions keep code in the interpreter.
+/// Dump iced-interpreter mnemonic counters to stderr.
+/// Only available in debug builds; activated by `WIE_EXEC_TRACE=1`.
+#[cfg(debug_assertions)]
+#[allow(dead_code)]
+pub(crate) fn dump_iced_counters() {
+    use std::sync::atomic::Ordering;
+
+    let mut pairs: Vec<(u64, u16)> = Vec::new();
+    for (i, c) in ICED_COUNTERS.iter().enumerate() {
+        let count = c.load(Ordering::Relaxed);
+        if count == 0 {
+            continue;
+        }
+        pairs.push((count, i as u16));
+    }
+    pairs.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let total: u64 = pairs.iter().map(|(c, _)| c).sum();
+    eprintln!("--- iced-interp mnemonic counts (total={total}) ---");
+    for (count, idx) in &pairs {
+        eprintln!("{count:>8} Mnemonic({idx})");
+    }
+    eprintln!("--- end ---");
 }
 
 fn branch_target(

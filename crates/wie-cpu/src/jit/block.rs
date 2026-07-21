@@ -7,7 +7,7 @@ use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKin
 /// Raised to capture longer pure loop bodies in one native frame.
 pub(super) const MAX_BLOCK_INSNS: usize = 96;
 /// Min instructions before paying Cranelift compile cost (short blocks lose wall).
-pub(super) const MIN_BLOCK_INSNS: usize = 8;
+pub(super) const MIN_BLOCK_INSNS: usize = 4;
 
 /// One decoded guest insn kept for the lowerer.
 #[derive(Debug, Clone)]
@@ -202,8 +202,10 @@ fn is_near_branch(instr: &Instruction) -> bool {
 
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
-        Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 => true,
-        // LEA: all standard SIB forms (base/index*1|2|4|8 + disp) + RIP-relative.
+        // Nop, endbranch, sign-extension: always lowerable.
+        Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Cwde | Mnemonic::Cdqe => {
+            true
+        }
         Mnemonic::Lea => lea_is_simple(instr),
         Mnemonic::Mov => mov_is_lowerable(instr),
         Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd => movx_is_lowerable(instr),
@@ -218,7 +220,10 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::And
         | Mnemonic::Or
         | Mnemonic::Cmp
-        | Mnemonic::Test => alu_is_lowerable(instr),
+        | Mnemonic::Test
+        | Mnemonic::Bt
+        | Mnemonic::Bts
+        | Mnemonic::Btr => alu_is_lowerable(instr),
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
         Mnemonic::Imul => imul_is_lowerable(instr),
         Mnemonic::Xchg => xchg_is_lowerable(instr),
@@ -227,7 +232,21 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Shr
         | Mnemonic::Sar
         | Mnemonic::Rol
-        | Mnemonic::Ror => shift_is_lowerable(instr),
+        | Mnemonic::Ror
+        | Mnemonic::Rcl
+        | Mnemonic::Rcr => shift_is_lowerable(instr),
+        // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register).
+        Mnemonic::Xadd | Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
+            (OpKind::Register, OpKind::Register) => true,
+            (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
+            _ => false,
+        },
+        // Bsr: bit scan reverse — dst reg, src reg/mem.
+        Mnemonic::Bsr => match (instr.op0_kind(), instr.op1_kind()) {
+            (OpKind::Register, OpKind::Register) => true,
+            (OpKind::Register, OpKind::Memory) => mem_ea_ok(instr) && mem_size_ok(instr),
+            _ => false,
+        },
         Mnemonic::Cmove
         | Mnemonic::Cmovne
         | Mnemonic::Cmova

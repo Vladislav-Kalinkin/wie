@@ -179,17 +179,63 @@ impl GuestStubKind {
     }
 
     /// Whether the body must be planted outside the IAT slot (jmp trampoline at entry).
+    ///
+    /// Uses an **exhaustive `match`** — every variant must be listed.  When a new
+    /// variant is added to [`GuestStubKind`], the compiler forces the developer
+    /// to consider whether it needs an out-of-line helper.
     #[must_use]
     pub(crate) fn needs_out_of_line_helper(self) -> bool {
-        matches!(
-            self,
-            Self::FlsGetValue { .. }
-                | Self::FlsSetValue { .. }
-                | Self::LoadU32FromTable { .. }
-                | Self::GetCurrentDirectoryW { .. }
-                | Self::Initterm
-                | Self::InittermE
-        )
+        // Exhaustive match: every variant must be listed.  No catch-all `_` arm.
+        match self {
+            Self::VoidRet => false,
+            Self::IdentityRcxToRax => false,
+            Self::ReturnZero => false,
+            Self::ReturnImm32(_) => false,
+            Self::ReturnImm64(_) => false,
+            Self::LoadZx32FromVa(_) => false,
+            Self::StoreEcxToVa(_) => false,
+            Self::FlsGetValue { .. } => true,
+            Self::FlsSetValue { .. } => true,
+            Self::AcrtIobFunc => false,
+            Self::LoadU32FromTable { .. } => true,
+            Self::SysColorBrush { .. } => false,
+            Self::GetCurrentDirectoryW { .. } => true,
+            Self::Initterm => true,
+            Self::InittermE => true,
+        }
+    }
+
+    /// Whether this kind embeds a guest address from the runtime config.
+    ///
+    /// When `true`, the cached `stub_kind` from `make_entry` (computed with
+    /// `CLASSIFY_ONLY` — all VAs zero) must be re-derived with the real config
+    /// before its body can be encoded.  Simple stubs (`VoidRet`, `ReturnZero`,
+    /// …) never need re-classification.
+    ///
+    /// Uses an **exhaustive `match`** — every variant must be listed.  When a new
+    /// variant is added to [`GuestStubKind`], the compiler forces the developer
+    /// to choose whether it needs re-classification.  There is no catch-all
+    /// `_` arm, so forgetting is a compile error, not a runtime bug.
+    #[must_use]
+    pub(crate) fn needs_real_guest_addresses(&self) -> bool {
+        // Exhaustive match: every variant must be listed.  No catch-all `_` arm.
+        match self {
+            Self::VoidRet => false,
+            Self::IdentityRcxToRax => false,
+            Self::ReturnZero => false,
+            Self::ReturnImm32(_) => false,
+            Self::ReturnImm64(_) => true, // GetCommandLineA/W, GetProcessHeap, GetDesktopWindow
+            Self::LoadZx32FromVa(_) => true, // TEB_LAST_ERROR_VA (constant, but safe to re-classify)
+            Self::StoreEcxToVa(_) => true,   // TEB_LAST_ERROR_VA (same)
+            Self::FlsGetValue { .. } => true,
+            Self::FlsSetValue { .. } => true,
+            Self::AcrtIobFunc => false,
+            Self::LoadU32FromTable { .. } => true,
+            Self::SysColorBrush { .. } => true, // FAKE_SYSCOLOR_BRUSH_BASE constant — harmless re-classify
+            Self::GetCurrentDirectoryW { .. } => true,
+            Self::Initterm => false,
+            Self::InittermE => false,
+        }
     }
 }
 
@@ -656,6 +702,11 @@ fn fake_sys_color(color_index: u64) -> u64 {
 /// Writes guest stubs into the fake-API mapping and builds a stop-bit mask.
 ///
 /// Bitmap: bit=1 means "host must stop here", bit=0 means passthrough (guest stub).
+///
+/// Uses the pre-computed `stub_kind` cached on each entry during `make_entry`
+/// — the kind variant is correct, but the embedded addresses (table_va, etc.)
+/// were set to zero (CLASSIFY_ONLY).  We re-classify only the entries that
+/// need real addresses: those whose kind embeds a VA (FlsGetValue, etc.).
 pub(crate) fn plant_guest_stubs(
     engine: &mut dyn wie_cpu::CpuEngine,
     entries: &[crate::hooks::RuntimeFakeApiEntry],
@@ -672,8 +723,18 @@ pub(crate) fn plant_guest_stubs(
     let helper_end = helper_code_base.saturating_add(helper_code_size as u64);
 
     for entry in entries {
-        let Some(kind) = classify_guest_stub(&entry.library, &entry.name, cfg) else {
-            continue;
+        let kind = match &entry.stub_kind {
+            // Most stub kinds embed the VA in the kind itself (set in make_entry
+            // with CLASSIFY_ONLY — VA is 0).  Re-classify only those that need
+            // a real guest address from the config.
+            Some(kind) if kind.needs_real_guest_addresses() => {
+                match classify_guest_stub(&entry.library, &entry.name, cfg) {
+                    Some(real_kind) => real_kind,
+                    None => continue,
+                }
+            }
+            Some(kind) => *kind,
+            None => continue,
         };
         let body = kind.encode();
         let va = entry.fake_target_va;
@@ -781,5 +842,114 @@ mod tests {
         assert!(classify_guest_stub("KERNEL32.dll", "EnterCriticalSection", &cfg).is_none());
         assert!(classify_guest_stub("KERNEL32.dll", "LeaveCriticalSection", &cfg).is_none());
         assert!(classify_guest_stub("KERNEL32.dll", "DeleteCriticalSection", &cfg).is_none());
+    }
+
+    /// Every known guest-stub classification: if the `CLASSIFY_ONLY` body differs
+    /// from the real-config body, the kind **must** declare that it needs
+    /// re-classification via [`GuestStubKind::needs_real_guest_addresses`].
+    ///
+    /// This catches cases where a new stub kind embeds a config-dependent guest
+    /// address but the author forgets to add the variant to the `matches!` list
+    /// in `needs_real_guest_addresses`. Without this guard the stub would be
+    /// planted with address zero for all cfg-derived addresses.
+    #[test]
+    fn every_stub_needing_real_addresses_is_listed() {
+        // Every (library, name) pair that `classify_guest_stub` can return `Some` for.
+        // When a new stub is added to `classify_guest_stub`, add it here too.
+        let stubs: &[(&str, &str)] = &[
+            // UCRT / CRT
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__acrt_iob_func"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_initterm"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_initterm_e"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "fflush"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "setvbuf"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_crt_atexit"),
+            (
+                "api-ms-win-crt-runtime-l1-1-0.dll",
+                "_set_invalid_parameter_handler",
+            ),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_app_type"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_set_new_mode"),
+            (
+                "api-ms-win-crt-runtime-l1-1-0.dll",
+                "_configure_narrow_argv",
+            ),
+            (
+                "api-ms-win-crt-runtime-l1-1-0.dll",
+                "_initialize_narrow_environment",
+            ),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__setusermatherr"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_configthreadlocale"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "_cexit"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "signal"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__environ"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p___argv"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p___argc"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__commode"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__fmode"),
+            ("api-ms-win-crt-runtime-l1-1-0.dll", "__p__acmdln"),
+            // USER32
+            ("USER32.dll", "GetSystemMetrics"),
+            ("USER32.dll", "GetSysColor"),
+            ("USER32.dll", "GetSysColorBrush"),
+            ("USER32.dll", "GetDesktopWindow"),
+            // KERNEL32 / ntdll
+            ("KERNEL32.dll", "EncodePointer"),
+            ("KERNEL32.dll", "DecodePointer"),
+            ("KERNEL32.dll", "GetLastError"),
+            ("KERNEL32.dll", "SetLastError"),
+            ("KERNEL32.dll", "FlsGetValue"),
+            ("KERNEL32.dll", "FlsSetValue"),
+            ("KERNEL32.dll", "SetHandleCount"),
+            ("KERNEL32.dll", "OutputDebugStringA"),
+            ("KERNEL32.dll", "OutputDebugStringW"),
+            ("KERNEL32.dll", "GetTickCount"),
+            ("KERNEL32.dll", "GetCurrentProcessId"),
+            ("KERNEL32.dll", "GetCurrentThreadId"),
+            ("KERNEL32.dll", "IsDebuggerPresent"),
+            ("KERNEL32.dll", "GetACP"),
+            ("KERNEL32.dll", "GetOEMCP"),
+            ("KERNEL32.dll", "GetSystemDefaultLangID"),
+            ("KERNEL32.dll", "GetUserDefaultLangID"),
+            ("KERNEL32.dll", "GetCurrentProcess"),
+            ("KERNEL32.dll", "GetProcessHeap"),
+            ("KERNEL32.dll", "GetCommandLineA"),
+            ("KERNEL32.dll", "GetCommandLineW"),
+            ("KERNEL32.dll", "GetCurrentDirectoryW"),
+        ];
+
+        let real_cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
+
+        for &(library, name) in stubs {
+            let kind0 = classify_guest_stub(library, name, &GuestStubConfig::CLASSIFY_ONLY);
+            let kind1 = classify_guest_stub(library, name, &real_cfg);
+
+            match (kind0, kind1) {
+                (Some(k0), Some(k1)) => {
+                    let body0 = k0.encode();
+                    let body1 = k1.encode();
+                    if body0 != body1 {
+                        assert!(
+                            k0.needs_real_guest_addresses(),
+                            "GuestStubKind variant for {library}!{name} produces \
+                             different machine code with CLASSIFY_ONLY vs real config \
+                             (k0={k0:?}, k1={k1:?}). \
+                             Add this variant to `needs_real_guest_addresses()`.",
+                        );
+                    }
+                }
+                (Some(_), None) => {
+                    panic!("{library}!{name}: classifies with CLASSIFY_ONLY but not with real cfg");
+                }
+                (None, Some(_)) => {
+                    panic!("{library}!{name}: classifies with real cfg but not with CLASSIFY_ONLY");
+                }
+                (None, None) => {
+                    panic!(
+                        "{library}!{name}: no longer classifies as a guest stub; remove from test"
+                    );
+                }
+            }
+        }
     }
 }
