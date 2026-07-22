@@ -80,9 +80,9 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 WIE models **1:1 host thread ↔ guest thread**. Each guest thread runs on its own `CpuEngine`. The engine model depends on the backend:
 
 - **JIT** (`WIE_CPU=jit`, default): each guest thread gets its own `JitCpu` instance sharing a common compiled-code cache (`Arc<JitShared>`). No engine mutex — threads execute guest code in parallel, serializing only on the shared WinAPI state mutex (for kernel object access, heap, etc.).
-- **Iced** (`WIE_CPU=iced`, interpreter fallback): each thread gets its own `IcedCpu` sharing a common `GuestMemory` behind `Arc<Mutex<>>`. Threads interpret guest code in parallel, only serializing on the guest memory mutex for page-table operations and on the shared WinAPI state mutex.
+- **Iced** (`WIE_CPU=iced`, interpreter fallback): each thread gets its own `IcedCpu` sharing a common `GuestMemory` behind `Arc<RwLock<GuestMemory>>`. Threads interpret guest code in parallel; guest memory reads/writes take a shared `RwLock` read guard, while page-table operations (map/protect/free) take the write lock; WinAPI state remains behind the shared mutex.
 
-When a thread parks (`WaitFor*`, contended critical section, …) it drops the WinAPI lock (and in the Iced case, the engine lock) so other threads can make progress.
+When a thread parks (`WaitFor*`, contended critical section, …) it drops the WinAPI lock so other threads can make progress.
 
 | Surface                                                        | Status |
 | -------------------------------------------------------------- | ------ |
