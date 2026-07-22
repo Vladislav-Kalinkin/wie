@@ -13,8 +13,6 @@ use wie_cpu::JitCpu;
 use wie_winapi::{HostParkReason, PendingSpawn, WinApiControlSignal, WinApiState};
 use wie_winapi::kernel32::{resolve_cs_queue, resolve_wait_target};
 
-// ── Helper: lock a mutex, recovering the lock on poison ───────────────
-
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -448,25 +446,25 @@ fn iced_worker_main(
                     let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
                     let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                     if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
-                    drop(eng.return_from_win64_api(u64::from(result)));
+                    eng.return_from_win64_api(u64::from(result))
+                        .expect("return_from_win64_api: guest stack corrupted");
                 }
                 HostParkReason::WaitMultiple => {
                     let req = {
-                        let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut st = lock(&shared_winapi);
                         st.sync.multi_wait.remove(&tid)
                     };
                     let result = wait_multiple_result(req, &shared_winapi, tid);
-                    let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
-                    let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut eng = lock(&shared_engine);
+                    let st = lock(&shared_winapi);
                     if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
-                    drop(eng.return_from_win64_api(u64::from(result)));
+                    eng.return_from_win64_api(u64::from(result))
+                        .expect("return_from_win64_api: guest stack corrupted");
                 }
             }
         }
     }
 }
-
-// ── Park helpers ──────────────────────────────────────────────────────
 
 fn handle_park_jit(
     engine: &mut Box<dyn wie_cpu::CpuEngine>,
@@ -488,19 +486,21 @@ fn handle_park_jit(
                 resolve_wait_target(&st, handle)
             };
             let result = wait_on_target(target, timeout_ms, shared_winapi, tid);
-            let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+            let st = lock(shared_winapi);
             if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
-            drop(engine.return_from_win64_api(u64::from(result)));
+            engine.return_from_win64_api(u64::from(result))
+                .expect("return_from_win64_api: guest stack corrupted");
         }
         HostParkReason::WaitMultiple => {
             let req = {
-                let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                let mut st = lock(shared_winapi);
                 st.sync.multi_wait.remove(&tid)
             };
             let result = wait_multiple_result(req, shared_winapi, tid);
-            let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+            let st = lock(shared_winapi);
             if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
-            drop(engine.return_from_win64_api(u64::from(result)));
+            engine.return_from_win64_api(u64::from(result))
+                .expect("return_from_win64_api: guest stack corrupted");
         }
     }
 }

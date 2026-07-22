@@ -1718,7 +1718,8 @@ impl RuntimeSession {
                             };
                             self.process.with_mut(|eng, st| {
                                 crate::mt_runtime::load_thread(eng, st, primary_tid);
-                                drop(eng.return_from_win64_api(u64::from(result)));
+                                eng.return_from_win64_api(u64::from(result))
+                                    .expect("return_from_win64_api: guest stack corrupted");
                                 crate::mt_runtime::save_thread(eng, st, primary_tid);
                             });
                             charged_api = charged_api.saturating_add(1);
@@ -1745,7 +1746,8 @@ impl RuntimeSession {
                             };
                             self.process.with_mut(|eng, st| {
                                 crate::mt_runtime::load_thread(eng, st, primary_tid);
-                                drop(eng.return_from_win64_api(u64::from(result)));
+                                eng.return_from_win64_api(u64::from(result))
+                                    .expect("return_from_win64_api: guest stack corrupted");
                                 crate::mt_runtime::save_thread(eng, st, primary_tid);
                             });
                             charged_api = charged_api.saturating_add(1);
