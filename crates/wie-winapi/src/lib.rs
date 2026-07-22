@@ -30,9 +30,9 @@ pub mod vfs;
 pub mod winmm;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
 pub use sync_obj::{
-    CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, PendingSpawn, STILL_ACTIVE,
-    SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
-    wait_multiple,
+    CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, MultiWaitRequest, PendingSpawn,
+    STILL_ACTIVE, SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    WaitTarget, wait_multiple,
 };
 pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
 // HostParkReason is defined with WinApiControlSignal below.

@@ -8,11 +8,11 @@ use crate::memory::{
     DEFAULT_LAYOUT, RuntimeMemoryLayout, build_default_environment_strings_w,
     default_winapi_environment, default_winapi_state, write_process_identity_strings,
 };
-use crate::mt_runtime::ProcessResources;
+use crate::mt_runtime::{self, ProcessConfig, ProcessState};
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Bootstrap options for a new guest session (argv / stdin injection).
@@ -473,8 +473,8 @@ fn register_layout_regions(
 /// The session owns the CPU engine, guest memory, WinAPI state and
 /// dispatcher metadata so execution can yield and later resume.
 pub struct RuntimeSession {
-    /// CPU + WinAPI (local until first `CreateThread`, then shared).
-    process: ProcessResources,
+    /// CPU + WinAPI (Jit or Iced state, determined at construction).
+    process: ProcessState,
     entry_point_va: u64,
     initial_rsp: u64,
     next_api_index: usize,
@@ -503,24 +503,48 @@ struct SessionInit {
 impl RuntimeSession {
     fn from_init(init: SessionInit) -> Self {
         let profile_enabled = std::env::var_os("WIE_RUNTIME_PROFILE").is_some();
+        let entry_point_va = init.entry_point_va;
+        let initial_rsp = init.initial_rsp;
+        let process = Self::build_process(init);
         Self {
-            process: ProcessResources::new(
-                init.engine,
-                init.winapi_state,
-                init.soft_apis,
-                init.environment,
-                init.layout,
-                init.stop_bitmap,
-                init.shared_jit,
-            ),
-            entry_point_va: init.entry_point_va,
-            initial_rsp: init.initial_rsp,
+            process,
+            entry_point_va,
+            initial_rsp,
             next_api_index: 0,
             no_hook_slices: 0,
             pending_callbacks: Vec::new(),
             profile_enabled,
             profile: RuntimeProfile::default(),
             last_published_last_error: None,
+        }
+    }
+
+    fn build_process(init: SessionInit) -> ProcessState {
+        let SessionInit { engine, environment, winapi_state, soft_apis, layout, stop_bitmap, shared_jit, .. } = init;
+        let config = ProcessConfig {
+            soft_apis,
+            environment,
+            layout,
+            stop_bitmap,
+            primary_tid: wie_winapi::PRIMARY_THREAD_ID,
+        };
+        let shared_winapi = Arc::new(Mutex::new(winapi_state));
+
+        if let Some(jit) = shared_jit {
+            ProcessState::Jit(mt_runtime::JitState {
+                config,
+                engine,
+                shared_jit: jit,
+                shared_winapi,
+                worker_joins: Vec::new(),
+            })
+        } else {
+            ProcessState::Iced(mt_runtime::IcedState {
+                config,
+                shared_engine: Arc::new(Mutex::new(engine)),
+                shared_winapi,
+                worker_joins: Vec::new(),
+            })
         }
     }
 
@@ -1130,7 +1154,7 @@ impl RuntimeSession {
     /// Returns the guest memory layout used by this session.
     #[must_use]
     pub fn layout(&self) -> RuntimeMemoryLayout {
-        self.process.layout
+        *self.process.layout()
     }
 
     /// Changes the behavior of `GetMessageA` when the queue is empty.
@@ -1147,10 +1171,10 @@ impl RuntimeSession {
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
     /// or processes `max_api` additional API calls.
     pub fn run_until_stop(&mut self, max_api: usize) -> Result<RuntimeRunSummary> {
-        let layout = self.process.layout;
-        let environment = self.process.environment;
-        let soft_apis = self.process.soft_apis.clone();
-        let primary_tid = self.process.primary_tid;
+        let layout = *self.process.layout();
+        let environment = *self.process.environment();
+        let soft_apis = self.process.soft_apis().clone();
+        let primary_tid = self.process.primary_tid();
 
         let fake_api_size_u64 =
             u64::try_from(layout.fake_api_size).context("fake API size does not fit u64")?;
@@ -1903,7 +1927,7 @@ impl RuntimeSession {
         outer_name: &str,
         outer_fake_va: u64,
     ) -> Result<()> {
-        let trampoline = self.process.layout.callback_return_trampoline_va;
+        let trampoline = self.process.layout().callback_return_trampoline_va;
         let dispatch_rsp = self.process.with_mut(|engine, _| {
             crate::guest_callback::install_guest_callback_frame(engine, &request, trampoline)
         })?;
