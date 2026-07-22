@@ -91,21 +91,25 @@ impl IcedCpu {
 
     /// Runtime hook window (JIT consults stop-bitmap before entering a block).
     #[must_use]
+    #[expect(dead_code)]
     pub(crate) fn hooks_ref(&self) -> Option<&HookWindow> {
         self.hooks.as_ref()
     }
 
     /// Read guest bytes without going through the `CpuEngine` trait (JIT decode).
+    #[expect(dead_code)]
     pub(crate) fn mem_read_into(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
         self.mem.read(address, bytes)
     }
 
     /// Mutable guest memory pointer for JIT host load/store callbacks.
+    #[expect(dead_code)]
     pub(crate) fn guest_mem_mut(&mut self) -> &mut GuestMemory {
         &mut self.mem
     }
 
     /// Immutable guest memory (code invalidation span lookup, etc.).
+    #[expect(dead_code)]
     pub(crate) fn guest_mem(&self) -> &GuestMemory {
         &self.mem
     }

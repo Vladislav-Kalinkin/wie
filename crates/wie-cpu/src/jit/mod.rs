@@ -13,6 +13,7 @@
 
 #![allow(
     unsafe_code, // Cranelift finalized fn pointers + host mem helpers
+    private_interfaces, // JitShared/PerThreadJitState expose crate-private types
     clippy::indexing_slicing, // fixed gpr[0..16]
     clippy::as_conversions,
     clippy::cast_possible_truncation,
@@ -26,9 +27,9 @@ mod trampolines;
 
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
-use crate::exec::{self, StepResult};
-use crate::iced_cpu::IcedCpu;
-use crate::mem::{self, PAGE_SIZE, PAGE_SIZE_USIZE, protect};
+use crate::exec::{self, StepResult, HookWindow};
+use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE, protect};
+use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
 use block::{BlockKind, decode_pure_gpr_block, pure_is_self_loop};
@@ -43,6 +44,7 @@ use lower::{
     wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
 };
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 use trampolines::match_micro_stub;
 
 /// Compile after this many visits to the same guest entry (skip cold code).
@@ -187,65 +189,165 @@ fn jit_chain_enabled() -> bool {
     })
 }
 
-/// Hybrid CPU: Cranelift for hot pure-GPR blocks, iced for everything else.
-///
-/// Contains raw host pointers (TLB / pins) that are only valid while the
-/// process map is live. MT.2 moves the engine across host threads under a
-/// process mutex and calls [`CpuEngine::on_thread_switch`] on each switch.
-pub struct JitCpu {
-    iced: IcedCpu,
-    /// `None` if host ISA / JIT module failed to open (always fall back to iced).
-    engine: Option<JitEngine>,
-    /// Guest block entry VA → cache entry.
-    cache: HashMap<u64, CacheEntry>,
-    /// Ready-block FuncIds for chaining (kept in sync with `cache`; avoids
-    /// rebuilding a full HashMap on every compile).
-    chain_ids: HashMap<u64, cranelift_module::FuncId>,
-    stats: JitStats,
-    /// Persistent set-associative page TLB across chained blocks (invalidate on protect/free).
-    tlb_sets: [TlbBucket; TLB_SETS],
-    tlb_aux: [TlbBucketAux; TLB_SETS],
-    /// Sticky last-hit page for inline IR mem path (mirror of multi sticky).
-    tlb_hot_page: u64,
-    tlb_hot_ptr: *mut u8,
-    tlb_hot_prot: u64,
-    tlb_hot_gen: u64,
-    /// Multi sticky ways (last-N pages for IR probes).
-    sticky_page: [u64; STICKY_WAYS],
-    sticky_ptr: [*mut u8; STICKY_WAYS],
-    sticky_prot: [u64; STICKY_WAYS],
-    sticky_gen: [u64; STICKY_WAYS],
-    sticky_rr: u64,
-    /// Region-direct pins (rebuilt each `run_compiled` from layout + PageMap).
-    pins: [MemPin; PIN_SLOTS],
-    /// Fake-API VA → fast UCRT kind (dense pairs; compile-time lookup).
-    fast_api: Vec<(u64, FastApiKind)>,
+/// Shared JIT state: Cranelift module + compilation cache + guest memory.
+/// One instance per process, shared via Arc across all per-thread engines.
+#[doc(hidden)]
+pub struct JitShared {
+    /// Cranelift JIT module (behind Mutex: compiled blocks are serialized anyway).
+    #[doc(hidden)]
+    pub engine: Mutex<Option<JitEngine>>,
+    /// Guest memory: page tables, mmap backend. Mutex protects metadata.
+    #[doc(hidden)]
+    pub mem: Mutex<GuestMemory>,
+    /// Guest entry VA → CacheEntry.
+    #[doc(hidden)]
+    pub cache: RwLock<HashMap<u64, CacheEntry>>,
+    /// Ready-block FuncIds for chaining.
+    #[doc(hidden)]
+    pub chain_ids: RwLock<HashMap<u64, cranelift_module::FuncId>>,
+    /// Guest page keys covered by Ready blocks (SMC tracking).
+    #[doc(hidden)]
+    pub code_pages: Mutex<HashMap<u64, u32>>,
+}
+
+impl JitShared {
+    fn new() -> Self {
+        Self {
+            engine: Mutex::new(match JitEngine::new() {
+                Ok(e) => {
+                    tracing::info!("cranelift JIT module ready");
+                    Some(e)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cranelift JIT unavailable; iced-only");
+                    None
+                }
+            }),
+            mem: Mutex::new(GuestMemory::new()),
+            cache: RwLock::new(HashMap::new()),
+            chain_ids: RwLock::new(HashMap::new()),
+            code_pages: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+// SAFETY: GuestMemory behind Mutex; raw pointers in GuestMemory are
+// non-owning views of mmap arenas that live for the process lifetime.
+// Mutex provides synchronization for the metadata; JIT hot path uses
+// per-thread TLB with host pointers directly.
+#[expect(unsafe_code)]
+unsafe impl Send for JitShared {}
+#[expect(unsafe_code)]
+unsafe impl Sync for JitShared {}
+
+/// Per-thread JIT execution state: registers, TLB, chain table, shadow stack.
+/// One instance per guest thread. Not shared.
+#[doc(hidden)]
+pub struct PerThreadJitState {
+    /// x86-64 register file.
+    #[doc(hidden)]
+    pub regs: RegFile,
+    /// Runtime hook window (stop-bitmap for fake-API range).
+    #[doc(hidden)]
+    pub hooks: Option<HookWindow>,
+    /// Recent RIP history for diagnostics (ring buffer).
+    pub rip_trace: [u64; 32],
+    pub rip_trace_i: usize,
+    pub rip_trace_n: usize,
+    /// Instructions retired via interpreter (Phase 0 baselines).
+    pub iced_steps: u64,
+    /// Persistent set-associative page TLB across chained blocks.
+    pub tlb_sets: [TlbBucket; TLB_SETS],
+    pub tlb_aux: [TlbBucketAux; TLB_SETS],
+    /// Sticky last-hit page for inline IR mem path.
+    pub tlb_hot_page: u64,
+    pub tlb_hot_ptr: *mut u8,
+    pub tlb_hot_prot: u64,
+    pub tlb_hot_gen: u64,
+    /// Multi sticky ways.
+    pub sticky_page: [u64; STICKY_WAYS],
+    pub sticky_ptr: [*mut u8; STICKY_WAYS],
+    pub sticky_prot: [u64; STICKY_WAYS],
+    pub sticky_gen: [u64; STICKY_WAYS],
+    pub sticky_rr: u64,
+    /// Region-direct pins.
+    pub pins: [MemPin; PIN_SLOTS],
+    /// Generation at which pins were last rebuilt.
+    pub pins_gen: u64,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
-    chain_va: Box<[u64; CHAIN_SLOTS]>,
-    chain_fn: Box<[u64; CHAIN_SLOTS]>,
-    /// Phase 4.2 monomorphic edge IC (data plane; cleared with chain table).
-    edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
-    edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
-    edge_ic_rr: u64,
-    /// Shadow return-stack depth across block entries (persisted in `run_compiled`).
-    shadow_sp: u64,
-    shadow_ret: [u64; lower::SHADOW_DEPTH],
-    /// Phase 4.x: guest page keys (`va >> 12`) covered by at least one Ready block.
-    /// Refcount = number of Ready blocks spanning that page (overlapping blocks).
-    code_pages: HashMap<u64, u32>,
-    /// Previous `GuestMemory::generation` at last `run_compiled` (gen-bump diag).
-    last_mem_gen: u64,
-    /// Generation at which [`Self::pins`] was last rebuilt (skip fill when stable).
-    pins_gen: u64,
+    pub chain_va: Box<[u64; CHAIN_SLOTS]>,
+    pub chain_fn: Box<[u64; CHAIN_SLOTS]>,
+    /// Phase 4.2 monomorphic edge IC.
+    pub edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
+    pub edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
+    pub edge_ic_rr: u64,
+    /// Shadow return-stack depth.
+    pub shadow_sp: u64,
+    pub shadow_ret: [u64; lower::SHADOW_DEPTH],
 }
 
 // SAFETY: TLB/pin raw pointers are non-owning views of guest mmap arenas.
-// WIE serializes all engine use with a process mutex under MT; thread switch
-// invalidates sticky translations via `on_thread_switch`.
+// Each PerThreadJitState is owned by one host thread; never moved between threads.
+#[expect(unsafe_code)]
+unsafe impl Send for PerThreadJitState {}
+
+impl PerThreadJitState {
+    fn new() -> Self {
+        Self {
+            regs: RegFile::new(),
+            hooks: None,
+            rip_trace: [0; 32],
+            rip_trace_i: 0,
+            rip_trace_n: 0,
+            iced_steps: 0,
+            tlb_sets: [empty_tlb_bucket(); TLB_SETS],
+            tlb_aux: [empty_tlb_aux(); TLB_SETS],
+            tlb_hot_page: TLB_EMPTY,
+            tlb_hot_ptr: std::ptr::null_mut(),
+            tlb_hot_prot: 0,
+            tlb_hot_gen: 0,
+            sticky_page: [TLB_EMPTY; STICKY_WAYS],
+            sticky_ptr: [std::ptr::null_mut(); STICKY_WAYS],
+            sticky_prot: [0; STICKY_WAYS],
+            sticky_gen: [0; STICKY_WAYS],
+            sticky_rr: 0,
+            pins: [MemPin::EMPTY; PIN_SLOTS],
+            pins_gen: u64::MAX,
+            chain_va: Box::new([0; CHAIN_SLOTS]),
+            chain_fn: Box::new([0; CHAIN_SLOTS]),
+            edge_ic_va: [0; lower::EDGE_IC_SLOTS],
+            edge_ic_fn: [0; lower::EDGE_IC_SLOTS],
+            edge_ic_rr: 0,
+            shadow_sp: 0,
+            shadow_ret: [0; lower::SHADOW_DEPTH],
+        }
+    }
+}
+
+/// Hybrid CPU: Cranelift for hot pure-GPR blocks, iced for everything else.
+///
+/// Holds a shared compilation cache + guest memory (Arc) and per-thread
+/// execution state (registers, TLB, chain table, shadow stack).
+pub struct JitCpu {
+    /// Shared compilation cache + guest memory (one per process).
+    pub(crate) shared: Arc<JitShared>,
+    /// Per-thread execution state (registers, TLB, chain table, etc.).
+    pub(crate) thread: PerThreadJitState,
+    /// Fake-API VA → fast UCRT kind (per-thread; configured once during init).
+    pub(crate) fast_api: Vec<(u64, FastApiKind)>,
+    /// Diagnostic counters (per-thread).
+    pub(crate) stats: JitStats,
+    /// Previous `GuestMemory::generation` at last `run_compiled` (diag).
+    pub(crate) last_mem_gen: u64,
+}
+
+// SAFETY: Arc<JitShared> is Send + Sync (via unsafe impl above).
+// PerThreadJitState is Send (raw pointers owned by one thread).
 #[expect(unsafe_code)]
 unsafe impl Send for JitCpu {}
 
-enum CacheEntry {
+#[doc(hidden)]
+pub enum CacheEntry {
     /// Native block ready to run.
     Ready(CompiledBlock),
     /// Do not retry decode/compile at this VA (cold fail or non-pure).
@@ -255,7 +357,7 @@ enum CacheEntry {
     Hot { visits: u32, thr: u32 },
 }
 
-struct JitEngine {
+pub(crate) struct JitEngine {
     module: cranelift_jit::JITModule,
     ctx: cranelift_codegen::Context,
     func_ctx: cranelift::prelude::FunctionBuilderContext,
@@ -415,47 +517,25 @@ impl JitCpu {
     /// Open hybrid JIT on the host ISA (ARM64 on Apple Silicon).
     #[must_use]
     pub fn open_x86_64() -> Self {
-        let engine = match JitEngine::new() {
-            Ok(e) => {
-                tracing::info!("cranelift JIT module ready");
-                Some(e)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "cranelift JIT unavailable; iced-only");
-                None
-            }
-        };
+        let shared = JitShared::new();
         Self {
-            iced: IcedCpu::open_x86_64(),
-            engine,
-            cache: HashMap::new(),
-            chain_ids: HashMap::new(),
-            stats: JitStats {
-                ..JitStats::default()
-            },
-            tlb_sets: [empty_tlb_bucket(); TLB_SETS],
-            tlb_aux: [empty_tlb_aux(); TLB_SETS],
-            tlb_hot_page: TLB_EMPTY,
-            tlb_hot_ptr: std::ptr::null_mut(),
-            tlb_hot_prot: 0,
-            tlb_hot_gen: 0,
-            sticky_page: [TLB_EMPTY; STICKY_WAYS],
-            sticky_ptr: [std::ptr::null_mut(); STICKY_WAYS],
-            sticky_prot: [0; STICKY_WAYS],
-            sticky_gen: [0; STICKY_WAYS],
-            sticky_rr: 0,
-            pins: [MemPin::EMPTY; PIN_SLOTS],
+            shared: Arc::new(shared),
+            thread: PerThreadJitState::new(),
             fast_api: Vec::new(),
-            chain_va: Box::new([0; CHAIN_SLOTS]),
-            chain_fn: Box::new([0; CHAIN_SLOTS]),
-            edge_ic_va: [0; lower::EDGE_IC_SLOTS],
-            edge_ic_fn: [0; lower::EDGE_IC_SLOTS],
-            edge_ic_rr: 0,
-            shadow_sp: 0,
-            shadow_ret: [0; lower::SHADOW_DEPTH],
-            code_pages: HashMap::new(),
+            stats: JitStats::default(),
             last_mem_gen: 0,
-            pins_gen: u64::MAX, // force first fill
+        }
+    }
+
+    /// Create a per-thread engine sharing the compilation cache + guest memory.
+    #[must_use]
+    pub fn new_shared(shared: Arc<JitShared>) -> Self {
+        Self {
+            shared,
+            thread: PerThreadJitState::new(),
+            fast_api: Vec::new(),
+            stats: JitStats::default(),
+            last_mem_gen: 0,
         }
     }
 
@@ -469,7 +549,6 @@ impl JitCpu {
     pub fn configure_fast_path(&mut self, cfg: JitFastPathConfig) {
         install_heap_layout(cfg.heap);
         self.fast_api = cfg.pairs;
-        // New mappings invalidate prior compiles that missed the fast path.
         self.clear_compiled();
         self.invalidate_chain_and_shadow();
     }
@@ -481,89 +560,103 @@ impl JitCpu {
             .find_map(|&(k, kind)| (k == va).then_some(kind))
     }
 
-    /// Insert a Ready block and keep `chain_ids` + code-page index consistent.
     fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
-        if let Some(CacheEntry::Ready(old)) = self.cache.remove(&rip) {
-            self.code_pages_remove_range(old.guest_start, old.guest_end);
-            self.chain_ids.remove(&rip);
+        let removed = {
+            let mut cache = self.shared.cache.write().unwrap();
+            let old = cache.remove(&rip);
+            if let Some(CacheEntry::Ready(ref old)) = old {
+                self.shared.chain_ids.write().unwrap().remove(&rip);
+                Some((old.guest_start, old.guest_end))
+            } else {
+                None
+            }
+        };
+        if let Some((gs, ge)) = removed {
+            self.code_pages_remove_range(gs, ge);
         }
         if jit_chain_enabled()
             && let Some(fid) = compiled.func_id
         {
-            self.chain_ids.insert(rip, fid);
+            self.shared.chain_ids.write().unwrap().insert(rip, fid);
         }
         self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
-        self.cache.insert(rip, CacheEntry::Ready(compiled));
+        self.shared.cache.write().unwrap().insert(rip, CacheEntry::Ready(compiled));
     }
 
-    /// Drop all compiled blocks (self-modifying code / hook reinstall).
     fn clear_compiled(&mut self) {
-        self.cache.clear();
-        self.chain_ids.clear();
-        self.code_pages.clear();
+        self.shared.cache.write().unwrap().clear();
+        self.shared.chain_ids.write().unwrap().clear();
+        self.shared.code_pages.lock().unwrap().clear();
     }
 
-    /// Phase 4.x: drop Ready blocks whose guest code range overlaps `[addr, addr+len)`.
-    ///
-    /// Also clears **edge IC** + chain table + shadow, then rebuilds the chain
-    /// from survivors. Data writes that miss the code-page index are a no-op.
     fn invalidate_code_range(&mut self, addr: u64, len: usize) {
-        if self.cache.is_empty() || len == 0 {
-            return;
+        {
+            let cache = self.shared.cache.read().unwrap();
+            if cache.is_empty() || len == 0 {
+                return;
+            }
         }
-        // Fast reject: no Ready block covers any page in the write range.
         if !self.code_pages_overlap(addr, len) {
             return;
         }
         let write_end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-        let to_drop: Vec<u64> = self
-            .cache
-            .iter()
-            .filter_map(|(va, entry)| match entry {
-                CacheEntry::Ready(c)
-                    if ranges_overlap(c.guest_start, c.guest_end, addr, write_end) =>
-                {
-                    Some(*va)
-                }
-                _ => None,
-            })
-            .collect();
+        let to_drop: Vec<u64> = {
+            let cache = self.shared.cache.read().unwrap();
+            cache
+                .iter()
+                .filter_map(|(va, entry)| match entry {
+                    CacheEntry::Ready(c)
+                        if ranges_overlap(c.guest_start, c.guest_end, addr, write_end) =>
+                    {
+                        Some(*va)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         if to_drop.is_empty() {
             return;
         }
         for va in &to_drop {
-            if let Some(CacheEntry::Ready(c)) = self.cache.remove(va) {
+            let mut cache = self.shared.cache.write().unwrap();
+            if let Some(CacheEntry::Ready(c)) = cache.remove(va) {
+                drop(cache);
                 self.code_pages_remove_range(c.guest_start, c.guest_end);
             }
-            self.chain_ids.remove(va);
+            self.shared.chain_ids.write().unwrap().remove(va);
         }
         self.stats.code_invs = self.stats.code_invs.saturating_add(1);
-        // Drop chain + edge IC + shadow; rebuild chain from remaining Ready.
         self.invalidate_chain_and_shadow();
         if jit_chain_enabled() {
-            for (va, entry) in &self.cache {
+            let cache = self.shared.cache.read().unwrap();
+            for (va, entry) in &*cache {
                 if let CacheEntry::Ready(c) = entry {
                     let fn_ptr = c.func as usize as u64;
-                    chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), *va, fn_ptr);
+                    chain_table_insert(
+                        self.thread.chain_va.as_mut(),
+                        self.thread.chain_fn.as_mut(),
+                        *va,
+                        fn_ptr,
+                    );
                 }
             }
         }
     }
 
-    /// True if any guest page in `[addr, addr+len)` is covered by a Ready block.
     #[inline]
     fn code_pages_overlap(&self, addr: u64, len: usize) -> bool {
-        if len == 0 || self.code_pages.is_empty() {
+        let code_pages = self.shared.code_pages.lock().unwrap();
+        if len == 0 || code_pages.is_empty() {
             return false;
         }
         let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         if end <= addr {
-            return !self.code_pages.is_empty();
+            return !code_pages.is_empty();
         }
         let mut page = addr >> 12;
         let last = end.saturating_sub(1) >> 12;
         while page <= last {
-            if self.code_pages.contains_key(&page) {
+            if code_pages.contains_key(&page) {
                 return true;
             }
             page = page.saturating_add(1);
@@ -575,10 +668,11 @@ impl JitCpu {
         if guest_end <= guest_start {
             return;
         }
+        let mut code_pages = self.shared.code_pages.lock().unwrap();
         let mut page = guest_start >> 12;
         let last = guest_end.saturating_sub(1) >> 12;
         while page <= last {
-            self.code_pages
+            code_pages
                 .entry(page)
                 .and_modify(|c| *c = c.saturating_add(1))
                 .or_insert(1);
@@ -590,39 +684,34 @@ impl JitCpu {
         if guest_end <= guest_start {
             return;
         }
+        let mut code_pages = self.shared.code_pages.lock().unwrap();
         let mut page = guest_start >> 12;
         let last = guest_end.saturating_sub(1) >> 12;
         while page <= last {
-            match self.code_pages.get_mut(&page) {
+            match code_pages.get_mut(&page) {
                 Some(c) if *c > 1 => *c = c.saturating_sub(1),
-                Some(_) => {
-                    self.code_pages.remove(&page);
-                }
+                Some(_) => { code_pages.remove(&page); }
                 None => {}
             }
             page = page.saturating_add(1);
         }
     }
 
-    /// Drain pending guest stores into selective code invalidation (safe point).
     fn drain_pending_code_writes(&mut self) {
-        let (pages, overflow) = self.iced.guest_mem_mut().take_pending_code_writes();
+        let (pages, overflow) = self.shared.mem.lock().unwrap().take_pending_code_writes();
         if overflow {
-            // Too many / unbounded stores in one slice — drop all Ready code.
-            if !self.cache.is_empty() {
+            if !self.shared.cache.read().unwrap().is_empty() {
                 self.clear_compiled();
                 self.invalidate_chain_and_shadow();
                 self.stats.code_invs = self.stats.code_invs.saturating_add(1);
             }
             return;
         }
-        // Per-page invalidate (cheap when code_pages is empty / sparse).
         for page in pages {
             self.invalidate_code_range(page << 12, PAGE_SIZE_USIZE);
         }
     }
 
-    /// Guest span to invalidate when `VirtualFree` succeeds.
     fn code_inv_span_for_free(
         &self,
         addr: u64,
@@ -630,7 +719,7 @@ impl JitCpu {
         free_type: u32,
     ) -> Option<(u64, usize)> {
         if (free_type & mem::MEM_RELEASE) != 0 {
-            return self.iced.guest_mem().allocation_span_at_base(addr);
+            return self.shared.mem.lock().unwrap().allocation_span_at_base(addr);
         }
         if (free_type & mem::MEM_DECOMMIT) != 0 {
             if size == 0 {
@@ -651,17 +740,19 @@ impl JitCpu {
         None
     }
 
-    /// Whether the JIT cache currently has a Ready block at `rip` (tests / diagnostics).
     #[cfg(test)]
     #[must_use]
     fn has_ready_at(&self, rip: u64) -> bool {
-        matches!(self.cache.get(&rip), Some(CacheEntry::Ready(_)))
+        matches!(
+            self.shared.cache.read().unwrap().get(&rip),
+            Some(CacheEntry::Ready(_))
+        )
     }
 
     /// Returns `(result, guest_insns_retired)` for budget accounting.
     fn step_one(&mut self) -> Result<(StepResult, usize), CpuError> {
-        let rip = self.iced.regs().rip;
-        if let Some(hook) = self.iced.hooks_ref()
+        let rip = self.thread.regs.rip;
+        if let Some(hook) = self.thread.hooks.as_ref()
             && hook.should_host_stop(rip)
         {
             return Ok((
@@ -673,33 +764,40 @@ impl JitCpu {
             ));
         }
 
-        if self.engine.is_some() {
-            match self.cache.get(&rip) {
+        if self.shared.engine.lock().unwrap().is_some() {
+            let cache = self.shared.cache.write().unwrap();
+            match cache.get(&rip) {
                 Some(CacheEntry::Ready(compiled)) => {
                     self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
                     let meta = CompiledRunMeta::from(compiled);
+                    drop(cache); // release lock before finish_compiled (may call drain_pending_code_writes)
                     return Ok(self.finish_compiled(rip, meta));
                 }
-                Some(CacheEntry::Never) => {
-                    // Fast path: known non-JIT site.
-                }
-                Some(&CacheEntry::Hot { visits, thr }) => {
-                    let next = visits.saturating_add(1);
-                    if thr > 0 && next < thr {
-                        self.cache
-                            .insert(rip, CacheEntry::Hot { visits: next, thr });
-                    } else if let Some(compiled) = self.try_compile(rip) {
-                        let meta = CompiledRunMeta::from(&compiled);
-                        self.insert_ready(rip, compiled);
-                        return Ok(self.finish_compiled(rip, meta));
-                    } else {
-                        self.cache.insert(rip, CacheEntry::Never);
+                Some(CacheEntry::Never) => {}
+                Some(CacheEntry::Hot { visits: _, thr: _ }) => {
+                    // Read visits via pattern match bypass — use clone to get value
+                    let is_hot_entry = cache.get(&rip).map(|e| match e {
+                        CacheEntry::Hot { visits, thr } => (*visits, *thr),
+                        _ => (0, 0),
+                    });
+                    drop(cache);
+                    if let Some((visits, thr)) = is_hot_entry {
+                        let next = visits.saturating_add(1);
+                        if thr > 0 && next < thr {
+                            self.shared.cache.write().unwrap()
+                                .insert(rip, CacheEntry::Hot { visits: next, thr });
+                        } else if let Some(compiled) = self.try_compile(rip) {
+                            let meta = CompiledRunMeta::from(&compiled);
+                            self.insert_ready(rip, compiled);
+                            return Ok(self.finish_compiled(rip, meta));
+                        } else {
+                            self.shared.cache.write().unwrap()
+                                .insert(rip, CacheEntry::Never);
+                        }
                     }
                 }
                 None => {
-                    // Eager when tests (thr=0) OR first sight of a fast-UCRT call site
-                    // (host_stop avoidance is worth the compile tax even once).
-                    // Pure self-loops use a lower threshold (compile sooner, less iced).
+                    drop(cache);
                     let is_ucrt = self.peek_fast_ucrt_call(rip);
                     let is_loop = self.peek_self_loop(rip);
                     let thr = if is_ucrt {
@@ -715,20 +813,36 @@ impl JitCpu {
                             self.insert_ready(rip, compiled);
                             return Ok(self.finish_compiled(rip, meta));
                         }
-                        self.cache.insert(rip, CacheEntry::Never);
+                        self.shared.cache.write().unwrap()
+                            .insert(rip, CacheEntry::Never);
                     } else {
-                        // First visit: start hotness, interpret (avoid compile on cold code).
-                        self.cache.insert(rip, CacheEntry::Hot { visits: 1, thr });
+                        self.shared.cache.write().unwrap()
+                            .insert(rip, CacheEntry::Hot { visits: 1, thr });
                     }
                 }
             }
         }
 
         // Iced does not maintain the shadow return stack — drop prediction.
-        self.shadow_sp = 0;
+        self.thread.shadow_sp = 0;
         self.stats.iced_insns = self.stats.iced_insns.saturating_add(1);
-        let result = self.iced.step_once_result()?;
-        // Phase 4.x: interpreter stores also note pending writes.
+        // Inline step_once_result: push RIP trace, call exec::step, update counters.
+        {
+            let rip = self.thread.regs.rip;
+            let i = self.thread.rip_trace_i & 31;
+            if let Some(slot) = self.thread.rip_trace.get_mut(i) {
+                *slot = rip;
+            }
+            self.thread.rip_trace_i = self.thread.rip_trace_i.wrapping_add(1);
+            if self.thread.rip_trace_n < 32 {
+                self.thread.rip_trace_n = self.thread.rip_trace_n.saturating_add(1);
+            }
+        }
+        let hook = self.thread.hooks.as_ref();
+        let result = exec::step(&mut *self.shared.mem.lock().unwrap(), &mut self.thread.regs, hook)?;
+        if matches!(result, StepResult::Continue) {
+            self.thread.iced_steps = self.thread.iced_steps.saturating_add(1);
+        }
         self.drain_pending_code_writes();
         Ok((result, 1))
     }
@@ -738,26 +852,30 @@ impl JitCpu {
         if self.fast_api.is_empty() {
             return false;
         }
-        match decode_pure_gpr_block(&self.iced, rip) {
+        let mem = self.shared.mem.lock().unwrap();
+        match decode_pure_gpr_block(&*mem, self.thread.hooks.as_ref(), rip) {
             BlockKind::Pure {
                 term: Some(block::BlockTerm::Call { target, .. }),
                 ..
             } => {
-                let final_va = resolve_thunk_va(&self.iced, target);
+                let final_va = resolve_thunk_va(&*mem, target);
                 self.fast_api_kind(final_va).is_some()
             }
             _ => false,
         }
     }
 
-    /// True when decode yields a pure self-loop (jcc/jmp back to entry).
     fn peek_self_loop(&self, rip: u64) -> bool {
-        let kind = decode_pure_gpr_block(&self.iced, rip);
+        let mem = self.shared.mem.lock().unwrap();
+        let kind = decode_pure_gpr_block(&*mem, self.thread.hooks.as_ref(), rip);
         pure_is_self_loop(&kind, rip)
     }
 
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
-        match decode_pure_gpr_block(&self.iced, rip) {
+        let mem_guard = self.shared.mem.lock().unwrap();
+        let result = decode_pure_gpr_block(&*mem_guard, self.thread.hooks.as_ref(), rip);
+        drop(mem_guard); // release before compiling (engine needs mutable access)
+        match result {
             BlockKind::Pure {
                 insns,
                 end_rip,
@@ -781,8 +899,8 @@ impl JitCpu {
                     if jit_chain_enabled() {
                         let fn_ptr = compiled.func as usize as u64;
                         chain_table_insert(
-                            self.chain_va.as_mut(),
-                            self.chain_fn.as_mut(),
+                            self.thread.chain_va.as_mut(),
+                            self.thread.chain_fn.as_mut(),
                             rip,
                             fn_ptr,
                         );
@@ -798,35 +916,34 @@ impl JitCpu {
                 // Resolve import thunks before mutably borrowing the JIT engine.
                 let call_fast = match term {
                     Some(block::BlockTerm::Call { target, .. }) => {
-                        let final_va = resolve_thunk_va(&self.iced, target);
-                        self.fast_api_kind(final_va)
+                        let mem = self.shared.mem.lock().unwrap();
+                        let final_va = resolve_thunk_va(&*mem, target);
+                        drop(mem);
+                        self.fast_api.iter()
+                            .find_map(|&(k, kind)| (k == final_va).then_some(kind))
                     }
                     _ => None,
                 };
                 // Split borrows: `chain_ids` (Ready FuncIds) + `engine` mutably.
-                // Avoids rebuilding a HashMap over the full cache each compile.
                 let chain_on = jit_chain_enabled();
                 let empty_chain = HashMap::new();
-                let JitCpu {
-                    engine,
-                    chain_ids,
-                    chain_va,
-                    chain_fn,
-                    stats,
-                    ..
-                } = self;
-                let eng = engine.as_mut()?;
-                let chain_map = if chain_on { &*chain_ids } else { &empty_chain };
+                let mut eng_guard = self.shared.engine.lock().unwrap();
+                let eng = eng_guard.as_mut()?;
+                let chain_ids = &*self.shared.chain_ids.read().unwrap();
+                let chain_map = if chain_on { chain_ids } else { &empty_chain };
                 match compile_block(
                     eng, rip, &insns, end_rip, term, call_fast, chain_map, bytes_len,
                 ) {
                     Ok(compiled) => {
-                        stats.compiles = stats.compiles.saturating_add(1);
-                        // Publish into late-bound chain table so older blocks can
-                        // `call_indirect` here without recompilation.
+                        self.stats.compiles = self.stats.compiles.saturating_add(1);
                         if chain_on {
                             let fn_ptr = compiled.func as usize as u64;
-                            chain_table_insert(chain_va.as_mut(), chain_fn.as_mut(), rip, fn_ptr);
+                            chain_table_insert(
+                                self.thread.chain_va.as_mut(),
+                                self.thread.chain_fn.as_mut(),
+                                rip,
+                                fn_ptr,
+                            );
                         }
                         tracing::debug!(
                             start = format_args!("{rip:#x}"),
@@ -840,7 +957,7 @@ impl JitCpu {
                         Some(compiled)
                     }
                     Err(e) => {
-                        stats.compile_skip = stats.compile_skip.saturating_add(1);
+                        self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
                         tracing::debug!(start = format_args!("{rip:#x}"), error = %e, "jit lower failed");
                         None
                     }
@@ -858,8 +975,7 @@ impl JitCpu {
             (StepResult::InvalidMemory(inv), 0)
         } else {
             self.stats.jit_insns = self
-                .stats
-                .jit_insns
+                .stats.jit_insns
                 .saturating_add(u64::from(meta.insn_count));
             (
                 StepResult::Continue,
@@ -872,17 +988,16 @@ impl JitCpu {
     fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
         // Refresh pins only when GuestMemory generation changes (map/protect/free).
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
-        let mem_gen = self.iced.guest_mem_mut().generation();
-        if self.pins_gen != mem_gen {
-            let infos = self.iced.guest_mem_mut().jit_region_pins();
-            self.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
-            self.pins_gen = mem_gen;
+        let mem_gen = self.shared.mem.lock().unwrap().generation();
+        if self.thread.pins_gen != mem_gen {
+            let infos = self.shared.mem.lock().unwrap().jit_region_pins();
+            self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            self.thread.pins_gen = mem_gen;
         }
         // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
         if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
             self.stats.mem_gen_bumps = self
-                .stats
-                .mem_gen_bumps
+                .stats.mem_gen_bumps
                 .saturating_add(mem_gen.saturating_sub(self.last_mem_gen));
         }
         self.last_mem_gen = mem_gen;
@@ -890,19 +1005,18 @@ impl JitCpu {
             self.stats.mem_gen_peak = mem_gen;
         }
         {
-            let stack = self.pins[0];
+            let stack = self.thread.pins[0];
             self.stats.pin_stack_bytes = if stack.host_base != 0 {
                 stack.guest_end.saturating_sub(stack.guest_base)
             } else {
                 0
             };
-            // Sum of data pin spans (process heap + VirtualAlloc slots 1..).
             let mut data_bytes = 0_u64;
             let mut bits = 0_u64;
             if stack.host_base != 0 {
                 bits |= stack.allow & 0b11;
             }
-            for (i, pin) in self.pins.iter().enumerate().skip(1) {
+            for (i, pin) in self.thread.pins.iter().enumerate().skip(1) {
                 if pin.host_base == 0 {
                     continue;
                 }
@@ -917,8 +1031,9 @@ impl JitCpu {
             self.stats.pin_heap_bytes = data_bytes;
             self.stats.pin_allow_bits = bits;
         }
-        let mem_ptr = std::ptr::from_mut(self.iced.guest_mem_mut());
-        let regs = self.iced.regs_mut();
+        let mut mem_guard = self.shared.mem.lock().unwrap();
+        let mem_ptr = std::ptr::from_mut(&mut *mem_guard);
+        let regs = &mut self.thread.regs;
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
         // JitCtx, so every architectural GPR must be valid for successors.
         let mut gpr = [0_u64; 16];
@@ -955,34 +1070,34 @@ impl JitCpu {
             fault_addr: 0,
             fault_size: 0,
             fault_access: 0,
-            tlb_sets: self.tlb_sets,
-            tlb_aux: self.tlb_aux,
+            tlb_sets: self.thread.tlb_sets,
+            tlb_aux: self.thread.tlb_aux,
             xmm,
-            shadow_sp: self.shadow_sp,
-            shadow_ret: self.shadow_ret,
-            chain_va: self.chain_va.as_mut_ptr(),
-            chain_fn: self.chain_fn.as_mut_ptr(),
-            tlb_hot_page: self.tlb_hot_page,
-            tlb_hot_ptr: self.tlb_hot_ptr,
+            shadow_sp: self.thread.shadow_sp,
+            shadow_ret: self.thread.shadow_ret,
+            chain_va: self.thread.chain_va.as_mut_ptr(),
+            chain_fn: self.thread.chain_fn.as_mut_ptr(),
+            tlb_hot_page: self.thread.tlb_hot_page,
+            tlb_hot_ptr: self.thread.tlb_hot_ptr,
             // 0 = Cranelift path (host falls back to full writeback);
             // trampolines OR their dirty bits; chain sets 0xffff.
             gpr_dirty_bits: 0,
             load_calls: 0,
             store_calls: 0,
-            tlb_hot_prot: self.tlb_hot_prot,
+            tlb_hot_prot: self.thread.tlb_hot_prot,
             mem_gen,
-            tlb_hot_gen: self.tlb_hot_gen,
-            pins: self.pins,
-            edge_ic_va: self.edge_ic_va,
-            edge_ic_fn: self.edge_ic_fn,
-            edge_ic_rr: self.edge_ic_rr,
+            tlb_hot_gen: self.thread.tlb_hot_gen,
+            pins: self.thread.pins,
+            edge_ic_va: self.thread.edge_ic_va,
+            edge_ic_fn: self.thread.edge_ic_fn,
+            edge_ic_rr: self.thread.edge_ic_rr,
             xmm_dirty_bits: 0,
             mem_path: MemPathSlice::default(),
-            sticky_page: self.sticky_page,
-            sticky_ptr: self.sticky_ptr,
-            sticky_prot: self.sticky_prot,
-            sticky_gen: self.sticky_gen,
-            sticky_rr: self.sticky_rr,
+            sticky_page: self.thread.sticky_page,
+            sticky_ptr: self.thread.sticky_ptr,
+            sticky_prot: self.thread.sticky_prot,
+            sticky_gen: self.thread.sticky_gen,
+            sticky_rr: self.thread.sticky_rr,
             // Fresh dispatcher entry always starts a new host-chain budget.
             chain_depth: 0,
         };
@@ -990,6 +1105,7 @@ impl JitCpu {
         unsafe {
             (meta.func)(std::ptr::from_mut(&mut ctx));
         }
+        drop(mem_guard); // GuestMemory no longer needed; drain_pending_code_writes locks it again
         self.stats.load_calls = self.stats.load_calls.saturating_add(ctx.load_calls);
         self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
         {
@@ -1011,23 +1127,23 @@ impl JitCpu {
         }
         // Phase 4.x: guest stores via `GuestMemory::write` leave a pending range;
         // apply selective code invalidation only after the native frame returns.
-        // Persist set-associative TLB + sticky hot page + shadow stack across chained blocks.
-        self.tlb_sets = ctx.tlb_sets;
-        self.tlb_aux = ctx.tlb_aux;
-        self.tlb_hot_page = ctx.tlb_hot_page;
-        self.tlb_hot_ptr = ctx.tlb_hot_ptr;
-        self.tlb_hot_prot = ctx.tlb_hot_prot;
-        self.tlb_hot_gen = ctx.tlb_hot_gen;
-        self.sticky_page = ctx.sticky_page;
-        self.sticky_ptr = ctx.sticky_ptr;
-        self.sticky_prot = ctx.sticky_prot;
-        self.sticky_gen = ctx.sticky_gen;
-        self.sticky_rr = ctx.sticky_rr;
-        self.edge_ic_va = ctx.edge_ic_va;
-        self.edge_ic_fn = ctx.edge_ic_fn;
-        self.edge_ic_rr = ctx.edge_ic_rr;
-        self.shadow_sp = ctx.shadow_sp;
-        self.shadow_ret = ctx.shadow_ret;
+        // Persist per-thread execution state from JitCtx.
+        self.thread.tlb_sets = ctx.tlb_sets;
+        self.thread.tlb_aux = ctx.tlb_aux;
+        self.thread.tlb_hot_page = ctx.tlb_hot_page;
+        self.thread.tlb_hot_ptr = ctx.tlb_hot_ptr;
+        self.thread.tlb_hot_prot = ctx.tlb_hot_prot;
+        self.thread.tlb_hot_gen = ctx.tlb_hot_gen;
+        self.thread.sticky_page = ctx.sticky_page;
+        self.thread.sticky_ptr = ctx.sticky_ptr;
+        self.thread.sticky_prot = ctx.sticky_prot;
+        self.thread.sticky_gen = ctx.sticky_gen;
+        self.thread.sticky_rr = ctx.sticky_rr;
+        self.thread.edge_ic_va = ctx.edge_ic_va;
+        self.thread.edge_ic_fn = ctx.edge_ic_fn;
+        self.thread.edge_ic_rr = ctx.edge_ic_rr;
+        self.thread.shadow_sp = ctx.shadow_sp;
+        self.thread.shadow_ret = ctx.shadow_ret;
         // Prefer cumulative trampoline dirty bits (partial writeback when a
         // micro-stub does not chain). Cranelift leaves bits at 0 → full sync
         // (internal block chaining can dirty arbitrary GPRs).
@@ -1097,30 +1213,28 @@ impl JitCpu {
     }
 
     fn invalidate_tlb(&mut self) {
-        self.tlb_sets = [empty_tlb_bucket(); TLB_SETS];
-        self.tlb_aux = [empty_tlb_aux(); TLB_SETS];
-        self.tlb_hot_page = TLB_EMPTY;
-        self.tlb_hot_ptr = std::ptr::null_mut();
-        self.tlb_hot_prot = 0;
-        self.tlb_hot_gen = 0;
-        self.sticky_page = [TLB_EMPTY; STICKY_WAYS];
-        self.sticky_ptr = [std::ptr::null_mut(); STICKY_WAYS];
-        self.sticky_prot = [0; STICKY_WAYS];
-        self.sticky_gen = [0; STICKY_WAYS];
-        self.sticky_rr = 0;
-        // Pins are rebuilt on next run_compiled; clear host bases so a stale
-        // mid-flight ctx (if any) cannot soft-translate after protect/free.
-        self.pins = [MemPin::EMPTY; PIN_SLOTS];
-        self.pins_gen = u64::MAX;
+        self.thread.tlb_sets = [empty_tlb_bucket(); TLB_SETS];
+        self.thread.tlb_aux = [empty_tlb_aux(); TLB_SETS];
+        self.thread.tlb_hot_page = TLB_EMPTY;
+        self.thread.tlb_hot_ptr = std::ptr::null_mut();
+        self.thread.tlb_hot_prot = 0;
+        self.thread.tlb_hot_gen = 0;
+        self.thread.sticky_page = [TLB_EMPTY; STICKY_WAYS];
+        self.thread.sticky_ptr = [std::ptr::null_mut(); STICKY_WAYS];
+        self.thread.sticky_prot = [0; STICKY_WAYS];
+        self.thread.sticky_gen = [0; STICKY_WAYS];
+        self.thread.sticky_rr = 0;
+        self.thread.pins = [MemPin::EMPTY; PIN_SLOTS];
+        self.thread.pins_gen = u64::MAX;
     }
 
     fn invalidate_chain_and_shadow(&mut self) {
-        chain_table_clear(self.chain_va.as_mut(), self.chain_fn.as_mut());
-        self.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
-        self.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
-        self.edge_ic_rr = 0;
-        self.shadow_sp = 0;
-        self.shadow_ret = [0; lower::SHADOW_DEPTH];
+        chain_table_clear(self.thread.chain_va.as_mut(), self.thread.chain_fn.as_mut());
+        self.thread.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
+        self.thread.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
+        self.thread.edge_ic_rr = 0;
+        self.thread.shadow_sp = 0;
+        self.thread.shadow_ret = [0; lower::SHADOW_DEPTH];
     }
 }
 
@@ -1155,10 +1269,10 @@ fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 }
 
 /// Follow PE import thunks / short jumps to the final callee VA.
-fn resolve_thunk_va(cpu: &IcedCpu, mut va: u64) -> u64 {
+fn resolve_thunk_va(mem: &GuestMemory, mut va: u64) -> u64 {
     let mut buf = [0_u8; 16];
     for _ in 0..4 {
-        if cpu.mem_read_into(va, &mut buf).is_err() {
+        if mem.read(va, &mut buf).is_err() {
             return va;
         }
         if buf[0] == 0xff && buf[1] == 0x25 {
@@ -1167,7 +1281,7 @@ fn resolve_thunk_va(cpu: &IcedCpu, mut va: u64) -> u64 {
                 .wrapping_add(6)
                 .wrapping_add(i64::from(rel).cast_unsigned());
             let mut slot = [0_u8; 8];
-            if cpu.mem_read_into(iat, &mut slot).is_ok() {
+            if mem.read(iat, &mut slot).is_ok() {
                 va = u64::from_le_bytes(slot);
                 continue;
             }
@@ -1451,26 +1565,25 @@ impl JitEngine {
 
 impl CpuEngine for JitCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.iced.mem_map(address, size, perms)
+        self.shared.mem.lock().unwrap().map(address, size, perms)
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        // Host-side write: apply bytes; `GuestMemory::write` notes pending SMC range.
-        self.iced.mem_write(address, bytes)?;
+        self.shared.mem.lock().unwrap().write(address, bytes)?;
         self.drain_pending_code_writes();
         Ok(())
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.iced.mem_read(address, bytes)
+        self.shared.mem.lock().unwrap().read(address, bytes)
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        self.iced.host_span(address, len, write)
+        self.shared.mem.lock().unwrap().host_span(address, len, write)
     }
 
     fn mem_generation(&self) -> u64 {
-        self.iced.mem_generation()
+        self.shared.mem.lock().unwrap().generation()
     }
 
     fn virtual_alloc(
@@ -1480,18 +1593,15 @@ impl CpuEngine for JitCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        let r = self.iced.virtual_alloc(addr, size, alloc_type, protect);
-        // PageMap/generation may change; drop TLB host pointers.
+        let r = self.shared.mem.lock().unwrap().virtual_alloc(addr, size, alloc_type, protect);
         self.invalidate_tlb();
         r
     }
 
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
-        // Resolve the guest span before free (RELEASE uses allocation size).
         let inv_span = self.code_inv_span_for_free(addr, size, free_type);
-        // Flush TLB before munmap so JIT never holds freed host pointers.
         self.invalidate_tlb();
-        let r = self.iced.virtual_free(addr, size, free_type);
+        let r = self.shared.mem.lock().unwrap().virtual_free(addr, size, free_type);
         if r.is_ok()
             && let Some((a, n)) = inv_span
         {
@@ -1506,8 +1616,7 @@ impl CpuEngine for JitCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        let r = self.iced.virtual_protect(addr, size, new_protect);
-        // Phase 4.x: X-loss drops overlapping Ready blocks (not just TLB/pins).
+        let r = self.shared.mem.lock().unwrap().virtual_protect(addr, size, new_protect);
         if r.is_ok() && !protect::allows_execute(new_protect) {
             self.invalidate_code_range(addr, size);
         }
@@ -1516,13 +1625,12 @@ impl CpuEngine for JitCpu {
     }
 
     fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
-        self.iced.virtual_query(addr)
+        self.shared.mem.lock().unwrap().virtual_query(addr)
     }
 
     fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
-        // Phase 7: map WinAPI flush to selective (or full) Ready drop.
         if size == 0 {
-            if !self.cache.is_empty() {
+            if !self.shared.cache.read().unwrap().is_empty() {
                 self.clear_compiled();
                 self.invalidate_chain_and_shadow();
                 self.stats.code_invs = self.stats.code_invs.saturating_add(1);
@@ -1534,7 +1642,7 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        let r = self.iced.mem_map_image(address, size, perms);
+        let r = self.shared.mem.lock().unwrap().map_image(address, size, perms);
         self.invalidate_tlb();
         r
     }
@@ -1544,15 +1652,15 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_backend_name(&self) -> &'static str {
-        self.iced.mem_backend_name()
+        self.shared.mem.lock().unwrap().backend_name()
     }
 
     fn register_region(&mut self, region: crate::mem::GuestRegion) {
-        self.iced.register_region(region);
+        self.shared.mem.lock().unwrap().register_region(region);
     }
 
     fn find_region(&self, va: u64) -> Option<crate::mem::GuestRegion> {
-        self.iced.find_region(va)
+        self.shared.mem.lock().unwrap().find_region(va).cloned()
     }
 
     fn install_runtime_hooks(
@@ -1564,8 +1672,20 @@ impl CpuEngine for JitCpu {
         self.clear_compiled();
         self.invalidate_tlb();
         self.invalidate_chain_and_shadow();
-        self.iced
-            .install_runtime_hooks(hook_begin, hook_end, stop_bitmap)
+        let range_len = hook_end.saturating_sub(hook_begin).saturating_add(1);
+        let expected_bytes = usize::try_from(range_len).unwrap_or(usize::MAX).div_ceil(8);
+        if expected_bytes != usize::MAX && stop_bitmap.len() < expected_bytes {
+            return Err(CpuError::Message(format!(
+                "stop_bitmap too small: {} < {expected_bytes}",
+                stop_bitmap.len()
+            )));
+        }
+        self.thread.hooks = Some(HookWindow {
+            begin: hook_begin,
+            end: hook_end,
+            stop_bitmap,
+        });
+        Ok(())
     }
 
     fn configure_jit_fast_path(&mut self, cfg: JitFastPathConfig) {
@@ -1574,12 +1694,10 @@ impl CpuEngine for JitCpu {
     }
 
     fn precompile_at(&mut self, address: u64) {
-        if self.engine.is_none() {
+        if self.shared.engine.lock().unwrap().is_none() {
             return;
         }
-        // Host-stop slots never run native code (checked before cache lookup).
-        // Skip decode/compile tax for pure stop-bitmap entries.
-        if let Some(hook) = self.iced.hooks_ref()
+        if let Some(hook) = self.thread.hooks.as_ref()
             && hook.should_host_stop(address)
         {
             return;
@@ -1587,8 +1705,7 @@ impl CpuEngine for JitCpu {
         if let Some(compiled) = self.try_compile(address) {
             self.insert_ready(address, compiled);
         } else {
-            // Remember NotPure so first runtime hit does not re-decode.
-            self.cache.entry(address).or_insert(CacheEntry::Never);
+            self.shared.cache.write().unwrap().entry(address).or_insert(CacheEntry::Never);
         }
     }
 
@@ -1601,16 +1718,15 @@ impl CpuEngine for JitCpu {
         _hook_begin: u64,
         _hook_end: u64,
     ) -> Result<RunUntilHook, CpuError> {
-        self.iced.regs_mut().rip = begin;
+        self.thread.regs.rip = begin;
         let budget = if count == 0 { 100_000_000_usize } else { count };
         let mut executed = 0_usize;
         while executed < budget {
-            let rip = self.iced.regs().rip;
+            let rip = self.thread.regs.rip;
             if until != 0 && rip == until {
                 break;
             }
-            // Fast host-stop (before cache / iced).
-            if let Some(hook) = self.iced.hooks_ref()
+            if let Some(hook) = self.thread.hooks.as_ref()
                 && hook.should_host_stop(rip)
             {
                 return Ok(RunUntilHook {
@@ -1629,50 +1745,39 @@ impl CpuEngine for JitCpu {
                 });
             }
             // Hot chain: run consecutive Ready blocks without re-entering step_one.
-            if self.engine.is_some()
-                && let Some(CacheEntry::Ready(compiled)) = self.cache.get(&rip)
-            {
-                self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-                let meta = CompiledRunMeta::from(compiled);
-                let (result, retired) = self.finish_compiled(rip, meta);
-                match result {
-                    StepResult::Continue => {
-                        executed = executed.saturating_add(retired.max(1));
-                        continue;
-                    }
-                    StepResult::HostStop { address, size } => {
-                        return Ok(RunUntilHook {
-                            code: CodeHookOutcome {
-                                hit: true,
-                                address,
-                                size,
-                            },
-                            invalid_memory: InvalidMemoryAccess {
-                                hit: false,
-                                access_type: 0,
-                                address: 0,
-                                size: 0,
-                                value: 0,
-                            },
-                        });
-                    }
-                    StepResult::InvalidMemory(inv) => {
-                        return Ok(RunUntilHook {
-                            code: CodeHookOutcome {
-                                hit: false,
-                                address: 0,
-                                size: 0,
-                            },
-                            invalid_memory: InvalidMemoryAccess {
-                                hit: true,
-                                access_type: inv.access_type,
-                                address: inv.address,
-                                size: inv.size,
-                                value: inv.value,
-                            },
-                        });
+            let mut chain_result = None;
+            if self.shared.engine.lock().unwrap().is_some() {
+                let meta = {
+                    let cache = self.shared.cache.read().unwrap();
+                    cache.get(&rip).and_then(|e| match e {
+                        CacheEntry::Ready(c) => Some(CompiledRunMeta::from(c)),
+                        _ => None,
+                    })
+                };
+                if let Some(meta) = meta {
+                    self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+                    let (result, retired) = self.finish_compiled(rip, meta);
+                    match result {
+                        StepResult::Continue => {
+                            executed = executed.saturating_add(retired.max(1));
+                            continue;
+                        }
+                        other => { chain_result = Some(other); }
                     }
                 }
+            }
+            if let Some(result) = chain_result {
+                return match result {
+                    StepResult::HostStop { address, size } => Ok(RunUntilHook {
+                        code: CodeHookOutcome { hit: true, address, size },
+                        invalid_memory: InvalidMemoryAccess { hit: false, access_type: 0, address: 0, size: 0, value: 0 },
+                    }),
+                    StepResult::InvalidMemory(inv) => Ok(RunUntilHook {
+                        code: CodeHookOutcome { hit: false, address: 0, size: 0 },
+                        invalid_memory: InvalidMemoryAccess { hit: true, access_type: inv.access_type, address: inv.address, size: inv.size, value: inv.value },
+                    }),
+                    StepResult::Continue => unreachable!(),
+                };
             }
             let (result, retired) = self.step_one()?;
             match result {
@@ -1730,70 +1835,45 @@ impl CpuEngine for JitCpu {
     }
 
     fn return_from_win64_api(&mut self, rax: u64) -> Result<u64, CpuError> {
-        // Host-side API return bypasses guest `ret` — invalidate shadow prediction.
-        self.shadow_sp = 0;
-        self.iced.return_from_win64_api(rax)
+        self.thread.shadow_sp = 0;
+        let rsp = self.thread.regs.rsp();
+        let mut ret_bytes = [0_u8; 8];
+        self.shared.mem.lock().unwrap()
+            .read(rsp, &mut ret_bytes)
+            .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
+        let return_address = u64::from_le_bytes(ret_bytes);
+        self.thread.regs.set_rsp(rsp.wrapping_add(8));
+        self.thread.regs.set_rax(rax);
+        self.thread.regs.rip = return_address;
+        Ok(return_address)
     }
 
-    fn read_rip(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_rip()
-    }
-    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_rip(value)
-    }
-    fn read_rsp(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_rsp()
-    }
-    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_rsp(value)
-    }
-    fn read_rax(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_rax()
-    }
-    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_rax(value)
-    }
-    fn read_rcx(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_rcx()
-    }
-    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_rcx(value)
-    }
-    fn read_rdx(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_rdx()
-    }
-    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_rdx(value)
-    }
-    fn read_r8(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_r8()
-    }
-    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_r8(value)
-    }
-    fn read_r9(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_r9()
-    }
-    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> {
-        self.iced.write_r9(value)
-    }
-    fn read_rbx(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_rbx()
-    }
-    fn read_r12(&mut self) -> Result<u64, CpuError> {
-        self.iced.read_r12()
-    }
+    fn read_rip(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rip) }
+    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.rip = value; Ok(()) }
+    fn read_rsp(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rsp()) }
+    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rsp(value); Ok(()) }
+    fn read_rax(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rax()) }
+    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rax(value); Ok(()) }
+    fn read_rcx(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rcx()) }
+    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rcx(value); Ok(()) }
+    fn read_rdx(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rdx()) }
+    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rdx(value); Ok(()) }
+    fn read_r8(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.r8()) }
+    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_r8(value); Ok(()) }
+    fn read_r9(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.r9()) }
+    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_r9(value); Ok(()) }
+    fn read_rbx(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.gpr(3)) }
+    fn read_r12(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.gpr(12)) }
 
     fn snapshot_thread_context(&mut self) -> crate::ThreadContext {
-        self.iced.snapshot_thread_context()
+        self.thread.regs.snapshot()
     }
 
     fn restore_thread_context(&mut self, ctx: &crate::ThreadContext) {
-        self.iced.restore_thread_context(ctx);
+        self.thread.regs.restore(ctx);
     }
 
     fn on_thread_switch(&mut self) {
-        // Drop sticky translations that may reference another thread's stack pin.
         self.invalidate_tlb();
         self.invalidate_chain_and_shadow();
     }
@@ -1826,11 +1906,11 @@ mod tests {
             );
             if jit_chain_enabled() {
                 let fn_ptr = dummy_block as *const () as usize as u64;
-                chain_table_insert(self.chain_va.as_mut(), self.chain_fn.as_mut(), rip, fn_ptr);
+                chain_table_insert(self.thread.chain_va.as_mut(), self.thread.chain_fn.as_mut(), rip, fn_ptr);
             }
             // Simulate edge IC hit for S6.
-            self.edge_ic_va[0] = rip;
-            self.edge_ic_fn[0] = dummy_block as *const () as usize as u64;
+            self.thread.edge_ic_va[0] = rip;
+            self.thread.edge_ic_fn[0] = dummy_block as *const () as usize as u64;
         }
     }
 
@@ -1853,7 +1933,7 @@ mod tests {
             .expect("x-loss");
         assert!(!cpu.has_ready_at(base));
         assert!(!cpu.code_pages_overlap(base, 16));
-        assert_eq!(cpu.edge_ic_va[0], 0);
+        assert_eq!(cpu.thread.edge_ic_va[0], 0);
         assert!(cpu.stats().code_invs >= 1);
     }
 
@@ -1874,7 +1954,7 @@ mod tests {
         // Guest/host store into compiled range.
         cpu.mem_write(base + 0x12, &[0x90, 0x90]).expect("smc");
         assert!(!cpu.has_ready_at(base + 0x10));
-        assert_eq!(cpu.edge_ic_fn[0], 0);
+        assert_eq!(cpu.thread.edge_ic_fn[0], 0);
     }
 
     #[test]
@@ -1901,8 +1981,7 @@ mod tests {
         cpu.mem_write(data, &[1, 2, 3, 4]).expect("data write");
         assert!(cpu.has_ready_at(code));
         assert_eq!(cpu.stats().code_invs, invs);
-        // Edge IC for code entry must survive pure data writes.
-        assert_eq!(cpu.edge_ic_va[0], code);
+        assert_eq!(cpu.thread.edge_ic_va[0], code);
     }
 
     #[test]
@@ -1919,7 +1998,7 @@ mod tests {
         cpu.test_plant_ready(base, base + 4);
         cpu.virtual_free(base, 0, MEM_RELEASE).expect("free");
         assert!(!cpu.has_ready_at(base));
-        assert!(cpu.code_pages.is_empty());
+        assert!(cpu.shared.code_pages.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1959,13 +2038,11 @@ mod tests {
         )
         .expect("alloc");
         let e = cpu
-            .iced
-            .guest_mem_mut()
+            .shared.mem.lock().unwrap()
             .page_tlb_entry(base >> 12)
             .expect("tlb");
         assert!(e.allow_r);
         assert!(!e.allow_w);
-        // Pure RW still allows W soft-translate.
         let data = 0x1007_0000_u64;
         cpu.virtual_alloc(
             data,
@@ -1975,8 +2052,7 @@ mod tests {
         )
         .expect("data");
         let e2 = cpu
-            .iced
-            .guest_mem_mut()
+            .shared.mem.lock().unwrap()
             .page_tlb_entry(data >> 12)
             .expect("data tlb");
         assert!(e2.allow_r && e2.allow_w);
@@ -2003,7 +2079,7 @@ mod tests {
         // Store on page1 half of the range.
         cpu.mem_write(base + 0x1000, &[0x90, 0x90]).expect("smc p1");
         assert!(!cpu.has_ready_at(entry));
-        assert_eq!(cpu.edge_ic_va[0], 0);
+        assert_eq!(cpu.thread.edge_ic_va[0], 0);
     }
 
     #[test]
@@ -2027,7 +2103,7 @@ mod tests {
             .expect("protect a");
         assert!(!cpu.has_ready_at(a));
         assert!(cpu.has_ready_at(b));
-        assert_eq!(cpu.edge_ic_va[0], 0); // edge IC cleared on any selective drop
+        assert_eq!(cpu.thread.edge_ic_va[0], 0); // edge IC cleared on any selective drop
         // Free B.
         cpu.virtual_free(b, 0, MEM_RELEASE).expect("free b");
         assert!(!cpu.has_ready_at(b));
@@ -2069,6 +2145,6 @@ mod tests {
         cpu.flush_instruction_cache(0, 0).expect("fic all");
         assert!(!cpu.has_ready_at(a));
         assert!(!cpu.has_ready_at(b));
-        assert!(cpu.code_pages.is_empty());
+        assert!(cpu.shared.code_pages.lock().unwrap().is_empty());
     }
 }

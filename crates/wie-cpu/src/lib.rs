@@ -18,7 +18,8 @@ mod regs;
 pub use exec::{dump_iced_counters, reset_iced_counters};
 pub use iced_cpu::IcedCpu;
 pub use jit::{
-    FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats, dump_mem_path_stats,
+    FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitShared, JitStats, PerThreadJitState,
+    dump_mem_path_stats,
 };
 /// Windows `PAGE_*` constants and software access checks (Phase 3).
 pub use mem::protect;
