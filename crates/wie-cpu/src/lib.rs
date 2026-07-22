@@ -6,6 +6,7 @@
 //! Scope: **x86-64 only** (no i386). Universal PE64 — no per-EXE cheats.
 //! Unicorn has been removed; see git history for the former reference backend.
 
+use std::sync::Arc;
 use thiserror::Error;
 
 mod exec;
@@ -318,6 +319,12 @@ pub trait CpuEngine: Send {
     ///
     /// No-op for pure interpreter backends.
     fn on_thread_switch(&mut self) {}
+
+    /// Access the shared JIT state, if this engine is backed by a JitCpu.
+    /// Returns `None` for IcedCpu or other backends.
+    fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
+        None
+    }
 }
 
 impl CpuEngine for Box<dyn CpuEngine> {
@@ -461,6 +468,9 @@ impl CpuEngine for Box<dyn CpuEngine> {
     }
     fn on_thread_switch(&mut self) {
         (**self).on_thread_switch();
+    }
+    fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
+        (**self).shared_jit()
     }
 }
 

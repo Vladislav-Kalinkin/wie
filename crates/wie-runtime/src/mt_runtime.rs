@@ -1,50 +1,26 @@
-//! MT.2 / MT.3 process sharing: engine + WinAPI under optional host locks.
+//! MT.2 / MT.3 process sharing: per-thread engines under shared WinAPI lock.
 //!
-//! Single-thread (no `CreateThread` yet): storage stays **local** — no mutex on
-//! the hot path. After the first worker is queued, ownership moves into
-//! `Arc<Mutex<_>>` so host threads can serialize on the shared CPU.
+//! Each guest thread gets its own `CpuEngine` (sharing a common `JitShared`
+//! compilation cache). No engine mutex — only the WinAPI state is shared.
 
 use crate::hooks::{SoftApiTable, resolve_fake_api_at};
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use wie_cpu::JitCpu;
 use wie_winapi::{HostParkReason, PRIMARY_THREAD_ID, PendingSpawn, WinApiControlSignal};
-
-/// Owns either exclusive (ST) or shared (MT) process resources.
-pub(crate) struct ProcessResources {
-    /// Exclusive engine (ST). `None` when moved into [`Self::shared`].
-    local_engine: Option<Box<dyn wie_cpu::CpuEngine>>,
-    /// Exclusive WinAPI state (ST).
-    local_winapi: Option<wie_winapi::WinApiState>,
-    /// Shared pair after first `CreateThread`.
-    shared: Option<Arc<SharedProcess>>,
-    /// Soft API table (cloneable; shared by value with workers).
-    pub soft_apis: SoftApiTable,
-    pub environment: wie_winapi::WinApiEnvironment,
-    pub layout: RuntimeMemoryLayout,
-    /// Host join handles for workers.
-    pub worker_joins: Vec<JoinHandle<()>>,
-    /// Active guest TID on the primary host thread.
-    pub primary_tid: u32,
-}
-
-/// Shared process resources for concurrent host threads.
-pub(crate) struct SharedProcess {
-    pub engine: Mutex<Box<dyn wie_cpu::CpuEngine>>,
-    pub winapi: Mutex<wie_winapi::WinApiState>,
-}
 
 /// Exclusive borrow of engine + WinAPI (local refs or mutex guards).
 pub(crate) enum ProcessPairGuard<'a> {
-    /// Single-thread exclusive ownership.
+    /// Single-thread exclusive ownership (engine + winapi both direct).
     Local {
-        eng: &'a mut Box<dyn wie_cpu::CpuEngine>,
+        eng: &'a mut dyn wie_cpu::CpuEngine,
         win: &'a mut wie_winapi::WinApiState,
     },
-    /// Multi-thread: holding both process mutexes.
+    /// Multi-thread: engine is direct, winapi behind Mutex.
     Shared {
-        eng: std::sync::MutexGuard<'a, Box<dyn wie_cpu::CpuEngine>>,
+        eng: &'a mut dyn wie_cpu::CpuEngine,
         win: std::sync::MutexGuard<'a, wie_winapi::WinApiState>,
     },
 }
@@ -54,10 +30,30 @@ impl ProcessPairGuard<'_> {
     #[inline]
     pub(crate) fn both(&mut self) -> (&mut dyn wie_cpu::CpuEngine, &mut wie_winapi::WinApiState) {
         match self {
-            Self::Local { eng, win } => (eng.as_mut(), win),
-            Self::Shared { eng, win } => (eng.as_mut(), win),
+            Self::Local { eng, win } => (*eng, *win),
+            Self::Shared { eng, win } => (*eng, &mut *win),
         }
     }
+}
+
+/// Owns process resources: primary engine + optional shared WinAPI state.
+pub(crate) struct ProcessResources {
+    /// Primary thread's dedicated engine.
+    pub engine: Box<dyn wie_cpu::CpuEngine>,
+    /// Shared JIT compilation cache + guest memory (None before any CreateThread).
+    pub shared_jit: Option<Arc<wie_cpu::JitShared>>,
+    /// Exclusive WinAPI state (ST). `None` when moved into [`Self::shared_winapi`].
+    local_winapi: Option<wie_winapi::WinApiState>,
+    /// Shared WinAPI state after first `CreateThread`.
+    shared_winapi: Option<Arc<Mutex<wie_winapi::WinApiState>>>,
+    /// Soft API table (cloneable; shared by value with workers).
+    pub soft_apis: SoftApiTable,
+    pub environment: wie_winapi::WinApiEnvironment,
+    pub layout: RuntimeMemoryLayout,
+    /// Host join handles for workers.
+    pub worker_joins: Vec<JoinHandle<()>>,
+    /// Active guest TID on the primary host thread.
+    pub primary_tid: u32,
 }
 
 impl ProcessResources {
@@ -69,9 +65,10 @@ impl ProcessResources {
         layout: RuntimeMemoryLayout,
     ) -> Self {
         Self {
-            local_engine: Some(engine),
+            engine,
+            shared_jit: None,
             local_winapi: Some(winapi),
-            shared: None,
+            shared_winapi: None,
             soft_apis,
             environment,
             layout,
@@ -92,8 +89,8 @@ impl ProcessResources {
 
     /// Read-only borrow of WinAPI state.
     pub(crate) fn with_winapi_ref<R>(&self, f: impl FnOnce(&wie_winapi::WinApiState) -> R) -> R {
-        if let Some(shared) = self.shared.as_ref() {
-            let g = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ref shared) = self.shared_winapi {
+            let g = shared.lock().unwrap_or_else(|p| p.into_inner());
             f(&g)
         } else {
             f(self
@@ -105,17 +102,14 @@ impl ProcessResources {
 
     /// Long exclusive access for the primary run loop (drop before host park).
     pub(crate) fn lock_pair(&mut self) -> ProcessPairGuard<'_> {
-        if let Some(shared) = self.shared.as_ref() {
+        if let Some(ref shared) = self.shared_winapi {
             ProcessPairGuard::Shared {
-                eng: shared.engine.lock().unwrap_or_else(|p| p.into_inner()),
-                win: shared.winapi.lock().unwrap_or_else(|p| p.into_inner()),
+                eng: &mut *self.engine,
+                win: shared.lock().unwrap_or_else(|p| p.into_inner()),
             }
         } else {
             ProcessPairGuard::Local {
-                eng: self
-                    .local_engine
-                    .as_mut()
-                    .expect("local engine present before share"),
+                eng: &mut *self.engine,
                 win: self
                     .local_winapi
                     .as_mut()
@@ -124,24 +118,17 @@ impl ProcessResources {
         }
     }
 
-    /// Promote to shared storage (idempotent). Returns the shared arc.
-    pub(crate) fn ensure_shared(&mut self) -> Arc<SharedProcess> {
-        if let Some(s) = self.shared.as_ref() {
+    /// Promote WinAPI state to shared storage (idempotent).
+    pub(crate) fn ensure_shared(&mut self) -> Arc<Mutex<wie_winapi::WinApiState>> {
+        if let Some(ref s) = self.shared_winapi {
             return Arc::clone(s);
         }
-        let eng = self
-            .local_engine
-            .take()
-            .expect("local engine when promoting to shared");
         let win = self
             .local_winapi
             .take()
             .expect("local winapi when promoting to shared");
-        let arc = Arc::new(SharedProcess {
-            engine: Mutex::new(eng),
-            winapi: Mutex::new(win),
-        });
-        self.shared = Some(Arc::clone(&arc));
+        let arc = Arc::new(Mutex::new(win));
+        self.shared_winapi = Some(Arc::clone(&arc));
         arc
     }
 
@@ -150,8 +137,6 @@ impl ProcessResources {
         let spawns: Vec<PendingSpawn> = self.with_mut(|eng, st| {
             let pending: Vec<_> = st.sync.pending_spawns.drain(..).collect();
             if !pending.is_empty() {
-                // Snapshot the creating thread (usually primary) before workers
-                // can overwrite the shared engine registers.
                 let tid = st.threads.current_tid();
                 let ctx = eng.snapshot_thread_context();
                 st.sync.thread_cpu.insert(tid, ctx);
@@ -162,21 +147,22 @@ impl ProcessResources {
         if spawns.is_empty() {
             return Ok(());
         }
-        let shared = self.ensure_shared();
+        // Extract shared_jit from the primary engine (must be JitCpu).
+        let shared_jit = self.ensure_shared_jit();
+        let shared_winapi = self.ensure_shared();
         let soft = self.soft_apis.clone();
         let env = self.environment;
         let layout = self.layout;
         for spawn in spawns {
-            let shared = Arc::clone(&shared);
+            let shared_jit = Arc::clone(&shared_jit);
+            let winapi = Arc::clone(&shared_winapi);
             let soft = soft.clone();
-            // Host stack must be large enough for JIT / iced dispatch; macOS
-            // secondary-thread defaults are often too small for guest workers.
             const HOST_WORKER_STACK: usize = 8 * 1024 * 1024;
             let handle = std::thread::Builder::new()
                 .name(format!("wie-guest-{}", spawn.tid))
                 .stack_size(HOST_WORKER_STACK)
                 .spawn(move || {
-                    worker_main(shared, soft, env, layout, spawn.tid);
+                    worker_main(shared_jit, winapi, soft, env, layout, spawn.tid);
                 })
                 .context("failed to spawn guest worker host thread")?;
             self.worker_joins.push(handle);
@@ -184,13 +170,18 @@ impl ProcessResources {
         Ok(())
     }
 
+    /// Extract or create `Arc<JitShared>` from the primary engine.
+    fn ensure_shared_jit(&mut self) -> Arc<wie_cpu::JitShared> {
+        if let Some(ref sj) = self.shared_jit {
+            return Arc::clone(sj);
+        }
+        // The primary engine was created as JitCpu. Extract its Arc<JitShared>.
+        let arc = Arc::clone(self.engine.shared_jit().expect("engine is JitCpu"));
+        self.shared_jit = Some(Arc::clone(&arc));
+        arc
+    }
+
     /// Join workers on `ExitProcess` (MT.4): set dying, wake all waiters, join hosts.
-    ///
-    /// Protocol:
-    /// 1. `process_dying = true` so workers exit at the next quantum.
-    /// 2. Notify all CS queues and signal all events so parks do not hang forever.
-    /// 3. Mark unfinished thread objects finished (wakes `WaitForSingleObject` joiners).
-    /// 4. Join host worker threads (best-effort; workers recheck dying flag).
     pub(crate) fn join_workers(&mut self) {
         self.with_mut(|_, st| {
             st.sync.process_dying = true;
@@ -202,8 +193,6 @@ impl ProcessResources {
                     wie_winapi::KernelObject::Event(e) => e.set(),
                     wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
                     wie_winapi::KernelObject::Thread(t) => {
-                        // Wake `WaitForSingleObject` joiners. Workers that still
-                        // hold the engine will exit after seeing `process_dying`.
                         if !t.is_finished() {
                             t.finish(1);
                         }
@@ -217,9 +206,10 @@ impl ProcessResources {
     }
 }
 
-/// Host worker: serialize on shared engine, run guest until ExitThread.
+/// Host worker: owns its own engine, shares WinAPI state.
 fn worker_main(
-    shared: Arc<SharedProcess>,
+    shared_jit: Arc<wie_cpu::JitShared>,
+    shared_winapi: Arc<Mutex<wie_winapi::WinApiState>>,
     soft_apis: SoftApiTable,
     environment: wie_winapi::WinApiEnvironment,
     layout: RuntimeMemoryLayout,
@@ -231,36 +221,37 @@ fn worker_main(
         .saturating_sub(1);
     let budget = layout.instruction_budget;
 
+    // Each worker gets its own per-thread JitCpu sharing the compilation cache.
+    let mut engine: Box<dyn wie_cpu::CpuEngine> =
+        Box::new(JitCpu::new_shared(shared_jit));
+
     loop {
         let park_reason: Option<HostParkReason>;
 
         {
-            let mut eng = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
-            let mut st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+            let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
 
             if st.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
 
-            activate_thread(eng.as_mut(), &mut st, tid);
+            activate_thread(engine.as_mut(), &mut st, tid);
 
-            let begin = eng.read_rip().unwrap_or(0);
+            let begin = engine.read_rip().unwrap_or(0);
             if begin == 0 {
-                // ThreadProc / `_beginthreadex` start returned (retaddr was 0).
-                // Win64: exit code is the low 32 bits of RAX.
-                let code = u32::try_from(eng.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+                let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code);
                 return;
             }
 
             let hook_result =
-                eng.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end);
+                engine.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end);
 
             let hook = match hook_result {
                 Ok(r) if r.code.hit => r.code,
                 Ok(_) => {
-                    deactivate_thread(eng.as_mut(), &mut st, tid);
+                    deactivate_thread(&mut st, tid);
                     std::thread::yield_now();
                     continue;
                 }
@@ -271,7 +262,7 @@ fn worker_main(
             };
 
             if hook.address == layout.callback_return_trampoline_va {
-                deactivate_thread(eng.as_mut(), &mut st, tid);
+                deactivate_thread(&mut st, tid);
                 continue;
             }
 
@@ -282,17 +273,16 @@ fn worker_main(
 
             if resolved.traits.exit_process() {
                 st.sync.process_dying = true;
-                let code = u32::try_from(eng.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+                let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code);
                 return;
             }
 
-            // Fast void sync / heap paths use full dispatch for workers.
             let dispatch = if let Some(id) = resolved.winapi_id {
-                wie_winapi::dispatch_winapi_id(eng.as_mut(), environment, &mut st, id)
+                wie_winapi::dispatch_winapi_id(engine.as_mut(), environment, &mut st, id)
             } else {
                 wie_winapi::dispatch_winapi(
-                    eng.as_mut(),
+                    engine.as_mut(),
                     environment,
                     &mut st,
                     &resolved.library,
@@ -302,7 +292,7 @@ fn worker_main(
 
             match dispatch {
                 Ok(_) => {
-                    deactivate_thread(eng.as_mut(), &mut st, tid);
+                    deactivate_thread(&mut st, tid);
                     park_reason = None;
                 }
                 Err(e) => {
@@ -316,7 +306,7 @@ fn worker_main(
                         e.downcast_ref::<WinApiControlSignal>()
                     {
                         let reason = *reason;
-                        deactivate_thread(eng.as_mut(), &mut st, tid);
+                        deactivate_thread(&mut st, tid);
                         park_reason = Some(reason);
                     } else {
                         finish_tid(&st, tid, 1);
@@ -324,12 +314,11 @@ fn worker_main(
                     }
                 }
             }
-        } // drop locks
+        } // drop WinAPI lock
 
         if let Some(reason) = park_reason {
-            // Bail if process is dying while we were about to park.
             {
-                let st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                 if st.sync.process_dying {
                     finish_tid(&st, tid, 1);
                     return;
@@ -337,19 +326,17 @@ fn worker_main(
             }
             match reason {
                 HostParkReason::CriticalSection { cs } => {
-                    // Take queue under winapi lock, then wait **without** holding it.
                     let q = {
-                        let mut st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                         wie_winapi::kernel32::resolve_cs_queue(&mut st, cs)
                     };
                     q.park_brief();
                 }
                 HostParkReason::WaitObject { handle, timeout_ms } => {
                     let target = {
-                        let st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                         wie_winapi::kernel32::resolve_wait_target(&st, handle)
                     };
-                    // Slice infinite waits so process_dying is observed promptly.
                     let result = match target {
                         Some(t) => {
                             if timeout_ms == wie_winapi::INFINITE {
@@ -359,7 +346,7 @@ fn worker_main(
                                         break wie_winapi::WAIT_OBJECT_0;
                                     }
                                     let st =
-                                        shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                                        shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                                     if st.sync.process_dying {
                                         finish_tid(&st, tid, 1);
                                         return;
@@ -371,38 +358,37 @@ fn worker_main(
                         }
                         None => wie_winapi::WAIT_FAILED,
                     };
-                    let mut eng = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                    // Engine is per-thread — no engine mutex needed.
+                    let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                     if st.sync.process_dying {
                         finish_tid(&st, tid, 1);
                         return;
                     }
-                    activate_thread(eng.as_mut(), &mut st, tid);
-                    drop(eng.return_from_win64_api(u64::from(result)));
-                    deactivate_thread(eng.as_mut(), &mut st, tid);
+                    activate_thread(engine.as_mut(), &mut st, tid);
+                    drop(engine.return_from_win64_api(u64::from(result)));
+                    deactivate_thread(&mut st, tid);
                 }
                 HostParkReason::WaitMultiple => {
                     let req = {
-                        let mut st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                         st.sync.multi_wait.remove(&tid)
                     };
                     let result = match req {
                         Some(req) => {
                             let targets = {
-                                let st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                                let st =
+                                    shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                                 st.sync.wait_targets(&req.handles)
                             };
                             match targets {
                                 Some(ts) => {
                                     if req.timeout_ms == wie_winapi::INFINITE {
                                         loop {
-                                            let r =
-                                                wie_winapi::wait_multiple(&ts, req.wait_all, 50);
+                                            let r = wie_winapi::wait_multiple(&ts, req.wait_all, 50);
                                             if r != wie_winapi::WAIT_TIMEOUT {
                                                 break r;
                                             }
-                                            let st = shared
-                                                .winapi
+                                            let st = shared_winapi
                                                 .lock()
                                                 .unwrap_or_else(|p| p.into_inner());
                                             if st.sync.process_dying {
@@ -419,15 +405,14 @@ fn worker_main(
                         }
                         None => wie_winapi::WAIT_FAILED,
                     };
-                    let mut eng = shared.engine.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut st = shared.winapi.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
                     if st.sync.process_dying {
                         finish_tid(&st, tid, 1);
                         return;
                     }
-                    activate_thread(eng.as_mut(), &mut st, tid);
-                    drop(eng.return_from_win64_api(u64::from(result)));
-                    deactivate_thread(eng.as_mut(), &mut st, tid);
+                    activate_thread(engine.as_mut(), &mut st, tid);
+                    drop(engine.return_from_win64_api(u64::from(result)));
+                    deactivate_thread(&mut st, tid);
                 }
             }
         }
@@ -446,33 +431,19 @@ fn finish_tid(st: &wie_winapi::WinApiState, tid: u32, code: u32) {
 }
 
 fn activate_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    _engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut wie_winapi::WinApiState,
     tid: u32,
 ) {
-    // Always park the previously running guest thread's CPU before overwriting
-    // the shared engine. Without this, a worker that wins the process lock
-    // between primary quanta clobbers unsaved primary registers (universal MT bug).
-    let prev = state.threads.current_tid();
-    if prev != tid {
-        let prev_ctx = engine.snapshot_thread_context();
-        state.sync.thread_cpu.insert(prev, prev_ctx);
-        state.threads.save_active();
-    }
+    // Per-thread engine: each engine is permanently assigned to one guest thread.
+    // No context save/restore needed — the engine's registers ARE this thread's regs.
     state.threads.activate(tid);
-    if let Some(ctx) = state.sync.thread_cpu.get(&tid).cloned() {
-        engine.restore_thread_context(&ctx);
-        engine.on_thread_switch();
-    }
 }
 
 fn deactivate_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut wie_winapi::WinApiState,
-    tid: u32,
+    _tid: u32,
 ) {
-    let ctx = engine.snapshot_thread_context();
-    state.sync.thread_cpu.insert(tid, ctx);
     state.threads.save_active();
 }
 
@@ -482,7 +453,9 @@ pub(crate) fn save_thread(
     state: &mut wie_winapi::WinApiState,
     tid: u32,
 ) {
-    deactivate_thread(engine, state, tid);
+    let ctx = engine.snapshot_thread_context();
+    state.sync.thread_cpu.insert(tid, ctx);
+    state.threads.save_active();
 }
 
 /// Restore active thread CPU from sync table.
@@ -491,5 +464,9 @@ pub(crate) fn load_thread(
     state: &mut wie_winapi::WinApiState,
     tid: u32,
 ) {
-    activate_thread(engine, state, tid);
+    state.threads.activate(tid);
+    if let Some(ctx) = state.sync.thread_cpu.get(&tid).cloned() {
+        engine.restore_thread_context(&ctx);
+        engine.on_thread_switch();
+    }
 }

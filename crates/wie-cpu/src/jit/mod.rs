@@ -527,6 +527,12 @@ impl JitCpu {
         }
     }
 
+    /// Borrow the shared JIT state (compilation cache + guest memory).
+    #[must_use]
+    pub fn shared_jit(&self) -> &Arc<JitShared> {
+        &self.shared
+    }
+
     /// Create a per-thread engine sharing the compilation cache + guest memory.
     #[must_use]
     pub fn new_shared(shared: Arc<JitShared>) -> Self {
@@ -1871,6 +1877,10 @@ impl CpuEngine for JitCpu {
 
     fn restore_thread_context(&mut self, ctx: &crate::ThreadContext) {
         self.thread.regs.restore(ctx);
+    }
+
+    fn shared_jit(&self) -> Option<&std::sync::Arc<crate::jit::JitShared>> {
+        Some(&self.shared)
     }
 
     fn on_thread_switch(&mut self) {
