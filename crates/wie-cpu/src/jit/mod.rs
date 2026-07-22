@@ -249,9 +249,9 @@ impl JitShared {
     }
 }
 
-// SAFETY: GuestMemory behind Mutex; raw pointers in GuestMemory are
+// SAFETY: GuestMemory is behind `RwLock`; raw pointers inside GuestMemory are
 // non-owning views of mmap arenas that live for the process lifetime.
-// Mutex provides synchronization for the metadata; JIT hot path uses
+// The lock provides synchronization for metadata updates; the JIT hot path uses
 // per-thread TLB with host pointers directly.
 #[expect(unsafe_code)]
 unsafe impl Send for JitShared {}
