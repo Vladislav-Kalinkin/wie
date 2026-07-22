@@ -1,9 +1,9 @@
 //! Process execution state: single `ProcessResources` for both JIT and Iced.
 //!
 //! Per-thread engines: each guest thread runs on its own `CpuEngine` instance.
-//! JIT workers share `Arc<JitShared>` (compilation cache), Iced workers share
-//! `Arc<RwLock<GuestMemory>>` via `CpuEngine::clone_guest_memory()`.
-//! WinAPI is always behind `Arc<Mutex<>>`.
+//! JIT workers share `Arc<JitShared>` (compilation cache). Iced workers share
+//! `Arc<RwLock<GuestMemory>>` extracted from the primary `IcedCpu` and passed to
+//! workers at spawn time. WinAPI is always behind `Arc<Mutex<>>`.
 
 use crate::hooks::{SoftApiTable, resolve_fake_api_at};
 use crate::memory::RuntimeMemoryLayout;
