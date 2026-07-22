@@ -494,6 +494,7 @@ struct SessionInit {
     winapi_state: wie_winapi::WinApiState,
     soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
+    stop_bitmap: Vec<u8>,
     entry_point_va: u64,
     initial_rsp: u64,
 }
@@ -508,6 +509,7 @@ impl RuntimeSession {
                 init.soft_apis,
                 init.environment,
                 init.layout,
+                init.stop_bitmap,
             ),
             entry_point_va: init.entry_point_va,
             initial_rsp: init.initial_rsp,
@@ -815,7 +817,7 @@ impl RuntimeSession {
         }
 
         engine
-            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
+            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap.clone())
             .context("failed to install persistent runtime hooks")?;
 
         // Selective precompile: only in-guest stubs (GetLastError / CS / …).
@@ -1033,6 +1035,7 @@ impl RuntimeSession {
             winapi_state,
             soft_apis,
             layout,
+            stop_bitmap,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
         });

@@ -50,6 +50,8 @@ pub(crate) struct ProcessResources {
     pub soft_apis: SoftApiTable,
     pub environment: wie_winapi::WinApiEnvironment,
     pub layout: RuntimeMemoryLayout,
+    /// Stop bitmap for fake-API hooks (reused by worker engines).
+    pub stop_bitmap: Vec<u8>,
     /// Host join handles for workers.
     pub worker_joins: Vec<JoinHandle<()>>,
     /// Active guest TID on the primary host thread.
@@ -63,6 +65,7 @@ impl ProcessResources {
         soft_apis: SoftApiTable,
         environment: wie_winapi::WinApiEnvironment,
         layout: RuntimeMemoryLayout,
+        stop_bitmap: Vec<u8>,
     ) -> Self {
         Self {
             engine,
@@ -72,6 +75,7 @@ impl ProcessResources {
             soft_apis,
             environment,
             layout,
+            stop_bitmap,
             worker_joins: Vec::new(),
             primary_tid: PRIMARY_THREAD_ID,
         }
@@ -148,23 +152,25 @@ impl ProcessResources {
             return Ok(());
         }
         // Extract shared_jit from the primary engine (must be JitCpu).
-        let shared_jit = self.ensure_shared_jit();
-        let shared_winapi = self.ensure_shared();
-        let soft = self.soft_apis.clone();
-        let env = self.environment;
-        let layout = self.layout;
-        for spawn in spawns {
-            let shared_jit = Arc::clone(&shared_jit);
-            let winapi = Arc::clone(&shared_winapi);
-            let soft = soft.clone();
-            const HOST_WORKER_STACK: usize = 8 * 1024 * 1024;
-            let handle = std::thread::Builder::new()
-                .name(format!("wie-guest-{}", spawn.tid))
-                .stack_size(HOST_WORKER_STACK)
-                .spawn(move || {
-                    worker_main(shared_jit, winapi, soft, env, layout, spawn.tid);
-                })
-                .context("failed to spawn guest worker host thread")?;
+            let shared_jit = self.ensure_shared_jit();
+            let shared_winapi = self.ensure_shared();
+            let soft = self.soft_apis.clone();
+            let env = self.environment;
+            let layout = self.layout;
+            let stop_bitmap = self.stop_bitmap.clone();
+            for spawn in spawns {
+                let shared_jit = Arc::clone(&shared_jit);
+                let winapi = Arc::clone(&shared_winapi);
+                let soft = soft.clone();
+                let bitmap = stop_bitmap.clone();
+                const HOST_WORKER_STACK: usize = 8 * 1024 * 1024;
+                let handle = std::thread::Builder::new()
+                    .name(format!("wie-guest-{}", spawn.tid))
+                    .stack_size(HOST_WORKER_STACK)
+                    .spawn(move || {
+                        worker_main(shared_jit, winapi, soft, env, layout, spawn.tid, bitmap);
+                    })
+                    .context("failed to spawn guest worker host thread")?;
             self.worker_joins.push(handle);
         }
         Ok(())
@@ -214,6 +220,7 @@ fn worker_main(
     environment: wie_winapi::WinApiEnvironment,
     layout: RuntimeMemoryLayout,
     tid: u32,
+    stop_bitmap: Vec<u8>,
 ) {
     let fake_api_end = layout
         .fake_api_base
@@ -224,6 +231,13 @@ fn worker_main(
     // Each worker gets its own per-thread JitCpu sharing the compilation cache.
     let mut engine: Box<dyn wie_cpu::CpuEngine> =
         Box::new(JitCpu::new_shared(shared_jit));
+
+    // Install runtime hooks (stop bitmap) so the engine stops on fake API calls.
+    let _ = engine.install_runtime_hooks(
+        layout.fake_api_base,
+        fake_api_end,
+        stop_bitmap,
+    );
 
     loop {
         let park_reason: Option<HostParkReason>;
@@ -431,13 +445,17 @@ fn finish_tid(st: &wie_winapi::WinApiState, tid: u32, code: u32) {
 }
 
 fn activate_thread(
-    _engine: &mut dyn wie_cpu::CpuEngine,
+    engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut wie_winapi::WinApiState,
     tid: u32,
 ) {
-    // Per-thread engine: each engine is permanently assigned to one guest thread.
-    // No context save/restore needed — the engine's registers ARE this thread's regs.
+    // Per-thread engine: no context switch needed. But still restore the
+    // initial context saved during drain_spawns (first activation).
     state.threads.activate(tid);
+    if let Some(ctx) = state.sync.thread_cpu.get(&tid).cloned() {
+        engine.restore_thread_context(&ctx);
+        engine.on_thread_switch();
+    }
 }
 
 fn deactivate_thread(
