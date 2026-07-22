@@ -172,11 +172,14 @@ fn worker_main(
         .saturating_add(u64::try_from(layout.fake_api_size).unwrap_or(0))
         .saturating_sub(1);
 
-    let _ = engine.install_runtime_hooks(
-        layout.fake_api_base,
-        fake_api_end,
-        config.stop_bitmap.clone(),
-    );
+if let Err(e) = engine.install_runtime_hooks(
+    layout.fake_api_base,
+    fake_api_end,
+    config.stop_bitmap.clone(),
+) {
+    tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
+    return;
+}
 
     // Load initial thread context set by CreateThread.
     {
