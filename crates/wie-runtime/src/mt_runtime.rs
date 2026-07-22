@@ -18,20 +18,25 @@ pub(crate) enum ProcessPairGuard<'a> {
         eng: &'a mut dyn wie_cpu::CpuEngine,
         win: &'a mut wie_winapi::WinApiState,
     },
-    /// Multi-thread: engine is direct, winapi behind Mutex.
-    Shared {
+    /// JIT path: engine is per-thread, winapi behind Mutex.
+    SharedJit {
         eng: &'a mut dyn wie_cpu::CpuEngine,
+        win: std::sync::MutexGuard<'a, wie_winapi::WinApiState>,
+    },
+    /// Iced fallback: both engine and winapi behind Mutex (shared engine).
+    SharedIced {
+        eng: std::sync::MutexGuard<'a, Box<dyn wie_cpu::CpuEngine>>,
         win: std::sync::MutexGuard<'a, wie_winapi::WinApiState>,
     },
 }
 
 impl ProcessPairGuard<'_> {
-    /// Simultaneous exclusive access to both sides (primary run loop).
     #[inline]
     pub(crate) fn both(&mut self) -> (&mut dyn wie_cpu::CpuEngine, &mut wie_winapi::WinApiState) {
         match self {
             Self::Local { eng, win } => (*eng, *win),
-            Self::Shared { eng, win } => (*eng, &mut *win),
+            Self::SharedJit { eng, win } => (*eng, &mut *win),
+            Self::SharedIced { eng, win } => (eng.as_mut(), &mut *win),
         }
     }
 }
@@ -40,8 +45,10 @@ impl ProcessPairGuard<'_> {
 pub(crate) struct ProcessResources {
     /// Primary thread's dedicated engine.
     pub engine: Box<dyn wie_cpu::CpuEngine>,
-    /// Shared JIT compilation cache + guest memory (None before any CreateThread).
+    /// Shared JIT compilation cache (Some for JIT, None for Iced).
     pub shared_jit: Option<Arc<wie_cpu::JitShared>>,
+    /// Iced fallback: shared engine behind mutex (None before first CreateThread).
+    iced_shared_engine: Option<Arc<Mutex<Box<dyn wie_cpu::CpuEngine>>>>,
     /// Exclusive WinAPI state (ST). `None` when moved into [`Self::shared_winapi`].
     local_winapi: Option<wie_winapi::WinApiState>,
     /// Shared WinAPI state after first `CreateThread`.
@@ -71,6 +78,7 @@ impl ProcessResources {
         Self {
             engine,
             shared_jit,
+            iced_shared_engine: None,
             local_winapi: Some(winapi),
             shared_winapi: None,
             soft_apis,
@@ -82,7 +90,7 @@ impl ProcessResources {
         }
     }
 
-    /// Borrow engine + winapi exclusively (ST: direct; MT: mutex).
+    /// Borrow engine + winapi exclusively (ST: direct; MT: mutex or per-thread).
     pub(crate) fn with_mut<R>(
         &mut self,
         f: impl FnOnce(&mut dyn wie_cpu::CpuEngine, &mut wie_winapi::WinApiState) -> R,
@@ -107,8 +115,14 @@ impl ProcessResources {
 
     /// Long exclusive access for the primary run loop (drop before host park).
     pub(crate) fn lock_pair(&mut self) -> ProcessPairGuard<'_> {
-        if let Some(ref shared) = self.shared_winapi {
-            ProcessPairGuard::Shared {
+        if let Some(ref shared_eng) = self.iced_shared_engine {
+            // Iced fallback: engine behind mutex, winapi behind mutex
+            ProcessPairGuard::SharedIced {
+                eng: shared_eng.lock().unwrap_or_else(|p| p.into_inner()),
+                win: self.shared_winapi.as_ref().expect("shared_winapi").lock().unwrap_or_else(|p| p.into_inner()),
+            }
+        } else if let Some(ref shared) = self.shared_winapi {
+            ProcessPairGuard::SharedJit {
                 eng: &mut *self.engine,
                 win: shared.lock().unwrap_or_else(|p| p.into_inner()),
             }
@@ -152,15 +166,16 @@ impl ProcessResources {
         if spawns.is_empty() {
             return Ok(());
         }
-        // Extract shared_jit from the primary engine (must be JitCpu).
-            let shared_jit = self.ensure_shared_jit();
-            let shared_winapi = self.ensure_shared();
-            let soft = self.soft_apis.clone();
-            let env = self.environment;
-            let layout = self.layout;
-            let stop_bitmap = self.stop_bitmap.clone();
+        let shared_winapi = self.ensure_shared();
+        let soft = self.soft_apis.clone();
+        let env = self.environment;
+        let layout = self.layout;
+        let stop_bitmap = self.stop_bitmap.clone();
+
+        if let Some(ref shared_jit) = self.shared_jit {
+            // JIT path: create per-thread engines sharing the compilation cache.
             for spawn in spawns {
-                let shared_jit = Arc::clone(&shared_jit);
+                let shared_jit = Arc::clone(shared_jit);
                 let winapi = Arc::clone(&shared_winapi);
                 let soft = soft.clone();
                 let bitmap = stop_bitmap.clone();
@@ -172,16 +187,35 @@ impl ProcessResources {
                         worker_main(shared_jit, winapi, soft, env, layout, spawn.tid, bitmap);
                     })
                     .context("failed to spawn guest worker host thread")?;
-            self.worker_joins.push(handle);
+                self.worker_joins.push(handle);
+            }
+        } else {
+            // Iced fallback: move engine behind mutex, share with workers.
+            let engine = std::mem::replace(
+                &mut self.engine,
+                Box::new(wie_cpu::IcedCpu::open_x86_64()),
+            );
+            let shared_engine = Arc::new(Mutex::new(engine));
+            self.iced_shared_engine = Some(Arc::clone(&shared_engine));
+            for spawn in spawns {
+                let eng = Arc::clone(&shared_engine);
+                let winapi = Arc::clone(&shared_winapi);
+                let soft = soft.clone();
+                const HOST_WORKER_STACK: usize = 8 * 1024 * 1024;
+                let handle = std::thread::Builder::new()
+                    .name(format!("wie-guest-{}", spawn.tid))
+                    .stack_size(HOST_WORKER_STACK)
+                    .spawn(move || {
+                        worker_main_iced(eng, winapi, soft, env, layout, spawn.tid);
+                    })
+                    .context("failed to spawn guest worker host thread")?;
+                self.worker_joins.push(handle);
+            }
         }
         Ok(())
     }
 
-    /// Get or create `Arc<JitShared>` from the stored value.
-    fn ensure_shared_jit(&mut self) -> Arc<wie_cpu::JitShared> {
-        self.shared_jit.as_ref().expect("shared_jit must be set for multi-threaded sessions; ensure the engine is JitCpu").clone()
-    }
-
+    /// Get shared JIT state (or None for Iced backends).
     /// Join workers on `ExitProcess` (MT.4): set dying, wake all waiters, join hosts.
     pub(crate) fn join_workers(&mut self) {
         self.with_mut(|_, st| {
@@ -432,6 +466,214 @@ fn worker_main(
                     activate_thread(engine.as_mut(), &mut st, tid);
                     drop(engine.return_from_win64_api(u64::from(result)));
                     deactivate_thread(&mut st, tid);
+                }
+            }
+        }
+    }
+}
+
+/// IcedCpu worker: shares the engine behind a mutex (old model).
+fn worker_main_iced(
+    shared_engine: Arc<Mutex<Box<dyn wie_cpu::CpuEngine>>>,
+    shared_winapi: Arc<Mutex<wie_winapi::WinApiState>>,
+    soft_apis: SoftApiTable,
+    environment: wie_winapi::WinApiEnvironment,
+    layout: RuntimeMemoryLayout,
+    tid: u32,
+) {
+    let fake_api_end = layout
+        .fake_api_base
+        .saturating_add(u64::try_from(layout.fake_api_size).unwrap_or(0))
+        .saturating_sub(1);
+    let budget = layout.instruction_budget;
+
+    loop {
+        let park_reason: Option<HostParkReason>;
+
+        {
+            let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
+            let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+
+            if st.sync.process_dying {
+                finish_tid(&st, tid, 1);
+                return;
+            }
+
+            // Iced shared engine: save previous thread context and load ours.
+            let prev = st.threads.current_tid();
+            if prev != tid {
+                let prev_ctx = eng.snapshot_thread_context();
+                st.sync.thread_cpu.insert(prev, prev_ctx);
+                st.threads.save_active();
+            }
+            st.threads.activate(tid);
+            if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
+                eng.restore_thread_context(&ctx);
+                eng.on_thread_switch();
+            }
+
+            let begin = eng.read_rip().unwrap_or(0);
+
+            let hook_result =
+                eng.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end);
+
+            let hook = match hook_result {
+                Ok(r) if r.code.hit => r.code,
+                Ok(_) => {
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(_) => {
+                    finish_tid(&st, tid, 1);
+                    return;
+                }
+            };
+
+            if hook.address == layout.callback_return_trampoline_va {
+                continue;
+            }
+
+            let Some(resolved) = resolve_fake_api_at(hook.address, &soft_apis) else {
+                finish_tid(&st, tid, 1);
+                return;
+            };
+
+            if resolved.traits.exit_process() {
+                st.sync.process_dying = true;
+                let code = u32::try_from(eng.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+                finish_tid(&st, tid, code);
+                return;
+            }
+
+            let dispatch = if let Some(id) = resolved.winapi_id {
+                wie_winapi::dispatch_winapi_id(eng.as_mut(), environment, &mut st, id)
+            } else {
+                wie_winapi::dispatch_winapi(
+                    eng.as_mut(),
+                    environment,
+                    &mut st,
+                    &resolved.library,
+                    &resolved.name,
+                )
+            };
+
+            match dispatch {
+                Ok(_) => {
+                    park_reason = None;
+                }
+                Err(e) => {
+                    if let Some(WinApiControlSignal::ExitThread { code }) =
+                        e.downcast_ref::<WinApiControlSignal>()
+                    {
+                        finish_tid(&st, tid, *code);
+                        return;
+                    }
+                    if let Some(WinApiControlSignal::HostPark { reason }) =
+                        e.downcast_ref::<WinApiControlSignal>()
+                    {
+                        park_reason = Some(*reason);
+                    } else {
+                        finish_tid(&st, tid, 1);
+                        return;
+                    }
+                }
+            }
+        } // drop locks
+
+        if let Some(reason) = park_reason {
+            {
+                let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                if st.sync.process_dying {
+                    finish_tid(&st, tid, 1);
+                    return;
+                }
+            }
+            match reason {
+                HostParkReason::CriticalSection { cs } => {
+                    let q = {
+                        let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        wie_winapi::kernel32::resolve_cs_queue(&mut st, cs)
+                    };
+                    q.park_brief();
+                }
+                HostParkReason::WaitObject { handle, timeout_ms } => {
+                    let target = {
+                        let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        wie_winapi::kernel32::resolve_wait_target(&st, handle)
+                    };
+                    let result = match target {
+                        Some(t) => {
+                            if timeout_ms == wie_winapi::INFINITE {
+                                loop {
+                                    let r = t.wait(50);
+                                    if r == wie_winapi::WAIT_OBJECT_0 {
+                                        break wie_winapi::WAIT_OBJECT_0;
+                                    }
+                                    let st =
+                                        shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                                    if st.sync.process_dying {
+                                        finish_tid(&st, tid, 1);
+                                        return;
+                                    }
+                                }
+                            } else {
+                                t.wait(timeout_ms)
+                            }
+                        }
+                        None => wie_winapi::WAIT_FAILED,
+                    };
+                    let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
+                    let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                    if st.sync.process_dying {
+                        finish_tid(&st, tid, 1);
+                        return;
+                    }
+                    drop(eng.return_from_win64_api(u64::from(result)));
+                }
+                HostParkReason::WaitMultiple => {
+                    let req = {
+                        let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                        st.sync.multi_wait.remove(&tid)
+                    };
+                    let result = match req {
+                        Some(req) => {
+                            let targets = {
+                                let st =
+                                    shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                                st.sync.wait_targets(&req.handles)
+                            };
+                            match targets {
+                                Some(ts) => {
+                                    if req.timeout_ms == wie_winapi::INFINITE {
+                                        loop {
+                                            let r = wie_winapi::wait_multiple(&ts, req.wait_all, 50);
+                                            if r != wie_winapi::WAIT_TIMEOUT {
+                                                break r;
+                                            }
+                                            let st = shared_winapi
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            if st.sync.process_dying {
+                                                finish_tid(&st, tid, 1);
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        wie_winapi::wait_multiple(&ts, req.wait_all, req.timeout_ms)
+                                    }
+                                }
+                                None => wie_winapi::WAIT_FAILED,
+                            }
+                        }
+                        None => wie_winapi::WAIT_FAILED,
+                    };
+                    let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
+                    let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+                    if st.sync.process_dying {
+                        finish_tid(&st, tid, 1);
+                        return;
+                    }
+                    drop(eng.return_from_win64_api(u64::from(result)));
                 }
             }
         }
