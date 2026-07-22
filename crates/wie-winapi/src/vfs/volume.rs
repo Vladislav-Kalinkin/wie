@@ -157,9 +157,7 @@ pub fn get_drive_type(volumes: &VolumeConfig, root_path: &str) -> u32 {
     let letter = drive_letter(&norm).or_else(|| {
         // `C:` without slash
         let b = norm.as_bytes();
-        if b.len() >= 2
-            && b.get(1) == Some(&b':')
-            && b.first().is_some_and(u8::is_ascii_alphabetic)
+        if b.len() >= 2 && b.get(1) == Some(&b':') && b.first().is_some_and(u8::is_ascii_alphabetic)
         {
             b.first().map(|c| char::from(*c).to_ascii_uppercase())
         } else {

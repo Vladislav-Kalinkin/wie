@@ -104,9 +104,7 @@ impl SyncState {
         let obj = Arc::new(EventObject {
             handle,
             manual_reset,
-            state: Mutex::new(EventInner {
-                signaled: initial,
-            }),
+            state: Mutex::new(EventInner { signaled: initial }),
             cv: Condvar::new(),
         });
         self.objects

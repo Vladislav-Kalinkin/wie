@@ -235,10 +235,7 @@ fn match_glob(pat: &[char], text: &[char]) -> bool {
 pub fn drive_letter(path: &str) -> Option<char> {
     let norm = normalize_windows_path_separators(path);
     let b = norm.as_bytes();
-    if b.len() >= 2
-        && b.get(1) == Some(&b':')
-        && b.first().is_some_and(u8::is_ascii_alphabetic)
-    {
+    if b.len() >= 2 && b.get(1) == Some(&b':') && b.first().is_some_and(u8::is_ascii_alphabetic) {
         let letter = char::from(*b.first()?);
         Some(letter.to_ascii_uppercase())
     } else {
@@ -280,10 +277,7 @@ mod tests {
 
     #[test]
     fn drive_relative_v1() {
-        assert_eq!(
-            resolve_full_windows_path(r"C:\App", r"D:foo"),
-            r"D:\foo"
-        );
+        assert_eq!(resolve_full_windows_path(r"C:\App", r"D:foo"), r"D:\foo");
     }
 
     #[test]

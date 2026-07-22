@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::fake_va::{
-    COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, encode_com,
-};
+use crate::fake_va::{COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, encode_com};
 use crate::guest_memory::{
     read_u32 as read_guest_u32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
     write_u64 as write_guest_u64,

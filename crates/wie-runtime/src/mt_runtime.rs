@@ -9,7 +9,7 @@ use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use wie_winapi::{HostParkReason, PendingSpawn, PRIMARY_THREAD_ID, WinApiControlSignal};
+use wie_winapi::{HostParkReason, PRIMARY_THREAD_ID, PendingSpawn, WinApiControlSignal};
 
 /// Owns either exclusive (ST) or shared (MT) process resources.
 pub(crate) struct ProcessResources {
@@ -52,12 +52,7 @@ pub(crate) enum ProcessPairGuard<'a> {
 impl ProcessPairGuard<'_> {
     /// Simultaneous exclusive access to both sides (primary run loop).
     #[inline]
-    pub(crate) fn both(
-        &mut self,
-    ) -> (
-        &mut dyn wie_cpu::CpuEngine,
-        &mut wie_winapi::WinApiState,
-    ) {
+    pub(crate) fn both(&mut self) -> (&mut dyn wie_cpu::CpuEngine, &mut wie_winapi::WinApiState) {
         match self {
             Self::Local { eng, win } => (eng.as_mut(), win),
             Self::Shared { eng, win } => (eng.as_mut(), win),
@@ -259,14 +254,8 @@ fn worker_main(
                 return;
             }
 
-            let hook_result = eng.run_until_stop(
-                begin,
-                0,
-                0,
-                budget,
-                layout.fake_api_base,
-                fake_api_end,
-            );
+            let hook_result =
+                eng.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end);
 
             let hook = match hook_result {
                 Ok(r) if r.code.hit => r.code,
@@ -422,11 +411,7 @@ fn worker_main(
                                             }
                                         }
                                     } else {
-                                        wie_winapi::wait_multiple(
-                                            &ts,
-                                            req.wait_all,
-                                            req.timeout_ms,
-                                        )
+                                        wie_winapi::wait_multiple(&ts, req.wait_all, req.timeout_ms)
                                     }
                                 }
                                 None => wie_winapi::WAIT_FAILED,

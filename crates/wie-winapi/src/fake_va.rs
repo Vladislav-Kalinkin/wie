@@ -69,9 +69,7 @@ pub enum FakeVa {
 #[must_use]
 #[allow(clippy::as_conversions)] // const: widen kind/payload into the packed VA bitfield
 pub const fn encode(kind: u8, payload: u16) -> u64 {
-    FAKE_API_BASE
-        | ((kind as u64) << KIND_SHIFT)
-        | ((payload as u64) << ALIGN_SHIFT)
+    FAKE_API_BASE | ((kind as u64) << KIND_SHIFT) | ((payload as u64) << ALIGN_SHIFT)
 }
 
 /// Encode a primary export address for `id`.
@@ -151,7 +149,9 @@ pub fn decode(va: u64) -> Option<FakeVa> {
                 let id = WinApiId::from_u16(payload)?;
                 Some(FakeVa::Alias(id))
             } else {
-                Some(FakeVa::Unresolved(payload.wrapping_sub(SOFT_UNRESOLVED_BASE)))
+                Some(FakeVa::Unresolved(
+                    payload.wrapping_sub(SOFT_UNRESOLVED_BASE),
+                ))
             }
         }
         _ => None,

@@ -138,7 +138,8 @@ fn vfs_roundtrip_custom_paths_via_guest_flags() {
     std::fs::create_dir_all(bottle.join("drive_c/App")).unwrap();
     std::fs::create_dir_all(&host_user).unwrap();
 
-    let original = b"Hello\n\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82\n\xe4\xbd\xa0\xe5\xa5\xbd\n";
+    let original =
+        b"Hello\n\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82\n\xe4\xbd\xa0\xe5\xa5\xbd\n";
     std::fs::write(host_user.join("custom_in.txt"), original).unwrap();
 
     let summary = wie_runtime::run_micro_exe_with_options(
@@ -160,12 +161,7 @@ fn vfs_roundtrip_custom_paths_via_guest_flags() {
     )
     .expect("run with flags");
 
-    assert_eq!(
-        summary.exit_code,
-        Some(0),
-        "{:?}",
-        summary.run.termination
-    );
+    assert_eq!(summary.exit_code, Some(0), "{:?}", summary.run.termination);
 
     let copy = std::fs::read(bottle.join("drive_c/App/custom_copy.txt")).unwrap();
     assert_eq!(copy.as_slice(), original.as_slice());
