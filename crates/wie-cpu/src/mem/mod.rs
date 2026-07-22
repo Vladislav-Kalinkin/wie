@@ -1170,15 +1170,16 @@ impl GuestMemory {
                 .write_ptr(va)
                 .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
             // SAFETY: write_ptr resolved a host pointer; generation check
-            // guards against concurrent arena removal (VirtualFree/MEM_RELEASE).
-            #[expect(unsafe_code)]
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk);
-            }
+            // BEFORE the write guards against concurrent arena removal
+            // (VirtualFree/MEM_RELEASE unmaps the arena and bumps generation).
             if self.generation() != gen_start {
                 return Err(CpuError::Message(format!(
                     "mem_write generation changed at {va:#x} (concurrent map/free)"
                 )));
+            }
+            #[expect(unsafe_code)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk);
             }
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
@@ -1188,8 +1189,16 @@ impl GuestMemory {
 
     /// Read into `bytes` from guest `address` after SPC (read permission).
     pub(crate) fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), crate::CpuError> {
+        let gen_start = self.generation();
         self.pages
             .check_access(address, bytes.len(), protect::AccessKind::Read)?;
+        // Generation check BEFORE read guards against concurrent arena removal
+        // by another thread (VirtualFree/MEM_RELEASE bumps generation + unmap).
+        if self.generation() != gen_start {
+            return Err(CpuError::Message(format!(
+                "mem_read generation changed at {address:#x} (concurrent map/free)"
+            )));
+        }
         self.backend.read(address, bytes)
     }
 
@@ -1210,6 +1219,7 @@ impl GuestMemory {
         if len == 0 {
             return None;
         }
+        let gen_start = self.generation();
         let len_u = u64::try_from(len).ok()?;
         let end = address.checked_add(len_u)?;
         let kind = if write {
@@ -1235,6 +1245,10 @@ impl GuestMemory {
             if !write && !entry.allow_r {
                 return None;
             }
+            // Generation check: ensure arena is still alive before returning pointer.
+            if self.generation() != gen_start {
+                return None;
+            }
             // SAFETY: host is a mapped page base; in-page offset + len checked.
             #[expect(unsafe_code)]
             return Some(unsafe { entry.host.add(page_off) });
@@ -1254,6 +1268,9 @@ impl GuestMemory {
         }
         let off = address.checked_sub(guest_base)?;
         let off_usize = usize::try_from(off).ok()?;
+        if self.generation() != gen_start {
+            return None;
+        }
         // SAFETY: SPC passed; start and last byte share one arena; soft translate.
         #[expect(unsafe_code, clippy::as_conversions)] // host base address → data pointer
         Some(unsafe { (host_base_u as *mut u8).add(off_usize) })
@@ -1272,6 +1289,7 @@ impl GuestMemory {
         // Fetch may shorten on the trailing edge of a mapping (same as backend
         // default), but never past a permission boundary: try full length first,
         // then shrink until a legal prefix is found.
+        let gen_start = self.generation();
         let mut len = want;
         while len > 0 {
             if self
@@ -1282,6 +1300,11 @@ impl GuestMemory {
                 let Some(dst) = out.get_mut(..len) else {
                     break;
                 };
+                if self.generation() != gen_start {
+                    return Err(crate::CpuError::Message(format!(
+                        "instruction fetch generation changed at {address:#x} (concurrent map/free)"
+                    )));
+                }
                 return self.backend.fetch_into(address, dst);
             }
             len = len.saturating_sub(1);
