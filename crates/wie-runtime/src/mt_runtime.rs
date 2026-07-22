@@ -13,6 +13,30 @@ use wie_cpu::JitCpu;
 use wie_winapi::{HostParkReason, PendingSpawn, WinApiControlSignal, WinApiState};
 use wie_winapi::kernel32::{resolve_cs_queue, resolve_wait_target};
 
+// ── Helper: lock a mutex, recovering the lock on poison ───────────────
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+// ── Shared: join_workers is identical for both JIT and Iced ───────────
+
+fn join_workers_impl(winapi: &Arc<Mutex<WinApiState>>, joins: &mut Vec<JoinHandle<()>>) {
+    {
+        let mut st = lock(winapi);
+        st.sync.process_dying = true;
+        for q in st.sync.cs_waiters.values() { q.notify_all(); }
+        for obj in st.sync.objects.values() {
+            match obj {
+                wie_winapi::KernelObject::Event(e) => e.set(),
+                wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
+                wie_winapi::KernelObject::Thread(t) => { if !t.is_finished() { t.finish(1); } }
+            }
+        }
+    }
+    for j in joins.drain(..) { let _ = j.join(); }
+}
+
 // ── Shared config (present in every state) ────────────────────────────
 
 #[derive(Clone)]
@@ -74,8 +98,7 @@ impl JitState {
     }
 
     pub(crate) fn with_winapi_ref<R>(&self, f: impl FnOnce(&WinApiState) -> R) -> R {
-        let g = self.shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-        f(&g)
+        f(&lock(&self.shared_winapi))
     }
 
     pub(crate) fn drain_spawns(&mut self) -> Result<()> {
@@ -95,13 +118,13 @@ impl JitState {
         for spawn in spawns {
             let jit = Arc::clone(&shared_jit);
             let winapi = Arc::clone(&shared_winapi);
-            let s = soft.clone();
-            let b = stop_bitmap.clone();
+            let soft = soft.clone();
+            let stop_bitmap = stop_bitmap.clone();
             const STACK: usize = 8 * 1024 * 1024;
             let handle = std::thread::Builder::new()
                 .name(format!("wie-guest-{}", spawn.tid))
                 .stack_size(STACK)
-                .spawn(move || jit_worker_main(jit, winapi, s, env, layout, spawn.tid, b))
+                .spawn(move || jit_worker_main(jit, winapi, soft, env, layout, spawn.tid, stop_bitmap))
                 .context("failed to spawn guest worker")?;
             self.worker_joins.push(handle);
         }
@@ -109,18 +132,7 @@ impl JitState {
     }
 
     pub(crate) fn join_workers(&mut self) {
-        self.with_mut(|_, st| {
-            st.sync.process_dying = true;
-            for q in st.sync.cs_waiters.values() { q.notify_all(); }
-            for obj in st.sync.objects.values() {
-                match obj {
-                    wie_winapi::KernelObject::Event(e) => e.set(),
-                    wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
-                    wie_winapi::KernelObject::Thread(t) => { if !t.is_finished() { t.finish(1); } }
-                }
-            }
-        });
-        for j in self.worker_joins.drain(..) { let _ = j.join(); }
+        join_workers_impl(&self.shared_winapi, &mut self.worker_joins);
     }
 }
 
@@ -136,8 +148,8 @@ pub(crate) struct IcedState {
 impl IcedState {
     fn lock_pair(&mut self) -> ProcessGuard<'_> {
         ProcessGuard::Iced {
-            eng: self.shared_engine.lock().unwrap_or_else(|p| p.into_inner()),
-            win: self.shared_winapi.lock().unwrap_or_else(|p| p.into_inner()),
+            eng: lock(&self.shared_engine),
+            win: lock(&self.shared_winapi),
         }
     }
 
@@ -151,8 +163,7 @@ impl IcedState {
     }
 
     pub(crate) fn with_winapi_ref<R>(&self, f: impl FnOnce(&WinApiState) -> R) -> R {
-        let g = self.shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-        f(&g)
+        f(&lock(&self.shared_winapi))
     }
 
     pub(crate) fn drain_spawns(&mut self) -> Result<()> {
@@ -171,12 +182,12 @@ impl IcedState {
         for spawn in spawns {
             let eng = Arc::clone(&shared_engine);
             let winapi = Arc::clone(&shared_winapi);
-            let s = soft.clone();
+            let soft = soft.clone();
             const STACK: usize = 8 * 1024 * 1024;
             let handle = std::thread::Builder::new()
                 .name(format!("wie-guest-{}", spawn.tid))
                 .stack_size(STACK)
-                .spawn(move || iced_worker_main(eng, winapi, s, env, layout, spawn.tid))
+                .spawn(move || iced_worker_main(eng, winapi, soft, env, layout, spawn.tid))
                 .context("failed to spawn guest worker")?;
             self.worker_joins.push(handle);
         }
@@ -184,18 +195,7 @@ impl IcedState {
     }
 
     pub(crate) fn join_workers(&mut self) {
-        self.with_mut(|_, st| {
-            st.sync.process_dying = true;
-            for q in st.sync.cs_waiters.values() { q.notify_all(); }
-            for obj in st.sync.objects.values() {
-                match obj {
-                    wie_winapi::KernelObject::Event(e) => e.set(),
-                    wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
-                    wie_winapi::KernelObject::Thread(t) => { if !t.is_finished() { t.finish(1); } }
-                }
-            }
-        });
-        for j in self.worker_joins.drain(..) { let _ = j.join(); }
+        join_workers_impl(&self.shared_winapi, &mut self.worker_joins);
     }
 }
 
@@ -281,7 +281,7 @@ fn jit_worker_main(
 
     // Load initial thread context set by CreateThread.
     {
-        let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+        let st = lock(&shared_winapi);
         if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
             drop(st);
             engine.restore_thread_context(&ctx);
@@ -292,7 +292,7 @@ fn jit_worker_main(
     loop {
         let park_reason: Option<HostParkReason>;
         {
-            let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+            let mut st = lock(&shared_winapi);
             if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
 
             let begin = engine.read_rip().unwrap_or(0);
@@ -360,8 +360,8 @@ fn iced_worker_main(
     loop {
         let park_reason: Option<HostParkReason>;
         {
-                    let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
-                    let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+            let mut eng = lock(&shared_engine);
+            let mut st = lock(&shared_winapi);
             if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
 
             // Shared engine: save prev thread context, load ours.
