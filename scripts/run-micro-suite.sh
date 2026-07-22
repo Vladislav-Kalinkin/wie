@@ -42,7 +42,12 @@ run_one "$ROOT/micro-exes/out/heap_alloc.exe"
 run_one "$ROOT/micro-exes/out/heap_core.exe"
 run_one "$ROOT/micro-exes/out/winapi_heap.exe"
 run_one "$ROOT/micro-exes/out/modules.exe"
-run_one "$ROOT/micro-exes/out/long_loop.exe"
+# long_loop is a 100M-iteration compute loop; skip under iced (slice budget) or when WIE_SKIP_LONG_LOOP=1.
+if [[ "${WIE_SKIP_LONG_LOOP:-0}" != "1" ]]; then
+  run_one "$ROOT/micro-exes/out/long_loop.exe"
+else
+  echo "--- skip long_loop (WIE_SKIP_LONG_LOOP=1) ---"
+fi
 run_one "$ROOT/micro-exes/out/cpu_string.exe"
 run_one "$ROOT/micro-exes/out/cpu_math.exe"
 run_one "$ROOT/micro-exes/out/cpu_fp.exe"

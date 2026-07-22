@@ -59,9 +59,11 @@ impl SoftApiTable {
         name: &str,
         iat_slot_va: u64,
     ) -> Result<(u64, RuntimeFakeApiEntry)> {
-        if let Some(existing) = self.entries.iter().find(|e| {
-            e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name)
-        }) {
+        if let Some(existing) = self
+            .entries
+            .iter()
+            .find(|e| e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name))
+        {
             return Ok((existing.fake_target_va, existing.clone()));
         }
 
@@ -141,7 +143,10 @@ pub fn resolve_import_fake_va(
 ) -> Result<(u64, RuntimeFakeApiEntry)> {
     if let Some(id) = resolve_winapi_id(library, name) {
         let va = encode_export(id);
-        return Ok((va, make_entry(va, library.to_owned(), name.to_owned(), iat_slot_va)));
+        return Ok((
+            va,
+            make_entry(va, library.to_owned(), name.to_owned(), iat_slot_va),
+        ));
     }
     soft.intern(library, name, iat_slot_va)
 }
@@ -155,10 +160,7 @@ pub fn resolve_import_fake_va(
 /// `library` and `name` borrow from [`winapi_id_export`]'s static strings for
 /// the Export/Alias path — zero allocation on every stop.  The Unresolved path
 /// converts the soft-table `Arc<str>` to an owned `String` (far less common).
-pub(crate) fn resolve_fake_api_at(
-    address: u64,
-    soft: &SoftApiTable,
-) -> Option<ResolvedFakeApi> {
+pub(crate) fn resolve_fake_api_at(address: u64, soft: &SoftApiTable) -> Option<ResolvedFakeApi> {
     let decoded = decode_fake_va(address)?;
     let _ = address; // available for future trace correlation
     match decoded {

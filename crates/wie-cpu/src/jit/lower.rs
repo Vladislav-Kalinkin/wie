@@ -521,7 +521,11 @@ fn tlb_set_hot(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, ge
             continue;
         }
         pages[dst] = pk;
-        ptrs[dst] = ctx.sticky_ptr.get(w).copied().unwrap_or(std::ptr::null_mut());
+        ptrs[dst] = ctx
+            .sticky_ptr
+            .get(w)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
         prots[dst] = ctx.sticky_prot.get(w).copied().unwrap_or(0);
         gens[dst] = ctx.sticky_gen.get(w).copied().unwrap_or(0);
         dst = dst.saturating_add(1);
@@ -571,7 +575,11 @@ fn classify_sticky_miss(ctx: &mut JitCtx, page_key: u64, write: bool) {
             continue;
         }
         saw_key = true;
-        let host = ctx.sticky_ptr.get(w).copied().unwrap_or(std::ptr::null_mut());
+        let host = ctx
+            .sticky_ptr
+            .get(w)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
         if host.is_null() {
             continue;
         }
@@ -829,7 +837,11 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) ->
         if ctx.sticky_page.get(w).copied() != Some(page_key) {
             continue;
         }
-        let host = ctx.sticky_ptr.get(w).copied().unwrap_or(std::ptr::null_mut());
+        let host = ctx
+            .sticky_ptr
+            .get(w)
+            .copied()
+            .unwrap_or(std::ptr::null_mut());
         if host.is_null() {
             continue;
         }
@@ -3215,7 +3227,10 @@ fn materialize_shift_flags(
     let cf_on = select_flag(bcx, cf_set, rflags::CF);
     new_flags = replace_flag(bcx, new_flags, rflags::CF, cf_on);
     new_flags = replace_flag(bcx, new_flags, rflags::OF, of_merged);
-    if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar | ShiftKind::Rcl | ShiftKind::Rcr) {
+    if matches!(
+        kind,
+        ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar | ShiftKind::Rcl | ShiftKind::Rcr
+    ) {
         new_flags = flags_zs_pf(bcx, new_flags, result, bits);
     }
     // count_mod == 0: architectural flags unchanged
@@ -4316,19 +4331,15 @@ fn sticky_tlb_probe(
         bcx.switch_to_block(hit);
         bcx.seal_block(hit);
         let one_i8 = bcx.ins().iconst(types::I8, 1);
-        bcx.ins().jump(
-            merge,
-            &[BlockArg::Value(one_i8), BlockArg::Value(host)],
-        );
+        bcx.ins()
+            .jump(merge, &[BlockArg::Value(one_i8), BlockArg::Value(host)]);
         bcx.switch_to_block(miss);
         bcx.seal_block(miss);
     }
 
     // All ways missed.
-    bcx.ins().jump(
-        merge,
-        &[BlockArg::Value(zero_i8), BlockArg::Value(zero)],
-    );
+    bcx.ins()
+        .jump(merge, &[BlockArg::Value(zero_i8), BlockArg::Value(zero)]);
     bcx.switch_to_block(merge);
     bcx.seal_block(merge);
     let params = bcx.block_params(merge);
@@ -5521,10 +5532,7 @@ fn lower_bit_test_op(
 
     // For Bts/Btr/Btc, write back the modified value.
     let mnemonic = instr.mnemonic();
-    if matches!(
-        mnemonic,
-        Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc
-    ) {
+    if matches!(mnemonic, Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc) {
         let bit_mask = bcx.ins().ishl(one, idx_masked);
         let new_val = if mnemonic == Mnemonic::Bts {
             // Set the bit: val | (1 << idx)

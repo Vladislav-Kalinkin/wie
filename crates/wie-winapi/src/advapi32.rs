@@ -177,15 +177,9 @@ fn handle_open_process_token(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    let _process = engine
-        .read_rcx()
-        .context("OpenProcessToken RCX")?;
-    let _access = engine
-        .read_rdx()
-        .context("OpenProcessToken RDX")?;
-    let token_out = engine
-        .read_r8()
-        .context("OpenProcessToken R8")?;
+    let _process = engine.read_rcx().context("OpenProcessToken RCX")?;
+    let _access = engine.read_rdx().context("OpenProcessToken RDX")?;
+    let token_out = engine.read_r8().context("OpenProcessToken R8")?;
     if token_out != 0 {
         write_guest_u64(engine, token_out, FAKE_PROCESS_TOKEN)?;
     }

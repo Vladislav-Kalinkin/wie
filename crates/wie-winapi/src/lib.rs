@@ -29,17 +29,17 @@ pub mod uxtheme;
 pub mod vfs;
 pub mod winmm;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
-pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
 pub use sync_obj::{
     CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, PendingSpawn, STILL_ACTIVE,
     SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
     wait_multiple,
 };
+pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
 // HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
     COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
-    SPECIAL_CALLBACK_RETURN, callback_return_trampoline_va, decode as decode_fake_va,
-    encode_alias, encode_com, encode_export, encode_unresolved,
+    SPECIAL_CALLBACK_RETURN, callback_return_trampoline_va, decode as decode_fake_va, encode_alias,
+    encode_com, encode_export, encode_unresolved,
 };
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};
@@ -793,11 +793,7 @@ mod tests {
 
     /// Low 32 bits of RAX as signed LONG (Win64 return convention for Interlocked*).
     fn rax_low_i32(rax: u64) -> i32 {
-        i32::from_le_bytes(
-            u32::try_from(rax & 0xffff_ffff)
-                .unwrap_or(0)
-                .to_le_bytes(),
-        )
+        i32::from_le_bytes(u32::try_from(rax & 0xffff_ffff).unwrap_or(0).to_le_bytes())
     }
 
     fn default_winapi_state() -> WinApiState {
@@ -926,7 +922,9 @@ mod tests {
         kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave1");
         write_regs(&mut engine, cs, 0, 0, 0, 0);
         kernel32::handle_leave_critical_section(&mut engine, &mut state).expect("leave2");
-        engine.mem_read(cs + 16, &mut owner).expect("read owner unlocked");
+        engine
+            .mem_read(cs + 16, &mut owner)
+            .expect("read owner unlocked");
         assert_eq!(u64::from_le_bytes(owner), 0);
         assert_eq!(state.threads.current_tid(), PRIMARY_THREAD_ID);
     }
@@ -993,7 +991,9 @@ mod tests {
 
         // 64-bit Increment64
         let cell64 = 0x4010_u64;
-        engine.mem_write(cell64, &10_i64.to_le_bytes()).expect("zero64");
+        engine
+            .mem_write(cell64, &10_i64.to_le_bytes())
+            .expect("zero64");
         write_regs(&mut engine, cell64, 0, 0, 0, 0);
         let r = kernel32::dispatch_kernel32_extra(
             &mut engine,

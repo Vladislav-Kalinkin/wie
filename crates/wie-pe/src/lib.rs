@@ -776,7 +776,10 @@ pub fn build_loaded_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageS
 }
 
 /// Private: build loaded image from a pre-parsed PE (no re-parse).
-fn build_loaded_image_from_parsed(pe: &PE, bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
+fn build_loaded_image_from_parsed(
+    pe: &PE,
+    bytes: &[u8],
+) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
@@ -933,8 +936,8 @@ where
     let identity = pe_identity_from_parsed(&pe, Path::new("<memory>"), bytes)?;
     let map_plan = pe_map_plan_from_parsed(&pe, bytes)?;
 
-    let header_size = usize::try_from(identity.size_of_headers)
-        .context("size_of_headers does not fit usize")?;
+    let header_size =
+        usize::try_from(identity.size_of_headers).context("size_of_headers does not fit usize")?;
 
     if header_size > bytes.len() {
         bail!("size_of_headers is larger than file size");
@@ -979,12 +982,8 @@ where
     let imports = inspect_pe_imports_from_parsed(&pe, bytes)?;
 
     // Patch IAT directly in guest memory through the writer.
-    let patched = patch_loaded_image_imports_direct(
-        image_base,
-        &imports,
-        &mut mem_write,
-        &mut fake_target,
-    )?;
+    let patched =
+        patch_loaded_image_imports_direct(image_base, &imports, &mut mem_write, &mut fake_target)?;
 
     let summary = PeLoadedImageSummary {
         image_base: identity.image_base,

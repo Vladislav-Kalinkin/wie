@@ -38,10 +38,9 @@ use fast_api::{
 };
 use lower::{
     CHAIN_SLOTS, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY,
-    TLB_SETS, TlbBucket,
-    TlbBucketAux, XmmSlot, chain_table_clear, chain_table_insert, compile_block, empty_tlb_aux,
-    empty_tlb_bucket, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_host_span,
-    wie_jit_load, wie_jit_store, wie_jit_string,
+    TLB_SETS, TlbBucket, TlbBucketAux, XmmSlot, chain_table_clear, chain_table_insert,
+    compile_block, empty_tlb_aux, empty_tlb_bucket, wie_f32_binop, wie_f64_binop,
+    wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
 };
 use std::collections::HashMap;
 use trampolines::match_micro_stub;
@@ -128,7 +127,9 @@ fn mem_path_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| match std::env::var("WIE_JIT_MEM_TRACE") {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") => true,
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes") => {
+            true
+        }
         // Also dump when residual iced trace is on (profiling runs).
         _ => matches!(
             std::env::var("WIE_EXEC_TRACE"),
@@ -326,10 +327,7 @@ pub fn dump_mem_path_stats(s: &JitStats) {
     );
     eprintln!(
         "[wie]   sticky_miss: key={} gen={} prot={} swaps={}",
-        s.mem_sticky_miss_key,
-        s.mem_sticky_miss_gen,
-        s.mem_sticky_miss_prot,
-        s.mem_sticky_swaps
+        s.mem_sticky_miss_key, s.mem_sticky_miss_gen, s.mem_sticky_miss_prot, s.mem_sticky_swaps
     );
     eprintln!(
         "[wie]   addr_vs_pin: stack={} heap={} outside={}",
@@ -337,16 +335,10 @@ pub fn dump_mem_path_stats(s: &JitStats) {
     );
     eprintln!(
         "[wie]   gen: bumps={} peak={}  pins: stack_bytes={:#x} heap_bytes={:#x} allow={:#x}",
-        s.mem_gen_bumps,
-        s.mem_gen_peak,
-        s.pin_stack_bytes,
-        s.pin_heap_bytes,
-        s.pin_allow_bits
+        s.mem_gen_bumps, s.mem_gen_peak, s.pin_stack_bytes, s.pin_heap_bytes, s.pin_allow_bits
     );
     if helpers > 0 {
-        let pct10 = |n: u64| -> u64 {
-            n.saturating_mul(1000).checked_div(helpers).unwrap_or(0)
-        };
+        let pct10 = |n: u64| -> u64 { n.saturating_mul(1000).checked_div(helpers).unwrap_or(0) };
         let fmt = |n: u64| {
             let t = pct10(n);
             format!("{}.{}", t.checked_div(10).unwrap_or(0), t % 10)
@@ -472,8 +464,6 @@ impl JitCpu {
     pub fn stats(&self) -> JitStats {
         self.stats
     }
-
-
 
     /// Install UCRT/heap fast-path config (called once after fake-API table build).
     pub fn configure_fast_path(&mut self, cfg: JitFastPathConfig) {
@@ -916,8 +906,8 @@ impl JitCpu {
                 if pin.host_base == 0 {
                     continue;
                 }
-                data_bytes = data_bytes
-                    .saturating_add(pin.guest_end.saturating_sub(pin.guest_base));
+                data_bytes =
+                    data_bytes.saturating_add(pin.guest_end.saturating_sub(pin.guest_base));
                 // Pack first two data pins' allow into bits 2..5 for compact dump.
                 if i <= 2 {
                     let shift = (i.saturating_sub(1).saturating_add(1)) * 2;

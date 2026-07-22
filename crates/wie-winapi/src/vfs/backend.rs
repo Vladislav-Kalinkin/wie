@@ -124,9 +124,7 @@ fn not_found() -> PathStat {
 fn is_drive_root(path: &str) -> bool {
     let p = path.trim_end_matches(['\\', '/']);
     let b = p.as_bytes();
-    b.len() == 2
-        && b.get(1) == Some(&b':')
-        && b.first().is_some_and(u8::is_ascii_alphabetic)
+    b.len() == 2 && b.get(1) == Some(&b':') && b.first().is_some_and(u8::is_ascii_alphabetic)
 }
 
 fn is_synthetic_dir(ctx: &ResolveCtx<'_>, path: &str) -> bool {
@@ -142,8 +140,7 @@ fn is_synthetic_dir(ctx: &ResolveCtx<'_>, path: &str) -> bool {
     for d in ctx.synthetic_dirs {
         let dl = d.trim_end_matches('\\').to_ascii_lowercase();
         if dl.starts_with(&lower)
-            && (dl.len() == lower.len()
-                || dl.as_bytes().get(lower.len()) == Some(&b'\\'))
+            && (dl.len() == lower.len() || dl.as_bytes().get(lower.len()) == Some(&b'\\'))
         {
             return true;
         }

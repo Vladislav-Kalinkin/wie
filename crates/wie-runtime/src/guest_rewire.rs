@@ -19,16 +19,17 @@ pub(crate) struct FakeApiRewire<'a> {
 impl FakeApiRewire<'_> {
     /// Plant `mov rax,imm64; jmp rax` at the dense fake VA for `library!name`.
     pub(crate) fn rewire(&mut self, library: &str, name: &str, target_va: u64) -> Result<()> {
-        let from = if let Some(id) = resolve_winapi_id(library, name) {
-            encode_export(id)
-        } else if let Some(entry) = self.entries.iter().find(|e| {
-            e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name)
-        }) {
-            entry.fake_target_va
-        } else {
-            tracing::debug!(library, name, "guest rewire: export not in IAT, skip");
-            return Ok(());
-        };
+        let from =
+            if let Some(id) = resolve_winapi_id(library, name) {
+                encode_export(id)
+            } else if let Some(entry) = self.entries.iter().find(|e| {
+                e.library.eq_ignore_ascii_case(library) && e.name.eq_ignore_ascii_case(name)
+            }) {
+                entry.fake_target_va
+            } else {
+                tracing::debug!(library, name, "guest rewire: export not in IAT, skip");
+                return Ok(());
+            };
 
         plant_jmp_abs64(self.engine, from, target_va)?;
         // 12-byte absolute jmp: mark all bytes as guest passthrough.

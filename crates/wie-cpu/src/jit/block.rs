@@ -224,8 +224,10 @@ fn is_lowerable(instr: &Instruction) -> bool {
         Mnemonic::Push => push_is_lowerable(instr),
         Mnemonic::Pop => pop_is_lowerable(instr),
         // Bswap: r32 / r64 only (no memory form).
-        Mnemonic::Bswap => matches!(instr.op0_kind(), OpKind::Register)
-            && matches!(instr.op_register(0).size(), 4 | 8),
+        Mnemonic::Bswap => {
+            matches!(instr.op0_kind(), OpKind::Register)
+                && matches!(instr.op_register(0).size(), 4 | 8)
+        }
         Mnemonic::Add
         | Mnemonic::Adc
         | Mnemonic::Sub
