@@ -1,7 +1,7 @@
 //! Decode a lowerable straight-line block for Cranelift (GPR + simple mem + jcc/jmp term).
 
-use crate::mem::GuestMemory;
 use crate::exec::HookWindow;
+use crate::mem::GuestMemory;
 use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
 
 /// Max instructions per compiled block (keeps compile time bounded).
@@ -54,7 +54,11 @@ pub(super) enum BlockKind {
 ///
 /// A near `jcc`/`jmp` terminator is **included** and ends the block. Other
 /// non-lowerable insns are **not** included (interpreter runs them next).
-pub(super) fn decode_pure_gpr_block(mem: &GuestMemory, hooks: Option<&HookWindow>, start: u64) -> BlockKind {
+pub(super) fn decode_pure_gpr_block(
+    mem: &GuestMemory,
+    hooks: Option<&HookWindow>,
+    start: u64,
+) -> BlockKind {
     let mut insns = Vec::with_capacity(MAX_BLOCK_INSNS);
     let mut rip = start;
     let mut bytes_len = 0_u32;

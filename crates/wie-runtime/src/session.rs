@@ -8,7 +8,7 @@ use crate::memory::{
     DEFAULT_LAYOUT, RuntimeMemoryLayout, build_default_environment_strings_w,
     default_winapi_environment, default_winapi_state, write_process_identity_strings,
 };
-use crate::mt_runtime::{self, ProcessConfig, ProcessState};
+use crate::mt_runtime::{ProcessConfig, ProcessResources};
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -473,8 +473,8 @@ fn register_layout_regions(
 /// The session owns the CPU engine, guest memory, WinAPI state and
 /// dispatcher metadata so execution can yield and later resume.
 pub struct RuntimeSession {
-    /// CPU + WinAPI (Jit or Iced state, determined at construction).
-    process: ProcessState,
+    /// CPU + WinAPI (single struct for both JIT and Iced).
+    process: ProcessResources,
     entry_point_va: u64,
     initial_rsp: u64,
     next_api_index: usize,
@@ -519,8 +519,17 @@ impl RuntimeSession {
         }
     }
 
-    fn build_process(init: SessionInit) -> ProcessState {
-        let SessionInit { engine, environment, winapi_state, soft_apis, layout, stop_bitmap, shared_jit, .. } = init;
+    fn build_process(init: SessionInit) -> ProcessResources {
+        let SessionInit {
+            engine,
+            environment,
+            winapi_state,
+            soft_apis,
+            layout,
+            stop_bitmap,
+            shared_jit,
+            ..
+        } = init;
         let config = ProcessConfig {
             soft_apis,
             environment,
@@ -530,21 +539,27 @@ impl RuntimeSession {
         };
         let shared_winapi = Arc::new(Mutex::new(winapi_state));
 
-        if let Some(jit) = shared_jit {
-            ProcessState::Jit(mt_runtime::JitState {
-                config,
-                engine,
-                shared_jit: jit,
-                shared_winapi,
-                worker_joins: Vec::new(),
-            })
+        // When shared_jit is None, the engine is IcedCpu; extract its
+        // GuestMemory handle for worker spawns. Avoids exposing GuestMemory
+        // through the public CpuEngine trait.
+        let guest_mem = if shared_jit.is_none() {
+            // SAFETY: open_default_cpu_with_shared guarantees IcedCpu when
+            // shared_jit is None; the engine is not a trait object alias.
+            #[expect(unsafe_code)]
+            let iced =
+                unsafe { &*(&*engine as *const dyn wie_cpu::CpuEngine as *const wie_cpu::IcedCpu) };
+            Some(Arc::clone(iced.guest_mem_arc()))
         } else {
-            ProcessState::Iced(mt_runtime::IcedState {
-                config,
-                engine,
-                shared_winapi,
-                worker_joins: Vec::new(),
-            })
+            None
+        };
+
+        ProcessResources {
+            config,
+            engine,
+            shared_jit,
+            guest_mem,
+            shared_winapi,
+            worker_joins: Vec::new(),
         }
     }
 
@@ -632,8 +647,11 @@ impl RuntimeSession {
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
 
         // WIE CPU backend (JIT default; `WIE_CPU=iced` for interpreter).
-        let (mut engine, shared_jit) = wie_cpu::open_default_cpu_with_shared()
-            .context("failed to open WIE CPU backend")?;
+        let backend = wie_cpu::open_cpu().context("failed to open WIE CPU backend")?;
+        let (mut engine, shared_jit) = match backend {
+            wie_cpu::CpuBackend::Jit { engine, shared } => (engine, Some(shared)),
+            wie_cpu::CpuBackend::Iced { engine } => (engine, None),
+        };
 
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
         // are written directly into guest memory (no intermediate Vec<u8> buffer).
@@ -1232,7 +1250,8 @@ impl RuntimeSession {
 
                 // Ensure primary TLS/TID active when shared with workers.
                 if winapi_state.threads.active.tid != primary_tid {
-                    crate::mt_runtime::load_thread(engine, winapi_state, primary_tid);
+                    // Per-thread engines: primary regs are in `engine`, no context restore needed.
+                    winapi_state.threads.activate(primary_tid);
                 }
 
                 let current_rip = engine
@@ -1716,8 +1735,9 @@ impl RuntimeSession {
                             };
                             self.process.with_mut(|eng, st| {
                                 st.threads.activate(primary_tid);
-                                eng.return_from_win64_api(u64::from(result))
-                                    .expect("return_from_win64_api: guest stack corrupted");
+                                let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
+                                    tracing::error!("guest stack corrupted on wait park: {e}")
+                                });
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
@@ -1743,8 +1763,9 @@ impl RuntimeSession {
                             };
                             self.process.with_mut(|eng, st| {
                                 st.threads.activate(primary_tid);
-                                eng.return_from_win64_api(u64::from(result))
-                                    .expect("return_from_win64_api: guest stack corrupted");
+                                let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
+                                    tracing::error!("guest stack corrupted on wait park: {e}")
+                                });
                             });
                             charged_api = charged_api.saturating_add(1);
                         }

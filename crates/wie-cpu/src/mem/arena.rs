@@ -149,7 +149,6 @@ impl MmapArena {
     /// # Safety
     /// Caller holds a shared borrow of the arena for the slice lifetime.
     pub(super) unsafe fn as_slice(&self) -> &[u8] {
-        // SAFETY: live mmap of `size`; shared borrow of arena.
         unsafe { std::slice::from_raw_parts(self.host, self.size) }
     }
 
@@ -158,7 +157,6 @@ impl MmapArena {
     /// # Safety
     /// Caller holds an exclusive borrow of the arena for the slice lifetime.
     pub(super) unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        // SAFETY: live mmap of `size`; exclusive borrow of arena.
         unsafe { std::slice::from_raw_parts_mut(self.host, self.size) }
     }
 }
@@ -280,6 +278,9 @@ impl ArenaSet {
     /// Host pointer for writing at guest `address` (lock-free data-plane path).
     ///
     /// Returns `None` when the VA is unmapped or the arena host pointer is null.
+    /// The returned pointer is valid only while the arena is alive (generation
+    /// unchanged); caller must pair with a generation check to guard against
+    /// concurrent `munmap` via `VirtualFree(MEM_RELEASE)`.
     /// Caller must validate `address + len` fits within one page before using
     /// this pointer for a multi-byte write (pages within one arena are contiguous,
     /// but cross-page writes need multiple resolves).
@@ -483,7 +484,6 @@ impl ArenaSet {
         let off_usize = usize::try_from(off).map_err(|_| ())?;
         // Host base is host-page aligned; require offset multiple of host page size.
         let host_ps = {
-            #[expect(unsafe_code)]
             let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
             if n > 0 {
                 usize::try_from(n).unwrap_or(0x1000)

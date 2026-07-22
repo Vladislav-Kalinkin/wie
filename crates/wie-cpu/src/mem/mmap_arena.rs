@@ -83,11 +83,7 @@ impl GuestMemBackend for MmapArenaBackend {
         self.arenas.read(address, bytes)
     }
 
-    fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
-        self.arenas.page_data_ptr(page_key)
-    }
-
-    fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
+    fn page_data_ptr(&self, page_key: u64) -> Option<*mut u8> {
         self.arenas.page_data_ptr(page_key)
     }
 

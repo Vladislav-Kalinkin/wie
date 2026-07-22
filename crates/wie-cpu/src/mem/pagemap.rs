@@ -3,11 +3,17 @@
 //! Absence of a page key means [`PageState::Free`]. Host storage is owned by the
 //! backend; this map is the Windows-visible correctness plane only.
 
+#![allow(clippy::unwrap_used)] // Mutex<RunCache> locks are infallible in practice
+
 use super::backend::{PAGE_SHIFT, PAGE_SIZE};
 use super::protect::{self, AccessKind};
 use crate::CpuError;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+
+fn lock_cache(m: &Mutex<RunCache>) -> std::sync::MutexGuard<'_, RunCache> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Guest page lifecycle state (Microsoft Learn page states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -88,7 +94,7 @@ impl Clone for PageMap {
     fn clone(&self) -> Self {
         Self {
             runs: self.runs.clone(),
-            cache: Mutex::new(self.cache.lock().unwrap().clone()),
+            cache: Mutex::new(*lock_cache(&self.cache)),
         }
     }
 }
@@ -102,13 +108,13 @@ impl PageMap {
 
     /// Invalidate the hot-path run cache (after any mutation).
     fn bump_cache(&mut self) {
-        *self.cache.lock().unwrap() = RunCache::default();
+        *lock_cache(&self.cache) = RunCache::default();
     }
 
     /// Look up the run covering `page_key`, if any.
     #[must_use]
     pub fn lookup(&self, page_key: u64) -> Option<PageRun> {
-        let c = *self.cache.lock().unwrap();
+        let c = *lock_cache(&self.cache);
         if c.valid && page_key >= c.start_page && page_key < c.end_page {
             return Some(PageRun {
                 start_page: c.start_page,
@@ -129,7 +135,7 @@ impl PageMap {
 
     /// Cache a successful lookup for subsequent adjacent accesses.
     fn fill_cache(&self, run: PageRun) {
-        *self.cache.lock().unwrap() = RunCache {
+        *lock_cache(&self.cache) = RunCache {
             valid: true,
             start_page: run.start_page,
             end_page: run.end_page,

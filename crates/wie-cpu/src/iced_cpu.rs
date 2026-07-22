@@ -8,11 +8,11 @@ use crate::{CpuEngine, CpuError, RunUntilHook};
 use std::sync::{Arc, RwLock};
 
 fn lock_rd<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    m.read().unwrap_or_else(|p| p.into_inner())
+    m.read().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn lock_wr<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    m.write().unwrap_or_else(|p| p.into_inner())
+    m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 const RIP_TRACE_CAP: usize = 32;
@@ -60,9 +60,23 @@ impl IcedCpu {
         }
     }
 
+    /// Create a temporary IcedCpu from a shared `GuestMemory` handle, used
+    /// only as a source for [`Self::new_shared`] when spawning workers.
     #[must_use]
-    #[expect(dead_code)]
-    pub(crate) fn guest_mem_arc(&self) -> &Arc<RwLock<GuestMemory>> {
+    pub fn new_standalone_with_mem(mem: Arc<RwLock<GuestMemory>>) -> Self {
+        Self {
+            mem,
+            regs: RegFile::new(),
+            hooks: None,
+            rip_trace: [0; RIP_TRACE_CAP],
+            rip_trace_i: 0,
+            rip_trace_n: 0,
+            iced_steps: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn guest_mem_arc(&self) -> &Arc<RwLock<GuestMemory>> {
         &self.mem
     }
 
@@ -130,7 +144,7 @@ impl IcedCpu {
         self.push_rip_trace(self.regs.rip);
         let hook = self.hooks.as_ref();
         let mem_guard = lock_rd(&self.mem);
-        let result = exec::step(&*mem_guard, &mut self.regs, hook)?;
+        let result = exec::step(&mem_guard, &mut self.regs, hook)?;
         drop(mem_guard);
         if matches!(result, StepResult::Continue) {
             self.iced_steps = self.iced_steps.saturating_add(1);
@@ -255,11 +269,7 @@ impl CpuEngine for IcedCpu {
         _hook_end: u64,
     ) -> Result<RunUntilHook, CpuError> {
         self.regs.rip = begin;
-        let budget = if count == 0 {
-            100_000_000_usize
-        } else {
-            count
-        };
+        let budget = if count == 0 { 100_000_000_usize } else { count };
 
         let mut executed = 0_usize;
         while executed < budget {
@@ -273,7 +283,7 @@ impl CpuEngine for IcedCpu {
             }
             let hook_ref = self.hooks.as_ref();
             let mem_guard = lock_rd(&self.mem);
-            match exec::step(&*mem_guard, &mut self.regs, hook_ref) {
+            match exec::step(&mem_guard, &mut self.regs, hook_ref) {
                 Ok(StepResult::Continue) => {
                     drop(mem_guard);
                     executed = executed.saturating_add(1);
@@ -281,16 +291,26 @@ impl CpuEngine for IcedCpu {
                 }
                 Ok(StepResult::HostStop { address, size }) => {
                     return Ok(RunUntilHook {
-                        code: CodeHookOutcome { hit: true, address, size },
+                        code: CodeHookOutcome {
+                            hit: true,
+                            address,
+                            size,
+                        },
                         invalid_memory: InvalidMemoryAccess {
-                            hit: false, access_type: 0, address: 0, size: 0, value: 0,
+                            hit: false,
+                            access_type: 0,
+                            address: 0,
+                            size: 0,
+                            value: 0,
                         },
                     });
                 }
                 Ok(StepResult::InvalidMemory(inv)) => {
                     return Ok(RunUntilHook {
                         code: CodeHookOutcome {
-                            hit: false, address: 0, size: 0,
+                            hit: false,
+                            address: 0,
+                            size: 0,
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
@@ -314,19 +334,37 @@ impl CpuEngine for IcedCpu {
                          rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} \
                          r8={:#x} r9={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}; \
                          iced_rip_trace=[{trace_s}]",
-                        r.rax(), r.rbx(), r.rcx(), r.rdx(),
-                        r.rsp(), r.rbp(), r.rsi(), r.rdi(),
-                        r.r8(), r.r9(),
-                        r.gpr(12), r.gpr(13), r.gpr(14), r.gpr(15),
+                        r.rax(),
+                        r.rbx(),
+                        r.rcx(),
+                        r.rdx(),
+                        r.rsp(),
+                        r.rbp(),
+                        r.rsi(),
+                        r.rdi(),
+                        r.r8(),
+                        r.r9(),
+                        r.gpr(12),
+                        r.gpr(13),
+                        r.gpr(14),
+                        r.gpr(15),
                     )));
                 }
             }
         }
 
         Ok(RunUntilHook {
-            code: CodeHookOutcome { hit: false, address: 0, size: 0 },
+            code: CodeHookOutcome {
+                hit: false,
+                address: 0,
+                size: 0,
+            },
             invalid_memory: InvalidMemoryAccess {
-                hit: false, access_type: 0, address: 0, size: 0, value: 0,
+                hit: false,
+                access_type: 0,
+                address: 0,
+                size: 0,
+                value: 0,
             },
         })
     }
@@ -346,22 +384,61 @@ impl CpuEngine for IcedCpu {
         Ok(return_address)
     }
 
-    fn read_rip(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rip) }
-    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> { self.regs.rip = value; Ok(()) }
-    fn read_rsp(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rsp()) }
-    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rsp(value); Ok(()) }
-    fn read_rax(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rax()) }
-    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rax(value); Ok(()) }
-    fn read_rcx(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rcx()) }
-    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rcx(value); Ok(()) }
-    fn read_rdx(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rdx()) }
-    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rdx(value); Ok(()) }
-    fn read_r8(&mut self) -> Result<u64, CpuError> { Ok(self.regs.r8()) }
-    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_r8(value); Ok(()) }
-    fn read_r9(&mut self) -> Result<u64, CpuError> { Ok(self.regs.r9()) }
-    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_r9(value); Ok(()) }
-    fn read_rbx(&mut self) -> Result<u64, CpuError> { Ok(self.regs.gpr(3)) }
-    fn read_r12(&mut self) -> Result<u64, CpuError> { Ok(self.regs.gpr(12)) }
+    fn read_rip(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.rip)
+    }
+    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.rip = value;
+        Ok(())
+    }
+    fn read_rsp(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.rsp())
+    }
+    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.set_rsp(value);
+        Ok(())
+    }
+    fn read_rax(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.rax())
+    }
+    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.set_rax(value);
+        Ok(())
+    }
+    fn read_rcx(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.rcx())
+    }
+    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.set_rcx(value);
+        Ok(())
+    }
+    fn read_rdx(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.rdx())
+    }
+    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.set_rdx(value);
+        Ok(())
+    }
+    fn read_r8(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.r8())
+    }
+    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.set_r8(value);
+        Ok(())
+    }
+    fn read_r9(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.r9())
+    }
+    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> {
+        self.regs.set_r9(value);
+        Ok(())
+    }
+    fn read_rbx(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.gpr(3))
+    }
+    fn read_r12(&mut self) -> Result<u64, CpuError> {
+        Ok(self.regs.gpr(12))
+    }
 
     fn snapshot_thread_context(&mut self) -> crate::ThreadContext {
         self.regs.snapshot()

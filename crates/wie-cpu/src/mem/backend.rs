@@ -36,10 +36,12 @@ pub trait GuestMemBackend {
     fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError>;
 
     /// Host pointer to a mapped page's data (JIT TLB). `page_key = va >> PAGE_SHIFT`.
-    fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8>;
+    fn page_data_ptr(&self, page_key: u64) -> Option<*mut u8>;
 
-    /// Fast page-table walk (may be identical to [`page_data_ptr`]).
-    fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8>;
+    /// Fast page-table walk. Default delegates to [`page_data_ptr`].
+    fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
+        self.page_data_ptr(page_key)
+    }
 
     /// Fill `out` (≤15 bytes) from guest `address` for instruction fetch.
     /// Returns the number of valid bytes written.

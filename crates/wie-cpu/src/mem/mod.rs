@@ -104,7 +104,7 @@ const HOST_PROT_WRITE: i32 = libc::PROT_WRITE;
 ///
 /// Storage is always [`MmapArenaBackend`]. Permission enforcement lives here
 /// (not inside the backend) so SPC is the sole correctness plane.
-pub(crate) struct GuestMemory {
+pub struct GuestMemory {
     backend: MmapArenaBackend,
     regions: RegionTable,
     pages: PageMap,
@@ -1150,6 +1150,7 @@ impl GuestMemory {
     /// Uses pointer-based write to mmap arena data plane — no backend mutation,
     /// so this method takes `&self` and is safe for concurrent caller threads.
     pub(crate) fn write(&self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
+        let gen_start = self.generation();
         self.pages
             .check_access(address, bytes.len(), protect::AccessKind::Write)?;
         // Lock-free pointer-based write: each page is resolved separately
@@ -1168,10 +1169,16 @@ impl GuestMemory {
                 .backend
                 .write_ptr(va)
                 .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
-            // SAFETY: write_ptr returned host pointer for mapped VA; SPC passed.
+            // SAFETY: write_ptr resolved a host pointer; generation check
+            // guards against concurrent arena removal (VirtualFree/MEM_RELEASE).
             #[expect(unsafe_code)]
             unsafe {
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk);
+            }
+            if self.generation() != gen_start {
+                return Err(CpuError::Message(format!(
+                    "mem_write generation changed at {va:#x} (concurrent map/free)"
+                )));
             }
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
@@ -1293,7 +1300,7 @@ impl GuestMemory {
     /// capability bits so the fast path can enforce SPC without a helper call.
     #[must_use]
     #[cfg_attr(not(test), expect(dead_code))]
-    pub(crate) fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
+    pub(crate) fn page_data_ptr(&self, page_key: u64) -> Option<*mut u8> {
         self.page_tlb_entry(page_key).map(|e| e.host)
     }
 
@@ -1309,7 +1316,7 @@ impl GuestMemory {
 
     /// Resolve a committed page for JIT TLB install: host pointer + R/W flags + gen.
     #[must_use]
-    pub(crate) fn page_tlb_entry(&mut self, page_key: u64) -> Option<PageTlbEntry> {
+    pub(crate) fn page_tlb_entry(&self, page_key: u64) -> Option<PageTlbEntry> {
         let meta = self.page_protect_meta(page_key)?;
         let host = self.backend.page_data_ptr(page_key)?;
         Some(PageTlbEntry {
@@ -1323,14 +1330,7 @@ impl GuestMemory {
     /// Read-only walk variant of [`Self::page_tlb_entry`].
     #[must_use]
     pub(crate) fn page_tlb_entry_walk(&self, page_key: u64) -> Option<PageTlbEntry> {
-        let meta = self.page_protect_meta(page_key)?;
-        let host = self.backend.page_data_ptr_walk(page_key)?;
-        Some(PageTlbEntry {
-            host,
-            allow_r: meta.allow_r,
-            allow_w: meta.allow_w,
-            generation: self.generation(),
-        })
+        self.page_tlb_entry(page_key)
     }
 
     fn page_protect_meta(&self, page_key: u64) -> Option<PageProtectMeta> {

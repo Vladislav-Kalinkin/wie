@@ -26,8 +26,8 @@ pub use jit::{
 pub use mem::protect;
 pub use mem::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
-    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestRegion, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE,
-    MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType, MemoryBasicInformation,
+    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestMemory, GuestRegion, MEM_COMMIT, MEM_DECOMMIT,
+    MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType, MemoryBasicInformation,
     MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun, PageState, RegionKind,
     RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
@@ -319,12 +319,6 @@ pub trait CpuEngine: Send {
     ///
     /// No-op for pure interpreter backends.
     fn on_thread_switch(&mut self) {}
-
-    /// Access the shared JIT state, if this engine is backed by a JitCpu.
-    /// Returns `None` for IcedCpu or other backends.
-    fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
-        None
-    }
 }
 
 impl CpuEngine for Box<dyn CpuEngine> {
@@ -469,9 +463,6 @@ impl CpuEngine for Box<dyn CpuEngine> {
     fn on_thread_switch(&mut self) {
         (**self).on_thread_switch();
     }
-    fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
-        (**self).shared_jit()
-    }
 }
 
 /// Active backend name (env `WIE_CPU`, default **`jit`**).
@@ -502,21 +493,59 @@ pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
 
 /// Open a CPU backend and return the engine together with its shared JIT state.
 ///
-/// For JIT backends, returns `Some(Arc<JitShared>)` for sharing across per-thread
-/// engines. For iced backends, returns `None`.
+/// Bundled CPU backend: engine + optional shared state for per-thread workers.
+pub enum CpuBackend {
+    /// Cranelift JIT: engine + shared compilation cache.
+    Jit {
+        engine: Box<dyn CpuEngine>,
+        shared: Arc<crate::jit::JitShared>,
+    },
+    /// iced-x86 interpreter: standalone engine.
+    Iced { engine: Box<dyn CpuEngine> },
+}
+
+impl CpuBackend {
+    pub fn engine(&self) -> &dyn CpuEngine {
+        match self {
+            Self::Jit { engine, .. } | Self::Iced { engine } => &**engine,
+        }
+    }
+    pub fn engine_mut(&mut self) -> &mut dyn CpuEngine {
+        match self {
+            Self::Jit { engine, .. } | Self::Iced { engine } => &mut **engine,
+        }
+    }
+    pub fn into_engine(self) -> Box<dyn CpuEngine> {
+        match self {
+            Self::Jit { engine, .. } | Self::Iced { engine } => engine,
+        }
+    }
+    pub fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
+        match self {
+            Self::Jit { shared, .. } => Some(shared),
+            Self::Iced { .. } => None,
+        }
+    }
+}
+
+/// Open the default CPU backend (JIT or `WIE_CPU=iced`).
 ///
 /// # Errors
 /// Backend open failure.
-pub fn open_default_cpu_with_shared() -> Result<(Box<dyn CpuEngine>, Option<Arc<crate::jit::JitShared>>), CpuError> {
+pub fn open_cpu() -> Result<CpuBackend, CpuError> {
     let name = active_backend_name();
     tracing::info!(backend = name, "opening WIE CPU backend");
-    match name {
-        "iced" => Ok((Box::new(IcedCpu::open_x86_64()), None)),
-        _ => {
-            let cpu = JitCpu::open_x86_64();
-            let shared = Arc::clone(cpu.shared_jit());
-            Ok((Box::new(cpu), Some(shared)))
-        }
+    if name == "iced" {
+        Ok(CpuBackend::Iced {
+            engine: Box::new(IcedCpu::open_x86_64()),
+        })
+    } else {
+        let cpu = JitCpu::open_x86_64();
+        let shared = Arc::clone(cpu.shared_jit());
+        Ok(CpuBackend::Jit {
+            engine: Box::new(cpu),
+            shared,
+        })
     }
 }
 

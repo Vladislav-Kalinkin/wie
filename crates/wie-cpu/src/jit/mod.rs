@@ -17,7 +17,8 @@
     clippy::indexing_slicing, // fixed gpr[0..16]
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::arithmetic_side_effects
+    clippy::arithmetic_side_effects,
+    clippy::unwrap_used // Mutex/RwLock poison recovery is hard-coded (never occurs in practice)
 )]
 
 mod block;
@@ -27,7 +28,7 @@ mod trampolines;
 
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 
-use crate::exec::{self, StepResult, HookWindow};
+use crate::exec::{self, HookWindow, StepResult};
 use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE, protect};
 use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
@@ -604,7 +605,11 @@ impl JitCpu {
             self.shared.chain_ids.write().unwrap().insert(rip, fid);
         }
         self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
-        self.shared.cache.write().unwrap().insert(rip, CacheEntry::Ready(compiled));
+        self.shared
+            .cache
+            .write()
+            .unwrap()
+            .insert(rip, CacheEntry::Ready(compiled));
     }
 
     fn clear_compiled(&mut self) {
@@ -714,7 +719,9 @@ impl JitCpu {
         while page <= last {
             match code_pages.get_mut(&page) {
                 Some(c) if *c > 1 => *c = c.saturating_sub(1),
-                Some(_) => { code_pages.remove(&page); }
+                Some(_) => {
+                    code_pages.remove(&page);
+                }
                 None => {}
             }
             page = page.saturating_add(1);
@@ -722,7 +729,10 @@ impl JitCpu {
     }
 
     fn drain_pending_code_writes(&mut self) {
-        let overflow = self.shared.pending_code_overflow.swap(false, Ordering::Relaxed);
+        let overflow = self
+            .shared
+            .pending_code_overflow
+            .swap(false, Ordering::Relaxed);
         let pages = std::mem::take(&mut *self.shared.pending_code_writes.lock().unwrap());
         if overflow {
             if !self.shared.cache.read().unwrap().is_empty() {
@@ -746,7 +756,9 @@ impl JitCpu {
         let len_u = u64::try_from(len).unwrap_or(u64::MAX);
         let end = address.saturating_add(len_u);
         if end <= address && len > 0 {
-            self.shared.pending_code_overflow.store(true, Ordering::Relaxed);
+            self.shared
+                .pending_code_overflow
+                .store(true, Ordering::Relaxed);
             self.shared.pending_code_writes.lock().unwrap().clear();
             return;
         }
@@ -755,7 +767,9 @@ impl JitCpu {
         let last = end.saturating_sub(1) >> 12;
         while page <= last {
             if guard.len() >= Self::PENDING_WRITE_PAGE_CAP {
-                self.shared.pending_code_overflow.store(true, Ordering::Relaxed);
+                self.shared
+                    .pending_code_overflow
+                    .store(true, Ordering::Relaxed);
                 guard.clear();
                 return;
             }
@@ -773,7 +787,12 @@ impl JitCpu {
         free_type: u32,
     ) -> Option<(u64, usize)> {
         if (free_type & mem::MEM_RELEASE) != 0 {
-            return self.shared.mem.read().unwrap().allocation_span_at_base(addr);
+            return self
+                .shared
+                .mem
+                .read()
+                .unwrap()
+                .allocation_span_at_base(addr);
         }
         if (free_type & mem::MEM_DECOMMIT) != 0 {
             if size == 0 {
@@ -835,14 +854,20 @@ impl JitCpu {
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
                         if thr > 0 && next < thr {
-                            self.shared.cache.write().unwrap()
+                            self.shared
+                                .cache
+                                .write()
+                                .unwrap()
                                 .insert(rip, CacheEntry::Hot { visits: next, thr });
                         } else if let Some(compiled) = self.try_compile(rip) {
                             let meta = CompiledRunMeta::from(&compiled);
                             self.insert_ready(rip, compiled);
                             return Ok(self.finish_compiled(rip, meta));
                         } else {
-                            self.shared.cache.write().unwrap()
+                            self.shared
+                                .cache
+                                .write()
+                                .unwrap()
                                 .insert(rip, CacheEntry::Never);
                         }
                     }
@@ -864,10 +889,16 @@ impl JitCpu {
                         self.insert_ready(rip, compiled);
                         return Ok(self.finish_compiled(rip, meta));
                     }
-                    self.shared.cache.write().unwrap()
+                    self.shared
+                        .cache
+                        .write()
+                        .unwrap()
                         .insert(rip, CacheEntry::Never);
                 } else {
-                    self.shared.cache.write().unwrap()
+                    self.shared
+                        .cache
+                        .write()
+                        .unwrap()
                         .insert(rip, CacheEntry::Hot { visits: 1, thr });
                 }
             }
@@ -889,7 +920,11 @@ impl JitCpu {
             }
         }
         let hook = self.thread.hooks.as_ref();
-        let result = exec::step(&*self.shared.mem.read().unwrap(), &mut self.thread.regs, hook)?;
+        let result = exec::step(
+            &self.shared.mem.read().unwrap(),
+            &mut self.thread.regs,
+            hook,
+        )?;
         if matches!(result, StepResult::Continue) {
             self.thread.iced_steps = self.thread.iced_steps.saturating_add(1);
         }
@@ -903,12 +938,12 @@ impl JitCpu {
             return false;
         }
         let mem = self.shared.mem.read().unwrap();
-        match decode_pure_gpr_block(&*mem, self.thread.hooks.as_ref(), rip) {
+        match decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip) {
             BlockKind::Pure {
                 term: Some(block::BlockTerm::Call { target, .. }),
                 ..
             } => {
-                let final_va = resolve_thunk_va(&*mem, target);
+                let final_va = resolve_thunk_va(&mem, target);
                 self.fast_api_kind(final_va).is_some()
             }
             _ => false,
@@ -917,13 +952,13 @@ impl JitCpu {
 
     fn peek_self_loop(&self, rip: u64) -> bool {
         let mem = self.shared.mem.read().unwrap();
-        let kind = decode_pure_gpr_block(&*mem, self.thread.hooks.as_ref(), rip);
+        let kind = decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip);
         pure_is_self_loop(&kind, rip)
     }
 
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
         let mem_guard = self.shared.mem.read().unwrap();
-        let result = decode_pure_gpr_block(&*mem_guard, self.thread.hooks.as_ref(), rip);
+        let result = decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip);
         drop(mem_guard); // release before compiling (engine needs mutable access)
         match result {
             BlockKind::Pure {
@@ -967,9 +1002,10 @@ impl JitCpu {
                 let call_fast = match term {
                     Some(block::BlockTerm::Call { target, .. }) => {
                         let mem = self.shared.mem.read().unwrap();
-                        let final_va = resolve_thunk_va(&*mem, target);
+                        let final_va = resolve_thunk_va(&mem, target);
                         drop(mem);
-                        self.fast_api.iter()
+                        self.fast_api
+                            .iter()
                             .find_map(|&(k, kind)| (k == final_va).then_some(kind))
                     }
                     _ => None,
@@ -1025,7 +1061,8 @@ impl JitCpu {
             (StepResult::InvalidMemory(inv), 0)
         } else {
             self.stats.jit_insns = self
-                .stats.jit_insns
+                .stats
+                .jit_insns
                 .saturating_add(u64::from(meta.insn_count));
             (
                 StepResult::Continue,
@@ -1048,7 +1085,8 @@ impl JitCpu {
         // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
         if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
             self.stats.mem_gen_bumps = self
-                .stats.mem_gen_bumps
+                .stats
+                .mem_gen_bumps
                 .saturating_add(mem_gen.saturating_sub(self.last_mem_gen));
         }
         self.last_mem_gen = mem_gen;
@@ -1083,7 +1121,7 @@ impl JitCpu {
             self.stats.pin_allow_bits = bits;
         }
         let mem_guard = self.shared.mem.read().unwrap();
-        let mem_ptr = &*mem_guard as *const GuestMemory as *mut GuestMemory;
+        let mem_ptr = (&raw const *mem_guard).cast_mut();
         let regs = &mut self.thread.regs;
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
         // JitCtx, so every architectural GPR must be valid for successors.
@@ -1636,7 +1674,11 @@ impl CpuEngine for JitCpu {
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        self.shared.mem.read().unwrap().host_span(address, len, write)
+        self.shared
+            .mem
+            .read()
+            .unwrap()
+            .host_span(address, len, write)
     }
 
     fn mem_generation(&self) -> u64 {
@@ -1650,7 +1692,12 @@ impl CpuEngine for JitCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        let r = self.shared.mem.write().unwrap().virtual_alloc(addr, size, alloc_type, protect);
+        let r = self
+            .shared
+            .mem
+            .write()
+            .unwrap()
+            .virtual_alloc(addr, size, alloc_type, protect);
         self.shared.mem_gen.store(
             self.shared.mem.read().unwrap().generation(),
             Ordering::Release,
@@ -1662,7 +1709,12 @@ impl CpuEngine for JitCpu {
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
         let inv_span = self.code_inv_span_for_free(addr, size, free_type);
         self.invalidate_tlb();
-        let r = self.shared.mem.write().unwrap().virtual_free(addr, size, free_type);
+        let r = self
+            .shared
+            .mem
+            .write()
+            .unwrap()
+            .virtual_free(addr, size, free_type);
         self.shared.mem_gen.store(
             self.shared.mem.read().unwrap().generation(),
             Ordering::Release,
@@ -1681,7 +1733,12 @@ impl CpuEngine for JitCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        let r = self.shared.mem.write().unwrap().virtual_protect(addr, size, new_protect);
+        let r = self
+            .shared
+            .mem
+            .write()
+            .unwrap()
+            .virtual_protect(addr, size, new_protect);
         self.shared.mem_gen.store(
             self.shared.mem.read().unwrap().generation(),
             Ordering::Release,
@@ -1711,7 +1768,12 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        let r = self.shared.mem.write().unwrap().map_image(address, size, perms);
+        let r = self
+            .shared
+            .mem
+            .write()
+            .unwrap()
+            .map_image(address, size, perms);
         self.shared.mem_gen.store(
             self.shared.mem.read().unwrap().generation(),
             Ordering::Release,
@@ -1778,7 +1840,12 @@ impl CpuEngine for JitCpu {
         if let Some(compiled) = self.try_compile(address) {
             self.insert_ready(address, compiled);
         } else {
-            self.shared.cache.write().unwrap().entry(address).or_insert(CacheEntry::Never);
+            self.shared
+                .cache
+                .write()
+                .unwrap()
+                .entry(address)
+                .or_insert(CacheEntry::Never);
         }
     }
 
@@ -1835,20 +1902,43 @@ impl CpuEngine for JitCpu {
                             executed = executed.saturating_add(retired.max(1));
                             continue;
                         }
-                        other => { chain_result = Some(other); }
+                        other => {
+                            chain_result = Some(other);
+                        }
                     }
                 }
             }
             if let Some(result) = chain_result {
                 return match result {
                     StepResult::HostStop { address, size } => Ok(RunUntilHook {
-                        code: CodeHookOutcome { hit: true, address, size },
-                        invalid_memory: InvalidMemoryAccess { hit: false, access_type: 0, address: 0, size: 0, value: 0 },
+                        code: CodeHookOutcome {
+                            hit: true,
+                            address,
+                            size,
+                        },
+                        invalid_memory: InvalidMemoryAccess {
+                            hit: false,
+                            access_type: 0,
+                            address: 0,
+                            size: 0,
+                            value: 0,
+                        },
                     }),
                     StepResult::InvalidMemory(inv) => Ok(RunUntilHook {
-                        code: CodeHookOutcome { hit: false, address: 0, size: 0 },
-                        invalid_memory: InvalidMemoryAccess { hit: true, access_type: inv.access_type, address: inv.address, size: inv.size, value: inv.value },
+                        code: CodeHookOutcome {
+                            hit: false,
+                            address: 0,
+                            size: 0,
+                        },
+                        invalid_memory: InvalidMemoryAccess {
+                            hit: true,
+                            access_type: inv.access_type,
+                            address: inv.address,
+                            size: inv.size,
+                            value: inv.value,
+                        },
                     }),
+                    #[allow(clippy::unreachable)]
                     StepResult::Continue => unreachable!(),
                 };
             }
@@ -1911,7 +2001,10 @@ impl CpuEngine for JitCpu {
         self.thread.shadow_sp = 0;
         let rsp = self.thread.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
-        self.shared.mem.read().unwrap()
+        self.shared
+            .mem
+            .read()
+            .unwrap()
             .read(rsp, &mut ret_bytes)
             .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
         let return_address = u64::from_le_bytes(ret_bytes);
@@ -1921,22 +2014,61 @@ impl CpuEngine for JitCpu {
         Ok(return_address)
     }
 
-    fn read_rip(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rip) }
-    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.rip = value; Ok(()) }
-    fn read_rsp(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rsp()) }
-    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rsp(value); Ok(()) }
-    fn read_rax(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rax()) }
-    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rax(value); Ok(()) }
-    fn read_rcx(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rcx()) }
-    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rcx(value); Ok(()) }
-    fn read_rdx(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.rdx()) }
-    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_rdx(value); Ok(()) }
-    fn read_r8(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.r8()) }
-    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_r8(value); Ok(()) }
-    fn read_r9(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.r9()) }
-    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> { self.thread.regs.set_r9(value); Ok(()) }
-    fn read_rbx(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.gpr(3)) }
-    fn read_r12(&mut self) -> Result<u64, CpuError> { Ok(self.thread.regs.gpr(12)) }
+    fn read_rip(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.rip)
+    }
+    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.rip = value;
+        Ok(())
+    }
+    fn read_rsp(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.rsp())
+    }
+    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.set_rsp(value);
+        Ok(())
+    }
+    fn read_rax(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.rax())
+    }
+    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.set_rax(value);
+        Ok(())
+    }
+    fn read_rcx(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.rcx())
+    }
+    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.set_rcx(value);
+        Ok(())
+    }
+    fn read_rdx(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.rdx())
+    }
+    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.set_rdx(value);
+        Ok(())
+    }
+    fn read_r8(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.r8())
+    }
+    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.set_r8(value);
+        Ok(())
+    }
+    fn read_r9(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.r9())
+    }
+    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> {
+        self.thread.regs.set_r9(value);
+        Ok(())
+    }
+    fn read_rbx(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.gpr(3))
+    }
+    fn read_r12(&mut self) -> Result<u64, CpuError> {
+        Ok(self.thread.regs.gpr(12))
+    }
 
     fn snapshot_thread_context(&mut self) -> crate::ThreadContext {
         self.thread.regs.snapshot()
@@ -1944,10 +2076,6 @@ impl CpuEngine for JitCpu {
 
     fn restore_thread_context(&mut self, ctx: &crate::ThreadContext) {
         self.thread.regs.restore(ctx);
-    }
-
-    fn shared_jit(&self) -> Option<&std::sync::Arc<crate::jit::JitShared>> {
-        Some(&self.shared)
     }
 
     fn on_thread_switch(&mut self) {
@@ -1983,7 +2111,12 @@ mod tests {
             );
             if jit_chain_enabled() {
                 let fn_ptr = dummy_block as *const () as usize as u64;
-                chain_table_insert(self.thread.chain_va.as_mut(), self.thread.chain_fn.as_mut(), rip, fn_ptr);
+                chain_table_insert(
+                    self.thread.chain_va.as_mut(),
+                    self.thread.chain_fn.as_mut(),
+                    rip,
+                    fn_ptr,
+                );
             }
             // Simulate edge IC hit for S6.
             self.thread.edge_ic_va[0] = rip;
@@ -2115,7 +2248,10 @@ mod tests {
         )
         .expect("alloc");
         let e = cpu
-            .shared.mem.write().unwrap()
+            .shared
+            .mem
+            .write()
+            .unwrap()
             .page_tlb_entry(base >> 12)
             .expect("tlb");
         assert!(e.allow_r);
@@ -2129,7 +2265,10 @@ mod tests {
         )
         .expect("data");
         let e2 = cpu
-            .shared.mem.write().unwrap()
+            .shared
+            .mem
+            .write()
+            .unwrap()
             .page_tlb_entry(data >> 12)
             .expect("data tlb");
         assert!(e2.allow_r && e2.allow_w);
