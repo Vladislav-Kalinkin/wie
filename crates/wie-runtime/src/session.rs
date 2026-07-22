@@ -12,7 +12,7 @@ use crate::mt_runtime::{ProcessConfig, ProcessResources};
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 /// Bootstrap options for a new guest session (argv / stdin injection).
@@ -496,6 +496,7 @@ struct SessionInit {
     layout: RuntimeMemoryLayout,
     stop_bitmap: Vec<u8>,
     shared_jit: Option<Arc<wie_cpu::JitShared>>,
+    guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
     entry_point_va: u64,
     initial_rsp: u64,
 }
@@ -528,6 +529,7 @@ impl RuntimeSession {
             layout,
             stop_bitmap,
             shared_jit,
+            guest_mem,
             ..
         } = init;
         let config = ProcessConfig {
@@ -538,20 +540,6 @@ impl RuntimeSession {
             primary_tid: wie_winapi::PRIMARY_THREAD_ID,
         };
         let shared_winapi = Arc::new(Mutex::new(winapi_state));
-
-        // When shared_jit is None, the engine is IcedCpu; extract its
-        // GuestMemory handle for worker spawns. Avoids exposing GuestMemory
-        // through the public CpuEngine trait.
-        let guest_mem = if shared_jit.is_none() {
-            // SAFETY: open_default_cpu_with_shared guarantees IcedCpu when
-            // shared_jit is None; the engine is not a trait object alias.
-            #[expect(unsafe_code)]
-            let iced =
-                unsafe { &*(&*engine as *const dyn wie_cpu::CpuEngine as *const wie_cpu::IcedCpu) };
-            Some(Arc::clone(iced.guest_mem_arc()))
-        } else {
-            None
-        };
 
         ProcessResources {
             config,
@@ -648,9 +636,9 @@ impl RuntimeSession {
 
         // WIE CPU backend (JIT default; `WIE_CPU=iced` for interpreter).
         let backend = wie_cpu::open_cpu().context("failed to open WIE CPU backend")?;
-        let (mut engine, shared_jit) = match backend {
-            wie_cpu::CpuBackend::Jit { engine, shared } => (engine, Some(shared)),
-            wie_cpu::CpuBackend::Iced { engine } => (engine, None),
+        let (mut engine, shared_jit, guest_mem) = match backend {
+            wie_cpu::CpuBackend::Jit { engine, shared } => (engine, Some(shared), None),
+            wie_cpu::CpuBackend::Iced { engine, guest_mem } => (engine, None, Some(guest_mem)),
         };
 
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
@@ -1082,6 +1070,7 @@ impl RuntimeSession {
             layout,
             stop_bitmap,
             shared_jit,
+            guest_mem,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
         });

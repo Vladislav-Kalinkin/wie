@@ -6,7 +6,7 @@
 //! Scope: **x86-64 only** (no i386). Universal PE64 — no per-EXE cheats.
 //! Unicorn has been removed; see git history for the former reference backend.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 mod exec;
@@ -500,24 +500,27 @@ pub enum CpuBackend {
         engine: Box<dyn CpuEngine>,
         shared: Arc<crate::jit::JitShared>,
     },
-    /// iced-x86 interpreter: standalone engine.
-    Iced { engine: Box<dyn CpuEngine> },
+    /// iced-x86 interpreter: standalone engine + shared guest memory.
+    Iced {
+        engine: Box<dyn CpuEngine>,
+        guest_mem: Arc<RwLock<GuestMemory>>,
+    },
 }
 
 impl CpuBackend {
     pub fn engine(&self) -> &dyn CpuEngine {
         match self {
-            Self::Jit { engine, .. } | Self::Iced { engine } => &**engine,
+            Self::Jit { engine, .. } | Self::Iced { engine, .. } => &**engine,
         }
     }
     pub fn engine_mut(&mut self) -> &mut dyn CpuEngine {
         match self {
-            Self::Jit { engine, .. } | Self::Iced { engine } => &mut **engine,
+            Self::Jit { engine, .. } | Self::Iced { engine, .. } => &mut **engine,
         }
     }
     pub fn into_engine(self) -> Box<dyn CpuEngine> {
         match self {
-            Self::Jit { engine, .. } | Self::Iced { engine } => engine,
+            Self::Jit { engine, .. } | Self::Iced { engine, .. } => engine,
         }
     }
     pub fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
@@ -536,8 +539,11 @@ pub fn open_cpu() -> Result<CpuBackend, CpuError> {
     let name = active_backend_name();
     tracing::info!(backend = name, "opening WIE CPU backend");
     if name == "iced" {
+        let cpu = IcedCpu::open_x86_64();
+        let guest_mem = Arc::clone(cpu.guest_mem_arc());
         Ok(CpuBackend::Iced {
-            engine: Box::new(IcedCpu::open_x86_64()),
+            engine: Box::new(cpu),
+            guest_mem,
         })
     } else {
         let cpu = JitCpu::open_x86_64();
