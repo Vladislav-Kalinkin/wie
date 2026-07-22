@@ -158,7 +158,7 @@ impl CpuEngine for IcedCpu {
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        lock_wr(&self.mem).write(address, bytes)
+        lock_rd(&self.mem).write(address, bytes)
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {

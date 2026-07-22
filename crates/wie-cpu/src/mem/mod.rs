@@ -8,8 +8,7 @@
 //! - [`PageMap`] / [`protect`] — Windows page state + software permission checks
 //! - [`GuestMemory`] — facade used by iced/JIT (SPC on read/write/fetch)
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::CpuError;
 
@@ -115,14 +114,6 @@ pub(crate) struct GuestMemory {
     /// `AtomicU64` so concurrent readers (MT.4 prep) can observe generation with
     /// acquire loads while structural writers bump under the process map lock.
     generation: AtomicU64,
-    /// Guest **page keys** (`va >> 12`) touched by successful stores this slice.
-    ///
-    /// Phase 4.x: drained by `JitCpu` at safe points. Must **not** be a single
-    /// bounding-box range — CRT/stack+heap stores would span gigabytes of
-    /// empty pages and hang in `code_pages_overlap`.
-    pending_write_pages: Mutex<Vec<u64>>,
-    /// Set when too many distinct pages were written; drain does a full code flush.
-    pending_write_overflow: AtomicBool,
 }
 
 impl Default for GuestMemory {
@@ -153,8 +144,6 @@ impl GuestMemory {
             pages: PageMap::new(),
             vad: VadTable::new(),
             generation: AtomicU64::new(0),
-            pending_write_pages: Mutex::new(Vec::new()),
-            pending_write_overflow: AtomicBool::new(false),
         }
     }
 
@@ -1187,50 +1176,7 @@ impl GuestMemory {
             offset = offset.saturating_add(chunk);
             va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
         }
-        self.note_code_write(address, bytes.len());
         Ok(())
-    }
-
-    /// Cap on recorded store pages per drain window (overflow → full code flush).
-    const PENDING_WRITE_PAGE_CAP: usize = 256;
-
-    /// Record pages touched by a successful guest store for Phase 4.x code inv.
-    #[inline]
-    pub(crate) fn note_code_write(&self, address: u64, len: usize) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if len == 0 || self.pending_write_overflow.load(Relaxed) {
-            return;
-        }
-        let len_u = u64::try_from(len).unwrap_or(u64::MAX);
-        let end = address.saturating_add(len_u);
-        if end <= address && len > 0 {
-            self.pending_write_overflow.store(true, Relaxed);
-            self.pending_write_pages.lock().unwrap().clear();
-            return;
-        }
-        let mut guard = self.pending_write_pages.lock().unwrap();
-        let mut page = address >> backend::PAGE_SHIFT;
-        let last = end.saturating_sub(1) >> backend::PAGE_SHIFT;
-        while page <= last {
-            if guard.len() >= Self::PENDING_WRITE_PAGE_CAP {
-                self.pending_write_overflow.store(true, Relaxed);
-                guard.clear();
-                return;
-            }
-            if guard.last().copied() != Some(page) {
-                guard.push(page);
-            }
-            page = page.saturating_add(1);
-        }
-    }
-
-    /// Take pending store pages. `overflow == true` → caller should full-flush code.
-    #[inline]
-    pub(crate) fn take_pending_code_writes(&self) -> (Vec<u64>, bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let overflow = self.pending_write_overflow.swap(false, Relaxed);
-        let pages = std::mem::take(&mut *self.pending_write_pages.lock().unwrap());
-        (pages, overflow)
     }
 
     /// Read into `bytes` from guest `address` after SPC (read permission).

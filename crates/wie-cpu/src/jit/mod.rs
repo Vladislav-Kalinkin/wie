@@ -210,6 +210,11 @@ pub struct JitShared {
     /// Guest page keys covered by Ready blocks (SMC tracking).
     #[doc(hidden)]
     pub code_pages: Mutex<HashMap<u64, u32>>,
+    /// Guest page keys written by JIT stores (SMC invalidation). Separate lock
+    /// so drain_pending_code_writes avoids GuestMemory write lock.
+    pub pending_code_writes: Mutex<Vec<u64>>,
+    /// Set when too many distinct pages were written; drain does a full code flush.
+    pub pending_code_overflow: AtomicBool,
     /// Cached GuestMemory generation, updated on map/protect/free (avoids mem lock).
     pub mem_gen: AtomicU64,
     /// Whether the Cranelift engine was successfully initialized.
@@ -235,6 +240,8 @@ impl JitShared {
             cache: RwLock::new(HashMap::new()),
             chain_ids: RwLock::new(HashMap::new()),
             code_pages: Mutex::new(HashMap::new()),
+            pending_code_writes: Mutex::new(Vec::new()),
+            pending_code_overflow: AtomicBool::new(false),
             mem_gen: AtomicU64::new(0),
             engine_ready: AtomicBool::new(engine_ready),
         }
@@ -715,7 +722,8 @@ impl JitCpu {
     }
 
     fn drain_pending_code_writes(&mut self) {
-        let (pages, overflow) = self.shared.mem.write().unwrap().take_pending_code_writes();
+        let overflow = self.shared.pending_code_overflow.swap(false, Ordering::Relaxed);
+        let pages = std::mem::take(&mut *self.shared.pending_code_writes.lock().unwrap());
         if overflow {
             if !self.shared.cache.read().unwrap().is_empty() {
                 self.clear_compiled();
@@ -726,6 +734,35 @@ impl JitCpu {
         }
         for page in pages {
             self.invalidate_code_range(page << 12, PAGE_SIZE_USIZE);
+        }
+    }
+
+    const PENDING_WRITE_PAGE_CAP: usize = 256;
+
+    fn note_code_write(&self, address: u64, len: usize) {
+        if len == 0 || self.shared.pending_code_overflow.load(Ordering::Relaxed) {
+            return;
+        }
+        let len_u = u64::try_from(len).unwrap_or(u64::MAX);
+        let end = address.saturating_add(len_u);
+        if end <= address && len > 0 {
+            self.shared.pending_code_overflow.store(true, Ordering::Relaxed);
+            self.shared.pending_code_writes.lock().unwrap().clear();
+            return;
+        }
+        let mut guard = self.shared.pending_code_writes.lock().unwrap();
+        let mut page = address >> 12;
+        let last = end.saturating_sub(1) >> 12;
+        while page <= last {
+            if guard.len() >= Self::PENDING_WRITE_PAGE_CAP {
+                self.shared.pending_code_overflow.store(true, Ordering::Relaxed);
+                guard.clear();
+                return;
+            }
+            if guard.last().copied() != Some(page) {
+                guard.push(page);
+            }
+            page = page.saturating_add(1);
         }
     }
 
@@ -1001,16 +1038,13 @@ impl JitCpu {
     fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
         // Refresh pins only when GuestMemory generation changes (map/protect/free).
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
-        let mem_gen = {
+        let mem_gen = self.shared.mem_gen.load(Ordering::Acquire);
+        if self.thread.pins_gen != mem_gen {
             let mem = self.shared.mem.read().unwrap();
-            let cur_gen = mem.generation();
-            if self.thread.pins_gen != cur_gen {
-                let infos = mem.jit_region_pins();
-                self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
-            }
-            cur_gen
-        };
-        self.thread.pins_gen = mem_gen;
+            let infos = mem.jit_region_pins();
+            self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            self.thread.pins_gen = mem_gen;
+        }
         // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
         if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
             self.stats.mem_gen_bumps = self
@@ -1582,11 +1616,17 @@ impl JitEngine {
 
 impl CpuEngine for JitCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.shared.mem.write().unwrap().map(address, size, perms)
+        let r = self.shared.mem.write().unwrap().map(address, size, perms);
+        self.shared.mem_gen.store(
+            self.shared.mem.read().unwrap().generation(),
+            Ordering::Release,
+        );
+        r
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
         self.shared.mem.write().unwrap().write(address, bytes)?;
+        self.note_code_write(address, bytes.len());
         self.drain_pending_code_writes();
         Ok(())
     }
@@ -1611,6 +1651,10 @@ impl CpuEngine for JitCpu {
         protect: u32,
     ) -> Result<u64, CpuError> {
         let r = self.shared.mem.write().unwrap().virtual_alloc(addr, size, alloc_type, protect);
+        self.shared.mem_gen.store(
+            self.shared.mem.read().unwrap().generation(),
+            Ordering::Release,
+        );
         self.invalidate_tlb();
         r
     }
@@ -1619,6 +1663,10 @@ impl CpuEngine for JitCpu {
         let inv_span = self.code_inv_span_for_free(addr, size, free_type);
         self.invalidate_tlb();
         let r = self.shared.mem.write().unwrap().virtual_free(addr, size, free_type);
+        self.shared.mem_gen.store(
+            self.shared.mem.read().unwrap().generation(),
+            Ordering::Release,
+        );
         if r.is_ok()
             && let Some((a, n)) = inv_span
         {
@@ -1634,6 +1682,10 @@ impl CpuEngine for JitCpu {
         new_protect: u32,
     ) -> Result<u32, CpuError> {
         let r = self.shared.mem.write().unwrap().virtual_protect(addr, size, new_protect);
+        self.shared.mem_gen.store(
+            self.shared.mem.read().unwrap().generation(),
+            Ordering::Release,
+        );
         if r.is_ok() && !protect::allows_execute(new_protect) {
             self.invalidate_code_range(addr, size);
         }
@@ -1660,6 +1712,10 @@ impl CpuEngine for JitCpu {
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
         let r = self.shared.mem.write().unwrap().map_image(address, size, perms);
+        self.shared.mem_gen.store(
+            self.shared.mem.read().unwrap().generation(),
+            Ordering::Release,
+        );
         self.invalidate_tlb();
         r
     }
