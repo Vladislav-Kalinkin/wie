@@ -19,7 +19,7 @@ The WinAPI surface is intentionally incomplete: many handlers are stubs sufficie
 
 **Status (post great cleanup):** Soft-translate guest memory is **mmap-only** (no hash/hybrid fallback). Software page permissions + `Virtual*`, Cranelift block JIT with stack super-path / **2-way multi sticky** + 8-slot region pins (helper always; data pin IR opt-in) / set-assoc Neon TLB / SIMD SSE2 / bulk + inline strings, expanded in-guest stubs, host idle park (`WIE_IDLE`), invalidation stress + `FlushInstructionCache`. CLI compressed to `inspect` / `run` / `trace`. See [`docs/RUNBOOK.md`](docs/RUNBOOK.md) and [`Optimization ROADMAP.md`](Optimization%20ROADMAP.md).
 
-**Real console 7-Zip (`7za`):** WIE runs the **Windows PE64** standalone console from 7-Zip Extra (not macOS `7za`, not GUI). The PE is **not** committed (`/real_exes` is gitignored) — download once, then create/list/extract `.7z` under JIT or iced. See [7-Zip console status](#7-zip-console-status-7za).
+**Real console 7-Zip (`7za`):** WIE runs the **Windows PE64** standalone console from 7-Zip Extra (not macOS `7za`, not GUI). The PE is **not** committed (`real_exes/` is gitignored) — download once, then create/list/extract `.7z` under JIT or iced. See [7-Zip console status](#7-zip-console-status-7za).
 
 ## Examples of launch
 
@@ -102,7 +102,7 @@ Default **guest** worker stack is **1 MiB** when `dwStackSize == 0`. Host OS thr
 
 WIE emulates a **Windows PE64** standalone console 7-Zip (`7za.exe` from the official **7-Zip Extra** package). That is **not** a native macOS `7za`/`7z` binary and **not** the GUI (`7zFM` / full installer).
 
-- **`/real_exes` is gitignored** — do not expect `7za.exe` in a clean clone; obtain the Windows PE yourself (steps below).
+- **`real_exes/` is gitignored** — do not expect `7za.exe` in a clean clone; obtain the Windows PE yourself (steps below).
 - Guest files use a **bottle**: host `{root}/drive_c/...` ↔ guest `C:\...` (`--root` / `WIE_ROOT`).
 
 ### What works (verified with 7-Zip Extra **26.02** `x64/7za.exe`)
@@ -131,24 +131,13 @@ WIE needs the **x64 PE** from **7-Zip Extra** (standalone console). Root `7za.ex
 | `x64/7za.exe`         | Windows **x64**   | **Yes** (this is what we run)  |
 | `arm64/7za.exe`       | Windows **ARM64** | No (WIE is x86-64 guest today) |
 
-**One-time setup** (run from the WIE repo root). Homebrew `p7zip` is only a **bootstrap** to unpack the Extra archive; the guest under WIE is still the **Windows** PE.
+**One-time setup** (run from the WIE repo root):
 
 ```bash
-brew install p7zip
-
-VER=26.02
-VER_COMPACT=2602
-mkdir -p real_exes /tmp/7z-extra-$$
-curl -fL -o /tmp/7z-extra-$$/extra.7z \
-  "https://github.com/ip7z/7zip/releases/download/${VER}/7z${VER_COMPACT}-extra.7z"
-7za x -y -o/tmp/7z-extra-$$/out /tmp/7z-extra-$$/extra.7z
-
-cp -f /tmp/7z-extra-$$/out/x64/7za.exe  real_exes/
-cp -f /tmp/7z-extra-$$/out/x64/7za.dll  real_exes/
-cp -f /tmp/7z-extra-$$/out/x64/7zxa.dll real_exes/
-file real_exes/7za.exe
-rm -rf /tmp/7z-extra-$$
+./scripts/fetch-7za.sh
 ```
+
+Homebrew `p7zip` is only a **bootstrap** to unpack the Extra archive; the guest under WIE is still the **Windows** PE.
 
 Without Homebrew: open `7z*-extra.7z` anywhere you can, then copy **`x64/7za.exe`** into this repo’s `real_exes/` (still gitignored).
 
@@ -428,18 +417,10 @@ source "$HOME/.cargo/env"
 git clone https://github.com/Vladislav-Kalinkin/wie
 cd wie
 cargo build -p wie-cli --release
-
-./scripts/run-micro-suite.sh
+./scripts/check.sh
 ```
 
-Useful local checks (same as pre-PR):
-
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-make -C micro-exes && ./scripts/run-micro-suite.sh
-```
+See [Pre-PR Checklist](#pre-pr-checklist) for the full check suite.
 
 ## History
 
@@ -457,17 +438,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ### Pre-PR Checklist
 
-1. **Format:** `cargo fmt --check`
-2. **Lint:** `cargo clippy --workspace --all-targets -- -D warnings`
-3. **Unit tests:** `cargo test --workspace`
-4. **Integration:** `make -C micro-exes && ./scripts/run-micro-suite.sh`
+```bash
+./scripts/check.sh
+```
 
 Optional JIT matrix when touching memory lower / chaining:
 
 ```bash
-WIE_JIT_MEM=slow ./scripts/run-micro-suite.sh
-WIE_JIT_MEM=pin ./scripts/run-micro-suite.sh
-WIE_CPU=iced ./scripts/run-micro-suite.sh
+./scripts/check-jit-matrix.sh
 ```
 
 ## Acknowledgments
