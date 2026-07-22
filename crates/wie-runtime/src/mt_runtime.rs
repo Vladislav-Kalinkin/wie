@@ -239,6 +239,16 @@ fn worker_main(
         stop_bitmap,
     );
 
+    // Load initial thread context set by CreateThread (RIP=start, RCX=param, RSP=stack).
+    {
+        let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
+            drop(st);
+            engine.restore_thread_context(&ctx);
+            engine.on_thread_switch();
+        }
+    }
+
     loop {
         let park_reason: Option<HostParkReason>;
 
@@ -445,17 +455,15 @@ fn finish_tid(st: &wie_winapi::WinApiState, tid: u32, code: u32) {
 }
 
 fn activate_thread(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    _engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut wie_winapi::WinApiState,
     tid: u32,
 ) {
-    // Per-thread engine: no context switch needed. But still restore the
-    // initial context saved during drain_spawns (first activation).
+    // Per-thread engine: each engine is permanently assigned to one guest thread.
+    // The engine's registers ARE this thread's registers — no save/restore needed.
+    // Only `register_thread` in CreateThread sets the initial context (RIP/RSP/RCX),
+    // which was already loaded onto this engine by the caller (drain_spawns loads it).
     state.threads.activate(tid);
-    if let Some(ctx) = state.sync.thread_cpu.get(&tid).cloned() {
-        engine.restore_thread_context(&ctx);
-        engine.on_thread_switch();
-    }
 }
 
 fn deactivate_thread(
