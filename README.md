@@ -77,7 +77,12 @@ WIE_STRING_BULK=0 ./scripts/run-micro-suite.sh
 
 ## Multithreading (guest threads)
 
-WIE models **1:1 host thread ↔ guest thread**. Guest **CPU is still serialized** on one shared `CpuEngine` (process mutex): when a thread waits (`WaitFor*`, contended CS, …) it **drops** the engine lock so peers can run. True parallel JIT on two cores is a future step. Details: [`docs/mt-threads.md`](docs/mt-threads.md).
+WIE models **1:1 host thread ↔ guest thread**. Each guest thread runs on its own `CpuEngine`. The engine model depends on the backend:
+
+- **JIT** (`WIE_CPU=jit`, default): each guest thread gets its own `JitCpu` instance sharing a common compiled-code cache (`Arc<JitShared>`). No engine mutex — threads execute guest code in parallel, serializing only on the shared WinAPI state mutex (for kernel object access, heap, etc.).
+- **Iced** (`WIE_CPU=iced`, interpreter fallback): all threads share a single `IcedCpu` behind a mutex (serialized interpreter). Basic threading and synchronization work correctly (`thread_create_join`, `cs_two_threads`, `event_handshake`) but performance under heavy contention is limited by the shared engine lock.
+
+When a thread parks (`WaitFor*`, contended critical section, …) it drops the WinAPI lock (and in the Iced case, the engine lock) so other threads can make progress.
 
 | Surface                                                        | Status |
 | -------------------------------------------------------------- | ------ |

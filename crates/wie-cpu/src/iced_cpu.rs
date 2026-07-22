@@ -1,11 +1,16 @@
 //! iced-x86 interpreter backend (WIE Phase 1). x86-64 only.
 
 use crate::exec::{self, HookWindow, StepResult};
-// Re-export for JIT host-stop checks.
 use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
+use std::sync::{Arc, Mutex};
+
+/// Lock a mutex, recovering the lock on poison.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Power-of-two RIP ring capacity (mask indexing avoids `%` side-effect lints).
 const RIP_TRACE_CAP: usize = 32;
@@ -13,14 +18,11 @@ const RIP_TRACE_MASK: usize = RIP_TRACE_CAP - 1;
 
 /// Software x86-64 CPU using iced-x86 decode + interpret.
 ///
-/// Universal PE64 backend — no app-specific shortcuts. Completeness grows with
-/// the implemented mnemonic set in [`crate::exec`].
-///
-/// # Safety / `Send`
-/// Guest memory arenas are process-private; MT.2 serializes access with a
-/// process mutex before moving the engine across host threads.
+/// Guest memory is shared behind `Arc<Mutex<>>` so multiple per-thread
+/// `IcedCpu` instances can share the same page tables and mmap arenas.
+/// The standalone constructor creates its own, uncontended memory.
 pub struct IcedCpu {
-    mem: GuestMemory,
+    mem: Arc<Mutex<GuestMemory>>,
     regs: RegFile,
     hooks: Option<HookWindow>,
     /// Recent RIP history for diagnostics (ring buffer).
@@ -32,11 +34,11 @@ pub struct IcedCpu {
 }
 
 impl IcedCpu {
-    /// Create a fresh x86-64 interpreter instance.
+    /// Create a fresh x86-64 interpreter instance with its own guest memory.
     #[must_use]
     pub fn open_x86_64() -> Self {
         Self {
-            mem: GuestMemory::new(),
+            mem: Arc::new(Mutex::new(GuestMemory::new())),
             regs: RegFile::new(),
             hooks: None,
             rip_trace: [0; RIP_TRACE_CAP],
@@ -44,6 +46,28 @@ impl IcedCpu {
             rip_trace_n: 0,
             iced_steps: 0,
         }
+    }
+
+    /// Create a per-thread interpreter sharing guest memory with other engines.
+    /// Uses the shared memory from `source` (the primary engine).
+    #[must_use]
+    pub fn new_shared(source: &Self) -> Self {
+        Self {
+            mem: Arc::clone(&source.mem),
+            regs: RegFile::new(),
+            hooks: None,
+            rip_trace: [0; RIP_TRACE_CAP],
+            rip_trace_i: 0,
+            rip_trace_n: 0,
+            iced_steps: 0,
+        }
+    }
+
+    /// Access the shared guest memory Arc (for creating per-thread engines).
+    #[must_use]
+    #[expect(dead_code)]
+    pub(crate) fn guest_mem_arc(&self) -> &Arc<Mutex<GuestMemory>> {
+        &self.mem
     }
 
     /// Interpreter step counter (also used when JIT falls back to iced).
@@ -99,26 +123,30 @@ impl IcedCpu {
     /// Read guest bytes without going through the `CpuEngine` trait (JIT decode).
     #[expect(dead_code)]
     pub(crate) fn mem_read_into(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.mem.read(address, bytes)
+        lock(&self.mem).read(address, bytes)
     }
 
     /// Mutable guest memory pointer for JIT host load/store callbacks.
     #[expect(dead_code)]
-    pub(crate) fn guest_mem_mut(&mut self) -> &mut GuestMemory {
-        &mut self.mem
+    pub(crate) fn guest_mem_mut(&mut self) -> impl std::ops::DerefMut<Target = GuestMemory> + '_ {
+        // Can't return &mut GuestMemory directly — behind a mutex.
+        // The caller gets a MutexGuard.
+        self.mem.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Immutable guest memory (code invalidation span lookup, etc.).
     #[expect(dead_code)]
-    pub(crate) fn guest_mem(&self) -> &GuestMemory {
-        &self.mem
+    pub(crate) fn guest_mem(&self) -> impl std::ops::Deref<Target = GuestMemory> + '_ {
+        self.mem.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// One step returning the raw [`StepResult`] (shared by `step_once` and JIT fallback).
     pub(crate) fn step_once_result(&mut self) -> Result<StepResult, CpuError> {
         self.push_rip_trace(self.regs.rip);
         let hook = self.hooks.as_ref();
-        let result = exec::step(&mut self.mem, &mut self.regs, hook)?;
+        let mut mem_guard = lock(&self.mem);
+        let result = exec::step(&mut *mem_guard, &mut self.regs, hook)?;
+        drop(mem_guard);
         if matches!(result, StepResult::Continue) {
             self.iced_steps = self.iced_steps.saturating_add(1);
         }
@@ -145,23 +173,23 @@ impl IcedCpu {
 
 impl CpuEngine for IcedCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.mem.map(address, size, perms)
+        lock(&self.mem).map(address, size, perms)
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        self.mem.write(address, bytes)
+        lock(&self.mem).write(address, bytes)
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.mem.read(address, bytes)
+        lock(&self.mem).read(address, bytes)
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        self.mem.host_span(address, len, write)
+        lock(&self.mem).host_span(address, len, write)
     }
 
     fn mem_generation(&self) -> u64 {
-        self.mem.generation()
+        lock(&self.mem).generation()
     }
 
     fn virtual_alloc(
@@ -171,11 +199,11 @@ impl CpuEngine for IcedCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        self.mem.virtual_alloc(addr, size, alloc_type, protect)
+        lock(&self.mem).virtual_alloc(addr, size, alloc_type, protect)
     }
 
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
-        self.mem.virtual_free(addr, size, free_type)
+        lock(&self.mem).virtual_free(addr, size, free_type)
     }
 
     fn virtual_protect(
@@ -184,27 +212,26 @@ impl CpuEngine for IcedCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        self.mem.virtual_protect(addr, size, new_protect)
+        lock(&self.mem).virtual_protect(addr, size, new_protect)
     }
 
     fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
-        self.mem.virtual_query(addr)
+        lock(&self.mem).virtual_query(addr)
     }
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.mem.map_image(address, size, perms)
+        lock(&self.mem).map_image(address, size, perms)
     }
 
     fn register_region(&mut self, region: GuestRegion) {
-        self.mem.register_region(region);
+        lock(&self.mem).register_region(region);
     }
 
     fn find_region(&self, va: u64) -> Option<GuestRegion> {
-        self.mem.find_region(va).cloned()
+        lock(&self.mem).find_region(va).cloned()
     }
 
     fn cpu_stats(&self) -> Option<crate::JitStats> {
-        // Pure iced backend: report step count in the shared stats shape.
         Some(crate::JitStats {
             iced_insns: self.iced_steps,
             ..crate::JitStats::default()
@@ -212,7 +239,7 @@ impl CpuEngine for IcedCpu {
     }
 
     fn mem_backend_name(&self) -> &'static str {
-        self.mem.backend_name()
+        lock(&self.mem).backend_name()
     }
 
     fn install_runtime_hooks(
@@ -248,7 +275,6 @@ impl CpuEngine for IcedCpu {
     ) -> Result<RunUntilHook, CpuError> {
         self.regs.rip = begin;
         let budget = if count == 0 {
-            // Unicorn: 0 means unlimited; keep a hard cap so a bug cannot hang forever.
             100_000_000_usize
         } else {
             count
@@ -256,20 +282,19 @@ impl CpuEngine for IcedCpu {
 
         let mut executed = 0_usize;
         while executed < budget {
-            // Unicorn: stop when RIP reaches `until` (before executing that address).
             if until != 0 && self.regs.rip == until {
                 break;
             }
 
             let rip_before = self.regs.rip;
-            // Sampled RIP history (every 16th) — full every-insn ring was pure overhead
-            // on the open-rom hot path (~97% emu wall). Fault path still has recent samples.
             if executed.is_multiple_of(16) {
                 self.push_rip_trace(rip_before);
             }
             let hook_ref = self.hooks.as_ref();
-            match exec::step(&mut self.mem, &mut self.regs, hook_ref) {
+        let mut mem_guard = lock(&self.mem);
+            match exec::step(&mut *mem_guard, &mut self.regs, hook_ref) {
                 Ok(StepResult::Continue) => {
+                    drop(mem_guard);
                     executed = executed.saturating_add(1);
                     self.iced_steps = self.iced_steps.saturating_add(1);
                 }
@@ -356,9 +381,11 @@ impl CpuEngine for IcedCpu {
     fn return_from_win64_api(&mut self, rax: u64) -> Result<u64, CpuError> {
         let rsp = self.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
-        self.mem
+        let mem_guard = lock(&self.mem);
+        mem_guard
             .read(rsp, &mut ret_bytes)
             .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
+        drop(mem_guard);
         let return_address = u64::from_le_bytes(ret_bytes);
         self.regs.set_rsp(rsp.wrapping_add(8));
         self.regs.set_rax(rax);
@@ -366,61 +393,22 @@ impl CpuEngine for IcedCpu {
         Ok(return_address)
     }
 
-    fn read_rip(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.rip)
-    }
-    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.rip = value;
-        Ok(())
-    }
-    fn read_rsp(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.rsp())
-    }
-    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.set_rsp(value);
-        Ok(())
-    }
-    fn read_rax(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.rax())
-    }
-    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.set_rax(value);
-        Ok(())
-    }
-    fn read_rcx(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.rcx())
-    }
-    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.set_rcx(value);
-        Ok(())
-    }
-    fn read_rdx(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.rdx())
-    }
-    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.set_rdx(value);
-        Ok(())
-    }
-    fn read_r8(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.r8())
-    }
-    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.set_r8(value);
-        Ok(())
-    }
-    fn read_r9(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.r9())
-    }
-    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> {
-        self.regs.set_r9(value);
-        Ok(())
-    }
-    fn read_rbx(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.gpr(3))
-    }
-    fn read_r12(&mut self) -> Result<u64, CpuError> {
-        Ok(self.regs.gpr(12))
-    }
+    fn read_rip(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rip) }
+    fn write_rip(&mut self, value: u64) -> Result<(), CpuError> { self.regs.rip = value; Ok(()) }
+    fn read_rsp(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rsp()) }
+    fn write_rsp(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rsp(value); Ok(()) }
+    fn read_rax(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rax()) }
+    fn write_rax(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rax(value); Ok(()) }
+    fn read_rcx(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rcx()) }
+    fn write_rcx(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rcx(value); Ok(()) }
+    fn read_rdx(&mut self) -> Result<u64, CpuError> { Ok(self.regs.rdx()) }
+    fn write_rdx(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_rdx(value); Ok(()) }
+    fn read_r8(&mut self) -> Result<u64, CpuError> { Ok(self.regs.r8()) }
+    fn write_r8(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_r8(value); Ok(()) }
+    fn read_r9(&mut self) -> Result<u64, CpuError> { Ok(self.regs.r9()) }
+    fn write_r9(&mut self, value: u64) -> Result<(), CpuError> { self.regs.set_r9(value); Ok(()) }
+    fn read_rbx(&mut self) -> Result<u64, CpuError> { Ok(self.regs.gpr(3)) }
+    fn read_r12(&mut self) -> Result<u64, CpuError> { Ok(self.regs.gpr(12)) }
 
     fn snapshot_thread_context(&mut self) -> crate::ThreadContext {
         self.regs.snapshot()

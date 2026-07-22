@@ -54,7 +54,7 @@ pub(crate) enum ProcessGuard<'a> {
         win: std::sync::MutexGuard<'a, WinApiState>,
     },
     Iced {
-        eng: std::sync::MutexGuard<'a, Box<dyn wie_cpu::CpuEngine>>,
+        eng: &'a mut dyn wie_cpu::CpuEngine,
         win: std::sync::MutexGuard<'a, WinApiState>,
     },
 }
@@ -63,7 +63,7 @@ impl ProcessGuard<'_> {
     pub(crate) fn both(&mut self) -> (&mut dyn wie_cpu::CpuEngine, &mut WinApiState) {
         match self {
             Self::Jit { eng, win } => (*eng, &mut *win),
-            Self::Iced { eng, win } => (eng.as_mut(), &mut *win),
+            Self::Iced { eng, win } => (*eng, &mut *win),
         }
     }
 }
@@ -134,11 +134,11 @@ impl JitState {
     }
 }
 
-// ── IcedState: shared engine behind mutex, shared WinAPI ──────────────
+// ── IcedState: per-thread engines, shared WinAPI ──────────────────────
 
 pub(crate) struct IcedState {
     pub config: ProcessConfig,
-    pub shared_engine: Arc<Mutex<Box<dyn wie_cpu::CpuEngine>>>,
+    pub engine: Box<dyn wie_cpu::CpuEngine>,  // primary's per-thread engine
     pub shared_winapi: Arc<Mutex<WinApiState>>,
     pub worker_joins: Vec<JoinHandle<()>>,
 }
@@ -146,7 +146,7 @@ pub(crate) struct IcedState {
 impl IcedState {
     fn lock_pair(&mut self) -> ProcessGuard<'_> {
         ProcessGuard::Iced {
-            eng: lock(&self.shared_engine),
+            eng: &mut *self.engine,
             win: lock(&self.shared_winapi),
         }
     }
@@ -171,21 +171,28 @@ impl IcedState {
         if spawns.is_empty() {
             return Ok(());
         }
-        let shared_engine = Arc::clone(&self.shared_engine);
         let shared_winapi = Arc::clone(&self.shared_winapi);
         let soft = self.config.soft_apis.clone();
         let env = self.config.environment;
         let layout = self.config.layout;
+        let stop_bitmap = self.config.stop_bitmap.clone();
+
+        // Create per-thread IcedCpu engines sharing the primary's GuestMemory.
+        // SAFETY: engine is always IcedCpu in this state.
+        let primary_iced = unsafe {
+            &*(&*self.engine as *const dyn wie_cpu::CpuEngine as *const wie_cpu::IcedCpu)
+        };
 
         for spawn in spawns {
-            let eng = Arc::clone(&shared_engine);
+            let engine: Box<dyn wie_cpu::CpuEngine> = Box::new(wie_cpu::IcedCpu::new_shared(primary_iced));
             let winapi = Arc::clone(&shared_winapi);
-            let soft = soft.clone();
+            let s = soft.clone();
+            let b = stop_bitmap.clone();
             const STACK: usize = 8 * 1024 * 1024;
             let handle = std::thread::Builder::new()
                 .name(format!("wie-guest-{}", spawn.tid))
                 .stack_size(STACK)
-                .spawn(move || iced_worker_main(eng, winapi, soft, env, layout, spawn.tid))
+                .spawn(move || iced_worker_main(engine, winapi, s, env, layout, spawn.tid, b))
                 .context("failed to spawn guest worker")?;
             self.worker_joins.push(handle);
         }
@@ -342,12 +349,13 @@ fn jit_worker_main(
 }
 
 fn iced_worker_main(
-    shared_engine: Arc<Mutex<Box<dyn wie_cpu::CpuEngine>>>,
+    mut engine: Box<dyn wie_cpu::CpuEngine>,
     shared_winapi: Arc<Mutex<WinApiState>>,
     soft_apis: SoftApiTable,
     environment: wie_winapi::WinApiEnvironment,
     layout: RuntimeMemoryLayout,
     tid: u32,
+    stop_bitmap: Vec<u8>,
 ) {
     let budget = layout.instruction_budget;
     let fake_api_end = layout
@@ -355,33 +363,32 @@ fn iced_worker_main(
         .saturating_add(u64::try_from(layout.fake_api_size).unwrap_or(0))
         .saturating_sub(1);
 
+    // Install runtime hooks so the engine can stop on fake API calls.
+    let _ = engine.install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap);
+
+    // Load initial thread context set by CreateThread.
+    {
+        let st = lock(&shared_winapi);
+        if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
+            drop(st);
+            engine.restore_thread_context(&ctx);
+            engine.on_thread_switch();
+        }
+    }
+
     loop {
         let park_reason: Option<HostParkReason>;
         {
-            let mut eng = lock(&shared_engine);
             let mut st = lock(&shared_winapi);
             if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
 
-            // Shared engine: save prev thread context, load ours.
-            let prev = st.threads.current_tid();
-            if prev != tid {
-                let ctx = eng.snapshot_thread_context();
-                st.sync.thread_cpu.insert(prev, ctx);
-                st.threads.save_active();
-            }
-            st.threads.activate(tid);
-            if let Some(ctx) = st.sync.thread_cpu.get(&tid).cloned() {
-                eng.restore_thread_context(&ctx);
-                eng.on_thread_switch();
-            }
-
-            let begin = eng.read_rip().unwrap_or(0);
+            let begin = engine.read_rip().unwrap_or(0);
             if begin == 0 {
-                let code = u32::try_from(eng.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+                let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code); return;
             }
 
-            let hook = match eng.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end) {
+            let hook = match engine.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end) {
                 Ok(r) if r.code.hit => r.code,
                 Ok(_) => { std::thread::yield_now(); continue; }
                 Err(_) => { finish_tid(&st, tid, 1); return; }
@@ -394,14 +401,14 @@ fn iced_worker_main(
             };
             if resolved.traits.exit_process() {
                 st.sync.process_dying = true;
-                let code = u32::try_from(eng.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+                let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
                 finish_tid(&st, tid, code); return;
             }
 
             let dispatch = if let Some(id) = resolved.winapi_id {
-                wie_winapi::dispatch_winapi_id(eng.as_mut(), environment, &mut st, id)
+                wie_winapi::dispatch_winapi_id(&mut *engine, environment, &mut st, id)
             } else {
-                wie_winapi::dispatch_winapi(eng.as_mut(), environment, &mut st, &resolved.library, &resolved.name)
+                wie_winapi::dispatch_winapi(&mut *engine, environment, &mut st, &resolved.library, &resolved.name)
             };
 
             match dispatch {
@@ -417,52 +424,9 @@ fn iced_worker_main(
                     }
                 }
             }
-            // Save this thread's registers before releasing the shared engine lock.
-            // Without this, another thread that acquires the engine will overwrite
-            // our registers, and a stale context would be loaded on wake-up.
-            let ctx = eng.snapshot_thread_context();
-            st.sync.thread_cpu.insert(tid, ctx);
-            st.threads.save_active();
-        } // drop locks
+        } // drop WinAPI lock
 
-        if let Some(reason) = park_reason {
-            match reason {
-                HostParkReason::CriticalSection { cs } => {
-                    let q = {
-                        let mut st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-                        resolve_cs_queue(&mut st, cs)
-                    };
-                    q.park_brief();
-                }
-                HostParkReason::WaitObject { handle, timeout_ms } => {
-                    // Get target without engine lock (only winapi lock needed).
-                    let target = {
-                        let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-                        resolve_wait_target(&st, handle)
-                    };
-                    // Wait WITHOUT engine lock (avoids deadlock with other workers).
-                    let result = wait_on_target(target, timeout_ms, &shared_winapi, tid);
-                    // Re-acquire engine for return value.
-                    let mut eng = shared_engine.lock().unwrap_or_else(|p| p.into_inner());
-                    let st = shared_winapi.lock().unwrap_or_else(|p| p.into_inner());
-                    if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
-                    eng.return_from_win64_api(u64::from(result))
-                        .expect("return_from_win64_api: guest stack corrupted");
-                }
-                HostParkReason::WaitMultiple => {
-                    let req = {
-                        let mut st = lock(&shared_winapi);
-                        st.sync.multi_wait.remove(&tid)
-                    };
-                    let result = wait_multiple_result(req, &shared_winapi, tid);
-                    let mut eng = lock(&shared_engine);
-                    let st = lock(&shared_winapi);
-                    if st.sync.process_dying { finish_tid(&st, tid, 1); return; }
-                    eng.return_from_win64_api(u64::from(result))
-                        .expect("return_from_win64_api: guest stack corrupted");
-                }
-            }
-        }
+        if let Some(reason) = park_reason { handle_park_jit(&mut engine, &shared_winapi, tid, reason); }
     }
 }
 

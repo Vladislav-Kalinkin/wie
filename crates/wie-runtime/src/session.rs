@@ -541,7 +541,7 @@ impl RuntimeSession {
         } else {
             ProcessState::Iced(mt_runtime::IcedState {
                 config,
-                shared_engine: Arc::new(Mutex::new(engine)),
+                engine,
                 shared_winapi,
                 worker_joins: Vec::new(),
             })
