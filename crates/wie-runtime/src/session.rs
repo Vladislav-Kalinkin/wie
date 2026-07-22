@@ -495,6 +495,7 @@ struct SessionInit {
     soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
     stop_bitmap: Vec<u8>,
+    shared_jit: Option<Arc<wie_cpu::JitShared>>,
     entry_point_va: u64,
     initial_rsp: u64,
 }
@@ -510,6 +511,7 @@ impl RuntimeSession {
                 init.environment,
                 init.layout,
                 init.stop_bitmap,
+                init.shared_jit,
             ),
             entry_point_va: init.entry_point_va,
             initial_rsp: init.initial_rsp,
@@ -605,8 +607,9 @@ impl RuntimeSession {
         let image_size =
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
 
-        // WIE CPU backend (Unicorn default; `WIE_CPU=iced` for interpreter).
-        let mut engine = crate::open_default_cpu().context("failed to open WIE CPU backend")?;
+        // WIE CPU backend (JIT default; `WIE_CPU=iced` for interpreter).
+        let (mut engine, shared_jit) = wie_cpu::open_default_cpu_with_shared()
+            .context("failed to open WIE CPU backend")?;
 
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
         // are written directly into guest memory (no intermediate Vec<u8> buffer).
@@ -1036,6 +1039,7 @@ impl RuntimeSession {
             soft_apis,
             layout,
             stop_bitmap,
+            shared_jit,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
         });

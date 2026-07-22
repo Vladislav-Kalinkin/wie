@@ -500,6 +500,26 @@ pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
     }
 }
 
+/// Open a CPU backend and return the engine together with its shared JIT state.
+///
+/// For JIT backends, returns `Some(Arc<JitShared>)` for sharing across per-thread
+/// engines. For iced backends, returns `None`.
+///
+/// # Errors
+/// Backend open failure.
+pub fn open_default_cpu_with_shared() -> Result<(Box<dyn CpuEngine>, Option<Arc<crate::jit::JitShared>>), CpuError> {
+    let name = active_backend_name();
+    tracing::info!(backend = name, "opening WIE CPU backend");
+    match name {
+        "iced" => Ok((Box::new(IcedCpu::open_x86_64()), None)),
+        _ => {
+            let cpu = JitCpu::open_x86_64();
+            let shared = Arc::clone(cpu.shared_jit());
+            Ok((Box::new(cpu), Some(shared)))
+        }
+    }
+}
+
 /// Process CPU times for `RUSAGE_SELF` in microseconds `(user, sys)`.
 ///
 /// Used by CLI wall/CPU reports.

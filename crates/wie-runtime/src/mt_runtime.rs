@@ -66,10 +66,11 @@ impl ProcessResources {
         environment: wie_winapi::WinApiEnvironment,
         layout: RuntimeMemoryLayout,
         stop_bitmap: Vec<u8>,
+        shared_jit: Option<Arc<wie_cpu::JitShared>>,
     ) -> Self {
         Self {
             engine,
-            shared_jit: None,
+            shared_jit,
             local_winapi: Some(winapi),
             shared_winapi: None,
             soft_apis,
@@ -176,15 +177,9 @@ impl ProcessResources {
         Ok(())
     }
 
-    /// Extract or create `Arc<JitShared>` from the primary engine.
+    /// Get or create `Arc<JitShared>` from the stored value.
     fn ensure_shared_jit(&mut self) -> Arc<wie_cpu::JitShared> {
-        if let Some(ref sj) = self.shared_jit {
-            return Arc::clone(sj);
-        }
-        // The primary engine was created as JitCpu. Extract its Arc<JitShared>.
-        let arc = Arc::clone(self.engine.shared_jit().expect("engine is JitCpu"));
-        self.shared_jit = Some(Arc::clone(&arc));
-        arc
+        self.shared_jit.as_ref().expect("shared_jit must be set for multi-threaded sessions; ensure the engine is JitCpu").clone()
     }
 
     /// Join workers on `ExitProcess` (MT.4): set dying, wake all waiters, join hosts.
