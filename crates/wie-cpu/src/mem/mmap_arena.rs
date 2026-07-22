@@ -96,6 +96,14 @@ impl GuestMemBackend for MmapArenaBackend {
     }
 }
 
+impl MmapArenaBackend {
+    /// Lock-free host pointer for data-plane write (no arena mutation).
+    #[inline]
+    pub(super) fn write_ptr(&self, address: u64) -> Option<*mut u8> {
+        self.arenas.write_ptr(address)
+    }
+}
+
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::as_conversions, unsafe_code)]
 mod tests {

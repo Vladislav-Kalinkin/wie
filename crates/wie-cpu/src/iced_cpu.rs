@@ -5,40 +5,39 @@ use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
-/// Lock a mutex, recovering the lock on poison.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+fn lock_rd<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Power-of-two RIP ring capacity (mask indexing avoids `%` side-effect lints).
+fn lock_wr<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|p| p.into_inner())
+}
+
 const RIP_TRACE_CAP: usize = 32;
 const RIP_TRACE_MASK: usize = RIP_TRACE_CAP - 1;
 
 /// Software x86-64 CPU using iced-x86 decode + interpret.
 ///
-/// Guest memory is shared behind `Arc<Mutex<>>` so multiple per-thread
-/// `IcedCpu` instances can share the same page tables and mmap arenas.
-/// The standalone constructor creates its own, uncontended memory.
+/// Guest memory is shared behind `Arc<RwLock<>>` so per-thread `IcedCpu`
+/// engines can read page tables and guest memory concurrently, while
+/// structural mutations (map, protect, VirtualAlloc) take exclusive access.
 pub struct IcedCpu {
-    mem: Arc<Mutex<GuestMemory>>,
+    mem: Arc<RwLock<GuestMemory>>,
     regs: RegFile,
     hooks: Option<HookWindow>,
-    /// Recent RIP history for diagnostics (ring buffer).
     rip_trace: [u64; RIP_TRACE_CAP],
     rip_trace_i: usize,
     rip_trace_n: usize,
-    /// Instructions retired via interpreter (Phase 0 baselines).
     iced_steps: u64,
 }
 
 impl IcedCpu {
-    /// Create a fresh x86-64 interpreter instance with its own guest memory.
     #[must_use]
     pub fn open_x86_64() -> Self {
         Self {
-            mem: Arc::new(Mutex::new(GuestMemory::new())),
+            mem: Arc::new(RwLock::new(GuestMemory::new())),
             regs: RegFile::new(),
             hooks: None,
             rip_trace: [0; RIP_TRACE_CAP],
@@ -48,8 +47,6 @@ impl IcedCpu {
         }
     }
 
-    /// Create a per-thread interpreter sharing guest memory with other engines.
-    /// Uses the shared memory from `source` (the primary engine).
     #[must_use]
     pub fn new_shared(source: &Self) -> Self {
         Self {
@@ -63,14 +60,12 @@ impl IcedCpu {
         }
     }
 
-    /// Access the shared guest memory Arc (for creating per-thread engines).
     #[must_use]
     #[expect(dead_code)]
-    pub(crate) fn guest_mem_arc(&self) -> &Arc<Mutex<GuestMemory>> {
+    pub(crate) fn guest_mem_arc(&self) -> &Arc<RwLock<GuestMemory>> {
         &self.mem
     }
 
-    /// Interpreter step counter (also used when JIT falls back to iced).
     #[must_use]
     pub fn iced_steps(&self) -> u64 {
         self.iced_steps
@@ -87,7 +82,6 @@ impl IcedCpu {
         }
     }
 
-    /// Recent RIP values (oldest → newest), for crash diagnostics.
     #[must_use]
     pub fn rip_trace_vec(&self) -> Vec<u64> {
         let n = self.rip_trace_n;
@@ -102,50 +96,41 @@ impl IcedCpu {
         out
     }
 
-    /// Expose registers for tests / debugging.
     #[must_use]
     pub fn regs(&self) -> &RegFile {
         &self.regs
     }
 
-    /// Mutable registers for tests.
     pub fn regs_mut(&mut self) -> &mut RegFile {
         &mut self.regs
     }
 
-    /// Runtime hook window (JIT consults stop-bitmap before entering a block).
     #[must_use]
     #[expect(dead_code)]
     pub(crate) fn hooks_ref(&self) -> Option<&HookWindow> {
         self.hooks.as_ref()
     }
 
-    /// Read guest bytes without going through the `CpuEngine` trait (JIT decode).
     #[expect(dead_code)]
     pub(crate) fn mem_read_into(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        lock(&self.mem).read(address, bytes)
+        lock_rd(&self.mem).read(address, bytes)
     }
 
-    /// Mutable guest memory pointer for JIT host load/store callbacks.
     #[expect(dead_code)]
     pub(crate) fn guest_mem_mut(&mut self) -> impl std::ops::DerefMut<Target = GuestMemory> + '_ {
-        // Can't return &mut GuestMemory directly — behind a mutex.
-        // The caller gets a MutexGuard.
-        self.mem.lock().unwrap_or_else(|p| p.into_inner())
+        lock_wr(&self.mem)
     }
 
-    /// Immutable guest memory (code invalidation span lookup, etc.).
     #[expect(dead_code)]
     pub(crate) fn guest_mem(&self) -> impl std::ops::Deref<Target = GuestMemory> + '_ {
-        self.mem.lock().unwrap_or_else(|p| p.into_inner())
+        lock_rd(&self.mem)
     }
 
-    /// One step returning the raw [`StepResult`] (shared by `step_once` and JIT fallback).
     pub(crate) fn step_once_result(&mut self) -> Result<StepResult, CpuError> {
         self.push_rip_trace(self.regs.rip);
         let hook = self.hooks.as_ref();
-        let mut mem_guard = lock(&self.mem);
-        let result = exec::step(&mut *mem_guard, &mut self.regs, hook)?;
+        let mem_guard = lock_rd(&self.mem);
+        let result = exec::step(&*mem_guard, &mut self.regs, hook)?;
         drop(mem_guard);
         if matches!(result, StepResult::Continue) {
             self.iced_steps = self.iced_steps.saturating_add(1);
@@ -153,10 +138,6 @@ impl IcedCpu {
         Ok(result)
     }
 
-    /// Execute a single instruction at the current `RIP`.
-    ///
-    /// # Errors
-    /// Decode/execute failure, invalid memory, or host-stop hit.
     pub fn step_once(&mut self) -> Result<(), CpuError> {
         match self.step_once_result()? {
             StepResult::Continue => Ok(()),
@@ -173,23 +154,23 @@ impl IcedCpu {
 
 impl CpuEngine for IcedCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        lock(&self.mem).map(address, size, perms)
+        lock_wr(&self.mem).map(address, size, perms)
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        lock(&self.mem).write(address, bytes)
+        lock_wr(&self.mem).write(address, bytes)
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        lock(&self.mem).read(address, bytes)
+        lock_rd(&self.mem).read(address, bytes)
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        lock(&self.mem).host_span(address, len, write)
+        lock_rd(&self.mem).host_span(address, len, write)
     }
 
     fn mem_generation(&self) -> u64 {
-        lock(&self.mem).generation()
+        lock_rd(&self.mem).generation()
     }
 
     fn virtual_alloc(
@@ -199,11 +180,11 @@ impl CpuEngine for IcedCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        lock(&self.mem).virtual_alloc(addr, size, alloc_type, protect)
+        lock_wr(&self.mem).virtual_alloc(addr, size, alloc_type, protect)
     }
 
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
-        lock(&self.mem).virtual_free(addr, size, free_type)
+        lock_wr(&self.mem).virtual_free(addr, size, free_type)
     }
 
     fn virtual_protect(
@@ -212,23 +193,23 @@ impl CpuEngine for IcedCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        lock(&self.mem).virtual_protect(addr, size, new_protect)
+        lock_wr(&self.mem).virtual_protect(addr, size, new_protect)
     }
 
     fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
-        lock(&self.mem).virtual_query(addr)
+        lock_rd(&self.mem).virtual_query(addr)
     }
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        lock(&self.mem).map_image(address, size, perms)
+        lock_wr(&self.mem).map_image(address, size, perms)
     }
 
     fn register_region(&mut self, region: GuestRegion) {
-        lock(&self.mem).register_region(region);
+        lock_wr(&self.mem).register_region(region);
     }
 
     fn find_region(&self, va: u64) -> Option<GuestRegion> {
-        lock(&self.mem).find_region(va).cloned()
+        lock_rd(&self.mem).find_region(va).cloned()
     }
 
     fn cpu_stats(&self) -> Option<crate::JitStats> {
@@ -239,7 +220,7 @@ impl CpuEngine for IcedCpu {
     }
 
     fn mem_backend_name(&self) -> &'static str {
-        lock(&self.mem).backend_name()
+        lock_rd(&self.mem).backend_name()
     }
 
     fn install_runtime_hooks(
@@ -291,8 +272,8 @@ impl CpuEngine for IcedCpu {
                 self.push_rip_trace(rip_before);
             }
             let hook_ref = self.hooks.as_ref();
-        let mut mem_guard = lock(&self.mem);
-            match exec::step(&mut *mem_guard, &mut self.regs, hook_ref) {
+            let mem_guard = lock_rd(&self.mem);
+            match exec::step(&*mem_guard, &mut self.regs, hook_ref) {
                 Ok(StepResult::Continue) => {
                     drop(mem_guard);
                     executed = executed.saturating_add(1);
@@ -300,26 +281,16 @@ impl CpuEngine for IcedCpu {
                 }
                 Ok(StepResult::HostStop { address, size }) => {
                     return Ok(RunUntilHook {
-                        code: CodeHookOutcome {
-                            hit: true,
-                            address,
-                            size,
-                        },
+                        code: CodeHookOutcome { hit: true, address, size },
                         invalid_memory: InvalidMemoryAccess {
-                            hit: false,
-                            access_type: 0,
-                            address: 0,
-                            size: 0,
-                            value: 0,
+                            hit: false, access_type: 0, address: 0, size: 0, value: 0,
                         },
                     });
                 }
                 Ok(StepResult::InvalidMemory(inv)) => {
                     return Ok(RunUntilHook {
                         code: CodeHookOutcome {
-                            hit: false,
-                            address: 0,
-                            size: 0,
+                            hit: false, address: 0, size: 0,
                         },
                         invalid_memory: InvalidMemoryAccess {
                             hit: true,
@@ -336,44 +307,26 @@ impl CpuEngine for IcedCpu {
                         .iter()
                         .map(|r| format!("{r:#x}"))
                         .collect::<Vec<_>>()
-                        .join(" → ");
+                        .join(" -> ");
                     let r = &self.regs;
                     return Err(CpuError::Message(format!(
                         "{e}; iced_regs rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} \
                          rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x} \
                          r8={:#x} r9={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}; \
                          iced_rip_trace=[{trace_s}]",
-                        r.rax(),
-                        r.rbx(),
-                        r.rcx(),
-                        r.rdx(),
-                        r.rsp(),
-                        r.rbp(),
-                        r.rsi(),
-                        r.rdi(),
-                        r.r8(),
-                        r.r9(),
-                        r.gpr(12),
-                        r.gpr(13),
-                        r.gpr(14),
-                        r.gpr(15),
+                        r.rax(), r.rbx(), r.rcx(), r.rdx(),
+                        r.rsp(), r.rbp(), r.rsi(), r.rdi(),
+                        r.r8(), r.r9(),
+                        r.gpr(12), r.gpr(13), r.gpr(14), r.gpr(15),
                     )));
                 }
             }
         }
 
         Ok(RunUntilHook {
-            code: CodeHookOutcome {
-                hit: false,
-                address: 0,
-                size: 0,
-            },
+            code: CodeHookOutcome { hit: false, address: 0, size: 0 },
             invalid_memory: InvalidMemoryAccess {
-                hit: false,
-                access_type: 0,
-                address: 0,
-                size: 0,
-                value: 0,
+                hit: false, access_type: 0, address: 0, size: 0, value: 0,
             },
         })
     }
@@ -381,7 +334,7 @@ impl CpuEngine for IcedCpu {
     fn return_from_win64_api(&mut self, rax: u64) -> Result<u64, CpuError> {
         let rsp = self.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
-        let mem_guard = lock(&self.mem);
+        let mem_guard = lock_rd(&self.mem);
         mem_guard
             .read(rsp, &mut ret_bytes)
             .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
@@ -418,7 +371,5 @@ impl CpuEngine for IcedCpu {
         self.regs.restore(ctx);
     }
 
-    fn on_thread_switch(&mut self) {
-        // Interpreter has no sticky TLB/pins.
-    }
+    fn on_thread_switch(&mut self) {}
 }

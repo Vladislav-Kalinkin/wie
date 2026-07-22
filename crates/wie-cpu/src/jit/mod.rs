@@ -44,6 +44,7 @@ use lower::{
     wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use trampolines::match_micro_stub;
 
@@ -196,9 +197,10 @@ pub struct JitShared {
     /// Cranelift JIT module (behind Mutex: compiled blocks are serialized anyway).
     #[doc(hidden)]
     pub engine: Mutex<Option<JitEngine>>,
-    /// Guest memory: page tables, mmap backend. Mutex protects metadata.
+    /// Guest memory: page tables, mmap backend. RwLock protects metadata;
+    /// reads are the common path (generation, pins, decode), writes are rare (map/free).
     #[doc(hidden)]
-    pub mem: Mutex<GuestMemory>,
+    pub mem: RwLock<GuestMemory>,
     /// Guest entry VA → CacheEntry.
     #[doc(hidden)]
     pub cache: RwLock<HashMap<u64, CacheEntry>>,
@@ -208,25 +210,33 @@ pub struct JitShared {
     /// Guest page keys covered by Ready blocks (SMC tracking).
     #[doc(hidden)]
     pub code_pages: Mutex<HashMap<u64, u32>>,
+    /// Cached GuestMemory generation, updated on map/protect/free (avoids mem lock).
+    pub mem_gen: AtomicU64,
+    /// Whether the Cranelift engine was successfully initialized.
+    pub engine_ready: AtomicBool,
 }
 
 impl JitShared {
     fn new() -> Self {
+        let has_engine = match JitEngine::new() {
+            Ok(e) => {
+                tracing::info!("cranelift JIT module ready");
+                Some(e)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cranelift JIT unavailable; iced-only");
+                None
+            }
+        };
+        let engine_ready = has_engine.is_some();
         Self {
-            engine: Mutex::new(match JitEngine::new() {
-                Ok(e) => {
-                    tracing::info!("cranelift JIT module ready");
-                    Some(e)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "cranelift JIT unavailable; iced-only");
-                    None
-                }
-            }),
-            mem: Mutex::new(GuestMemory::new()),
+            engine: Mutex::new(has_engine),
+            mem: RwLock::new(GuestMemory::new()),
             cache: RwLock::new(HashMap::new()),
             chain_ids: RwLock::new(HashMap::new()),
             code_pages: Mutex::new(HashMap::new()),
+            mem_gen: AtomicU64::new(0),
+            engine_ready: AtomicBool::new(engine_ready),
         }
     }
 }
@@ -347,6 +357,7 @@ pub struct JitCpu {
 unsafe impl Send for JitCpu {}
 
 #[doc(hidden)]
+#[derive(Clone)]
 pub enum CacheEntry {
     /// Native block ready to run.
     Ready(CompiledBlock),
@@ -704,7 +715,7 @@ impl JitCpu {
     }
 
     fn drain_pending_code_writes(&mut self) {
-        let (pages, overflow) = self.shared.mem.lock().unwrap().take_pending_code_writes();
+        let (pages, overflow) = self.shared.mem.write().unwrap().take_pending_code_writes();
         if overflow {
             if !self.shared.cache.read().unwrap().is_empty() {
                 self.clear_compiled();
@@ -725,7 +736,7 @@ impl JitCpu {
         free_type: u32,
     ) -> Option<(u64, usize)> {
         if (free_type & mem::MEM_RELEASE) != 0 {
-            return self.shared.mem.lock().unwrap().allocation_span_at_base(addr);
+            return self.shared.mem.read().unwrap().allocation_span_at_base(addr);
         }
         if (free_type & mem::MEM_DECOMMIT) != 0 {
             if size == 0 {
@@ -770,24 +781,21 @@ impl JitCpu {
             ));
         }
 
-        if self.shared.engine.lock().unwrap().is_some() {
-            let cache = self.shared.cache.write().unwrap();
-            match cache.get(&rip) {
-                Some(CacheEntry::Ready(compiled)) => {
-                    self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-                    let meta = CompiledRunMeta::from(compiled);
-                    drop(cache); // release lock before finish_compiled (may call drain_pending_code_writes)
-                    return Ok(self.finish_compiled(rip, meta));
-                }
-                Some(CacheEntry::Never) => {}
-                Some(CacheEntry::Hot { visits: _, thr: _ }) => {
-                    // Read visits via pattern match bypass — use clone to get value
-                    let is_hot_entry = cache.get(&rip).map(|e| match e {
-                        CacheEntry::Hot { visits, thr } => (*visits, *thr),
-                        _ => (0, 0),
-                    });
-                    drop(cache);
-                    if let Some((visits, thr)) = is_hot_entry {
+        if self.shared.engine_ready.load(Ordering::Relaxed) {
+            // Read-first pattern: acquire read lock, clone entry, drop lock, then act.
+            let entry = {
+                let cache = self.shared.cache.read().unwrap();
+                cache.get(&rip).cloned()
+            };
+            if let Some(entry) = entry {
+                match entry {
+                    CacheEntry::Ready(compiled) => {
+                        self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+                        let meta = CompiledRunMeta::from(&compiled);
+                        return Ok(self.finish_compiled(rip, meta));
+                    }
+                    CacheEntry::Never => { /* fall through to iced */ }
+                    CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
                         if thr > 0 && next < thr {
                             self.shared.cache.write().unwrap()
@@ -802,29 +810,28 @@ impl JitCpu {
                         }
                     }
                 }
-                None => {
-                    drop(cache);
-                    let is_ucrt = self.peek_fast_ucrt_call(rip);
-                    let is_loop = self.peek_self_loop(rip);
-                    let thr = if is_ucrt {
-                        2
-                    } else if is_loop {
-                        pure_loop_hotness()
-                    } else {
-                        hotness_threshold()
-                    };
-                    if thr == 0 || is_ucrt {
-                        if let Some(compiled) = self.try_compile(rip) {
-                            let meta = CompiledRunMeta::from(&compiled);
-                            self.insert_ready(rip, compiled);
-                            return Ok(self.finish_compiled(rip, meta));
-                        }
-                        self.shared.cache.write().unwrap()
-                            .insert(rip, CacheEntry::Never);
-                    } else {
-                        self.shared.cache.write().unwrap()
-                            .insert(rip, CacheEntry::Hot { visits: 1, thr });
+            } else {
+                // Miss: need write lock to insert.
+                let is_ucrt = self.peek_fast_ucrt_call(rip);
+                let is_loop = self.peek_self_loop(rip);
+                let thr = if is_ucrt {
+                    2
+                } else if is_loop {
+                    pure_loop_hotness()
+                } else {
+                    hotness_threshold()
+                };
+                if thr == 0 || is_ucrt {
+                    if let Some(compiled) = self.try_compile(rip) {
+                        let meta = CompiledRunMeta::from(&compiled);
+                        self.insert_ready(rip, compiled);
+                        return Ok(self.finish_compiled(rip, meta));
                     }
+                    self.shared.cache.write().unwrap()
+                        .insert(rip, CacheEntry::Never);
+                } else {
+                    self.shared.cache.write().unwrap()
+                        .insert(rip, CacheEntry::Hot { visits: 1, thr });
                 }
             }
         }
@@ -845,7 +852,7 @@ impl JitCpu {
             }
         }
         let hook = self.thread.hooks.as_ref();
-        let result = exec::step(&mut *self.shared.mem.lock().unwrap(), &mut self.thread.regs, hook)?;
+        let result = exec::step(&*self.shared.mem.read().unwrap(), &mut self.thread.regs, hook)?;
         if matches!(result, StepResult::Continue) {
             self.thread.iced_steps = self.thread.iced_steps.saturating_add(1);
         }
@@ -858,7 +865,7 @@ impl JitCpu {
         if self.fast_api.is_empty() {
             return false;
         }
-        let mem = self.shared.mem.lock().unwrap();
+        let mem = self.shared.mem.read().unwrap();
         match decode_pure_gpr_block(&*mem, self.thread.hooks.as_ref(), rip) {
             BlockKind::Pure {
                 term: Some(block::BlockTerm::Call { target, .. }),
@@ -872,13 +879,13 @@ impl JitCpu {
     }
 
     fn peek_self_loop(&self, rip: u64) -> bool {
-        let mem = self.shared.mem.lock().unwrap();
+        let mem = self.shared.mem.read().unwrap();
         let kind = decode_pure_gpr_block(&*mem, self.thread.hooks.as_ref(), rip);
         pure_is_self_loop(&kind, rip)
     }
 
     fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
-        let mem_guard = self.shared.mem.lock().unwrap();
+        let mem_guard = self.shared.mem.read().unwrap();
         let result = decode_pure_gpr_block(&*mem_guard, self.thread.hooks.as_ref(), rip);
         drop(mem_guard); // release before compiling (engine needs mutable access)
         match result {
@@ -922,7 +929,7 @@ impl JitCpu {
                 // Resolve import thunks before mutably borrowing the JIT engine.
                 let call_fast = match term {
                     Some(block::BlockTerm::Call { target, .. }) => {
-                        let mem = self.shared.mem.lock().unwrap();
+                        let mem = self.shared.mem.read().unwrap();
                         let final_va = resolve_thunk_va(&*mem, target);
                         drop(mem);
                         self.fast_api.iter()
@@ -994,12 +1001,16 @@ impl JitCpu {
     fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
         // Refresh pins only when GuestMemory generation changes (map/protect/free).
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
-        let mem_gen = self.shared.mem.lock().unwrap().generation();
-        if self.thread.pins_gen != mem_gen {
-            let infos = self.shared.mem.lock().unwrap().jit_region_pins();
-            self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
-            self.thread.pins_gen = mem_gen;
-        }
+        let mem_gen = {
+            let mem = self.shared.mem.read().unwrap();
+            let cur_gen = mem.generation();
+            if self.thread.pins_gen != cur_gen {
+                let infos = mem.jit_region_pins();
+                self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            }
+            cur_gen
+        };
+        self.thread.pins_gen = mem_gen;
         // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
         if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
             self.stats.mem_gen_bumps = self
@@ -1037,8 +1048,8 @@ impl JitCpu {
             self.stats.pin_heap_bytes = data_bytes;
             self.stats.pin_allow_bits = bits;
         }
-        let mut mem_guard = self.shared.mem.lock().unwrap();
-        let mem_ptr = std::ptr::from_mut(&mut *mem_guard);
+        let mem_guard = self.shared.mem.read().unwrap();
+        let mem_ptr = &*mem_guard as *const GuestMemory as *mut GuestMemory;
         let regs = &mut self.thread.regs;
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
         // JitCtx, so every architectural GPR must be valid for successors.
@@ -1107,11 +1118,11 @@ impl JitCpu {
             // Fresh dispatcher entry always starts a new host-chain budget.
             chain_depth: 0,
         };
-        // SAFETY: `func` is a finalized Cranelift block or hand-written trampoline.
+        drop(mem_guard); // GuestMemory read lock already released; compiled block runs on TLB/pins.
+        // SAFETY: func is a finalized Cranelift block; TLB/pins resolve to stable mmap pointers.
         unsafe {
             (meta.func)(std::ptr::from_mut(&mut ctx));
         }
-        drop(mem_guard); // GuestMemory no longer needed; drain_pending_code_writes locks it again
         self.stats.load_calls = self.stats.load_calls.saturating_add(ctx.load_calls);
         self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
         {
@@ -1571,25 +1582,25 @@ impl JitEngine {
 
 impl CpuEngine for JitCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.shared.mem.lock().unwrap().map(address, size, perms)
+        self.shared.mem.write().unwrap().map(address, size, perms)
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        self.shared.mem.lock().unwrap().write(address, bytes)?;
+        self.shared.mem.write().unwrap().write(address, bytes)?;
         self.drain_pending_code_writes();
         Ok(())
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.shared.mem.lock().unwrap().read(address, bytes)
+        self.shared.mem.read().unwrap().read(address, bytes)
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        self.shared.mem.lock().unwrap().host_span(address, len, write)
+        self.shared.mem.read().unwrap().host_span(address, len, write)
     }
 
     fn mem_generation(&self) -> u64 {
-        self.shared.mem.lock().unwrap().generation()
+        self.shared.mem.read().unwrap().generation()
     }
 
     fn virtual_alloc(
@@ -1599,7 +1610,7 @@ impl CpuEngine for JitCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        let r = self.shared.mem.lock().unwrap().virtual_alloc(addr, size, alloc_type, protect);
+        let r = self.shared.mem.write().unwrap().virtual_alloc(addr, size, alloc_type, protect);
         self.invalidate_tlb();
         r
     }
@@ -1607,7 +1618,7 @@ impl CpuEngine for JitCpu {
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
         let inv_span = self.code_inv_span_for_free(addr, size, free_type);
         self.invalidate_tlb();
-        let r = self.shared.mem.lock().unwrap().virtual_free(addr, size, free_type);
+        let r = self.shared.mem.write().unwrap().virtual_free(addr, size, free_type);
         if r.is_ok()
             && let Some((a, n)) = inv_span
         {
@@ -1622,7 +1633,7 @@ impl CpuEngine for JitCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        let r = self.shared.mem.lock().unwrap().virtual_protect(addr, size, new_protect);
+        let r = self.shared.mem.write().unwrap().virtual_protect(addr, size, new_protect);
         if r.is_ok() && !protect::allows_execute(new_protect) {
             self.invalidate_code_range(addr, size);
         }
@@ -1631,7 +1642,7 @@ impl CpuEngine for JitCpu {
     }
 
     fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
-        self.shared.mem.lock().unwrap().virtual_query(addr)
+        self.shared.mem.read().unwrap().virtual_query(addr)
     }
 
     fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
@@ -1648,7 +1659,7 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        let r = self.shared.mem.lock().unwrap().map_image(address, size, perms);
+        let r = self.shared.mem.write().unwrap().map_image(address, size, perms);
         self.invalidate_tlb();
         r
     }
@@ -1658,15 +1669,15 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_backend_name(&self) -> &'static str {
-        self.shared.mem.lock().unwrap().backend_name()
+        self.shared.mem.read().unwrap().backend_name()
     }
 
     fn register_region(&mut self, region: crate::mem::GuestRegion) {
-        self.shared.mem.lock().unwrap().register_region(region);
+        self.shared.mem.write().unwrap().register_region(region);
     }
 
     fn find_region(&self, va: u64) -> Option<crate::mem::GuestRegion> {
-        self.shared.mem.lock().unwrap().find_region(va).cloned()
+        self.shared.mem.read().unwrap().find_region(va).cloned()
     }
 
     fn install_runtime_hooks(
@@ -1700,7 +1711,7 @@ impl CpuEngine for JitCpu {
     }
 
     fn precompile_at(&mut self, address: u64) {
-        if self.shared.engine.lock().unwrap().is_none() {
+        if !self.shared.engine_ready.load(Ordering::Relaxed) {
             return;
         }
         if let Some(hook) = self.thread.hooks.as_ref()
@@ -1752,7 +1763,7 @@ impl CpuEngine for JitCpu {
             }
             // Hot chain: run consecutive Ready blocks without re-entering step_one.
             let mut chain_result = None;
-            if self.shared.engine.lock().unwrap().is_some() {
+            if self.shared.engine_ready.load(Ordering::Relaxed) {
                 let meta = {
                     let cache = self.shared.cache.read().unwrap();
                     cache.get(&rip).and_then(|e| match e {
@@ -1844,7 +1855,7 @@ impl CpuEngine for JitCpu {
         self.thread.shadow_sp = 0;
         let rsp = self.thread.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
-        self.shared.mem.lock().unwrap()
+        self.shared.mem.read().unwrap()
             .read(rsp, &mut ret_bytes)
             .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
         let return_address = u64::from_le_bytes(ret_bytes);
@@ -2048,7 +2059,7 @@ mod tests {
         )
         .expect("alloc");
         let e = cpu
-            .shared.mem.lock().unwrap()
+            .shared.mem.write().unwrap()
             .page_tlb_entry(base >> 12)
             .expect("tlb");
         assert!(e.allow_r);
@@ -2062,7 +2073,7 @@ mod tests {
         )
         .expect("data");
         let e2 = cpu
-            .shared.mem.lock().unwrap()
+            .shared.mem.write().unwrap()
             .page_tlb_entry(data >> 12)
             .expect("data tlb");
         assert!(e2.allow_r && e2.allow_w);

@@ -527,6 +527,7 @@ fn wait_multiple_result(
 }
 
 /// Save active thread CPU into sync table.
+#[allow(dead_code)] // per-thread engines: primary regs never leave the engine
 pub(crate) fn save_thread(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,

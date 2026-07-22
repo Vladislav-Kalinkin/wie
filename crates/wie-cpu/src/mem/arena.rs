@@ -28,8 +28,13 @@ pub(super) struct MmapArena {
 }
 
 // SAFETY: arenas are only accessed through exclusive/shared borrows on the
-// owning backend; not shared across threads.
+// owning backend; not shared across threads.  `host` pointer is immutable
+// after construction (never written through mutable references from multiple
+// threads); mmap'd memory supports concurrent access.
 unsafe impl Send for MmapArena {}
+// SAFETY: shared (&) access never mutates the `host` pointer or arena bounds;
+// the mmap backing is safe for concurrent reads and non-overlapping writes.
+unsafe impl Sync for MmapArena {}
 
 impl Drop for MmapArena {
     fn drop(&mut self) {
@@ -270,6 +275,26 @@ impl ArenaSet {
     /// Guest base of the arena containing `va`, if any.
     pub(super) fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
         Some(self.find_va(va)?.guest_base())
+    }
+
+    /// Host pointer for writing at guest `address` (lock-free data-plane path).
+    ///
+    /// Returns `None` when the VA is unmapped or the arena host pointer is null.
+    /// Caller must validate `address + len` fits within one page before using
+    /// this pointer for a multi-byte write (pages within one arena are contiguous,
+    /// but cross-page writes need multiple resolves).
+    #[inline]
+    pub(super) fn write_ptr(&self, address: u64) -> Option<*mut u8> {
+        let arena = self.find_va(address)?;
+        if arena.host().is_null() {
+            return None;
+        }
+        let off = address.saturating_sub(arena.guest_base());
+        let off_usize = usize::try_from(off).ok()?;
+        if off_usize >= arena.size() {
+            return None;
+        }
+        Some(unsafe { arena.host().add(off_usize) })
     }
 
     /// Read `bytes.len()` from guest `address` into `bytes` (may span arenas page-wise).

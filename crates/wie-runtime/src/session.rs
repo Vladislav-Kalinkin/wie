@@ -1640,11 +1640,9 @@ impl RuntimeSession {
                                         continue 'outer;
                                     }
                                     Some(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
-                                        crate::mt_runtime::save_thread(
-                                            engine,
-                                            winapi_state,
-                                            primary_tid,
-                                        );
+                                        // Per-thread engine: primary regs are already in `engine`;
+                                        // only persist thread bookkeeping for TLS tracking.
+                                        winapi_state.threads.save_active();
                                         quantum = Quantum::Park(*reason);
                                     }
                                     Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
@@ -1699,9 +1697,9 @@ impl RuntimeSession {
                                 .process
                                 .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
                             q.park_brief();
-                            // Retry Enter: restore primary regs; RIP still at API.
-                            self.process.with_mut(|eng, st| {
-                                crate::mt_runtime::load_thread(eng, st, primary_tid);
+                            // Retry Enter: per-thread engine keeps primary regs; only restore TLS.
+                            self.process.with_mut(|_eng, st| {
+                                st.threads.activate(primary_tid);
                             });
                             // Do not charge API index again — undo increment.
                             self.next_api_index = self.next_api_index.saturating_sub(1);
@@ -1717,10 +1715,9 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                crate::mt_runtime::load_thread(eng, st, primary_tid);
+                                st.threads.activate(primary_tid);
                                 eng.return_from_win64_api(u64::from(result))
                                     .expect("return_from_win64_api: guest stack corrupted");
-                                crate::mt_runtime::save_thread(eng, st, primary_tid);
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
@@ -1745,10 +1742,9 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                crate::mt_runtime::load_thread(eng, st, primary_tid);
+                                st.threads.activate(primary_tid);
                                 eng.return_from_win64_api(u64::from(result))
                                     .expect("return_from_win64_api: guest stack corrupted");
-                                crate::mt_runtime::save_thread(eng, st, primary_tid);
                             });
                             charged_api = charged_api.saturating_add(1);
                         }

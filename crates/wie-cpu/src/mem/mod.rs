@@ -8,7 +8,10 @@
 //! - [`PageMap`] / [`protect`] — Windows page state + software permission checks
 //! - [`GuestMemory`] — facade used by iced/JIT (SPC on read/write/fetch)
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use crate::CpuError;
 
 mod arena;
 mod backend;
@@ -117,9 +120,9 @@ pub(crate) struct GuestMemory {
     /// Phase 4.x: drained by `JitCpu` at safe points. Must **not** be a single
     /// bounding-box range — CRT/stack+heap stores would span gigabytes of
     /// empty pages and hang in `code_pages_overlap`.
-    pending_write_pages: Vec<u64>,
+    pending_write_pages: Mutex<Vec<u64>>,
     /// Set when too many distinct pages were written; drain does a full code flush.
-    pending_write_overflow: bool,
+    pending_write_overflow: AtomicBool,
 }
 
 impl Default for GuestMemory {
@@ -150,8 +153,8 @@ impl GuestMemory {
             pages: PageMap::new(),
             vad: VadTable::new(),
             generation: AtomicU64::new(0),
-            pending_write_pages: Vec::new(),
-            pending_write_overflow: false,
+            pending_write_pages: Mutex::new(Vec::new()),
+            pending_write_overflow: AtomicBool::new(false),
         }
     }
 
@@ -1154,11 +1157,36 @@ impl GuestMemory {
     }
 
     /// Write `bytes` at guest `address` after SPC (write permission).
-    pub(crate) fn write(&mut self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
+    ///
+    /// Uses pointer-based write to mmap arena data plane — no backend mutation,
+    /// so this method takes `&self` and is safe for concurrent caller threads.
+    pub(crate) fn write(&self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
         self.pages
             .check_access(address, bytes.len(), protect::AccessKind::Write)?;
-        self.backend.write(address, bytes)?;
-        // Record for Phase 4.x selective JIT invalidation (drained by JitCpu).
+        // Lock-free pointer-based write: each page is resolved separately
+        // since cross-page spans may cross arena boundaries.
+        let mut offset = 0_usize;
+        let mut va = address;
+        while offset < bytes.len() {
+            let page_off = usize::try_from(va & (PAGE_SIZE - 1))
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
+            let src = bytes
+                .get(offset..)
+                .ok_or_else(|| CpuError::Message("write slice OOB".into()))?;
+            let room_in_page = PAGE_SIZE_USIZE.saturating_sub(page_off);
+            let chunk = room_in_page.min(src.len());
+            let dst = self
+                .backend
+                .write_ptr(va)
+                .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
+            // SAFETY: write_ptr returned host pointer for mapped VA; SPC passed.
+            #[expect(unsafe_code)]
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk);
+            }
+            offset = offset.saturating_add(chunk);
+            va = va.saturating_add(u64::try_from(chunk).unwrap_or(0));
+        }
         self.note_code_write(address, bytes.len());
         Ok(())
     }
@@ -1168,29 +1196,29 @@ impl GuestMemory {
 
     /// Record pages touched by a successful guest store for Phase 4.x code inv.
     #[inline]
-    pub(crate) fn note_code_write(&mut self, address: u64, len: usize) {
-        if len == 0 || self.pending_write_overflow {
+    pub(crate) fn note_code_write(&self, address: u64, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if len == 0 || self.pending_write_overflow.load(Relaxed) {
             return;
         }
         let len_u = u64::try_from(len).unwrap_or(u64::MAX);
         let end = address.saturating_add(len_u);
         if end <= address && len > 0 {
-            // Wrap / enormous: force full flush on drain.
-            self.pending_write_overflow = true;
-            self.pending_write_pages.clear();
+            self.pending_write_overflow.store(true, Relaxed);
+            self.pending_write_pages.lock().unwrap().clear();
             return;
         }
+        let mut guard = self.pending_write_pages.lock().unwrap();
         let mut page = address >> backend::PAGE_SHIFT;
         let last = end.saturating_sub(1) >> backend::PAGE_SHIFT;
         while page <= last {
-            if self.pending_write_pages.len() >= Self::PENDING_WRITE_PAGE_CAP {
-                self.pending_write_overflow = true;
-                self.pending_write_pages.clear();
+            if guard.len() >= Self::PENDING_WRITE_PAGE_CAP {
+                self.pending_write_overflow.store(true, Relaxed);
+                guard.clear();
                 return;
             }
-            // Dedup last page (common sequential stores); full unique set not required.
-            if self.pending_write_pages.last().copied() != Some(page) {
-                self.pending_write_pages.push(page);
+            if guard.last().copied() != Some(page) {
+                guard.push(page);
             }
             page = page.saturating_add(1);
         }
@@ -1198,10 +1226,10 @@ impl GuestMemory {
 
     /// Take pending store pages. `overflow == true` → caller should full-flush code.
     #[inline]
-    pub(crate) fn take_pending_code_writes(&mut self) -> (Vec<u64>, bool) {
-        let overflow = self.pending_write_overflow;
-        self.pending_write_overflow = false;
-        let pages = std::mem::take(&mut self.pending_write_pages);
+    pub(crate) fn take_pending_code_writes(&self) -> (Vec<u64>, bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let overflow = self.pending_write_overflow.swap(false, Relaxed);
+        let pages = std::mem::take(&mut *self.pending_write_pages.lock().unwrap());
         (pages, overflow)
     }
 

@@ -60,7 +60,7 @@ static ICED_TRACE_ENABLED: LazyLock<bool> =
 /// `WIE_EXEC_TRACE=1 7za …` to discover which instructions keep code in the
 /// interpreter rather than the JIT.
 pub(crate) fn step(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     hook: Option<&HookWindow>,
 ) -> Result<StepResult, CpuError> {
@@ -176,7 +176,7 @@ impl HookWindow {
 }
 
 fn execute_one(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     next_ip: u64,
@@ -565,7 +565,7 @@ fn cond_from_setcc(m: Mnemonic, regs: &RegFile) -> bool {
 }
 
 fn exec_mov(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -575,7 +575,7 @@ fn exec_mov(
 }
 
 fn exec_movzx(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     sign: bool,
@@ -606,7 +606,7 @@ fn exec_lea(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError
 }
 
 fn exec_push(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -620,7 +620,7 @@ fn exec_push(
 }
 
 fn exec_pop(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -633,7 +633,7 @@ fn exec_pop(
 }
 
 fn exec_arith(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: ArithOp,
@@ -699,7 +699,7 @@ fn exec_arith(
 }
 
 fn exec_imul(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -741,7 +741,7 @@ fn exec_imul(
 }
 
 fn exec_mul(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -851,7 +851,7 @@ fn sign_extend(value: u64, size: usize) -> i64 {
 }
 
 fn exec_div(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     signed: bool,
@@ -977,7 +977,7 @@ fn exec_div(
 }
 
 fn exec_cmov(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     taken: bool,
@@ -990,7 +990,7 @@ fn exec_cmov(
 }
 
 fn exec_setcc(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     taken: bool,
@@ -1017,7 +1017,7 @@ fn exec_bswap(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecErr
 }
 
 fn exec_bit(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: BitOp,
@@ -1095,7 +1095,7 @@ fn is_sse_movsd(instr: &Instruction) -> bool {
 }
 
 fn exec_sse_mov(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     nbytes: usize,
@@ -1114,7 +1114,7 @@ enum SseBitOp {
 }
 
 fn exec_sse_bitwise(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: SseBitOp,
@@ -1157,7 +1157,7 @@ fn fp64(op: FpOp, a: f64, b: f64) -> f64 {
 }
 
 fn exec_sse_scalar_fp(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: FpOp,
@@ -1181,7 +1181,7 @@ fn exec_sse_scalar_fp(
 }
 
 fn exec_sse_packed_fp(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: FpOp,
@@ -1209,7 +1209,7 @@ fn exec_sse_packed_fp(
 }
 
 fn exec_sse_movq(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -1223,7 +1223,7 @@ fn exec_sse_movq(
 }
 
 fn exec_sse_movd(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -1252,7 +1252,7 @@ fn exec_sse_movd(
 }
 
 fn read_sse_op(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: u32,
@@ -1300,7 +1300,7 @@ fn read_sse_op(
 }
 
 fn write_sse_op(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: u32,
@@ -1401,7 +1401,7 @@ pub(crate) enum StringOpKind {
 ///
 /// `rep` covers REP/REPE/REPNE presence; `repe`/`repne` select ZF early-exit for SCAS/CMPS.
 pub(crate) fn run_string_op(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     kind: StringOpKind,
     size: usize,
@@ -1475,7 +1475,7 @@ unsafe fn host_fill_pattern(host: *mut u8, len: usize, val: u64, size: usize) {
 }
 
 fn exec_stos(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     size: usize,
@@ -1486,7 +1486,7 @@ fn exec_stos(
 }
 
 fn string_stos(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     size: usize,
     rep: bool,
@@ -1586,7 +1586,7 @@ fn fill_pattern(buf: &mut [u8], val: u64, size: usize) {
 }
 
 fn exec_movs(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     size: usize,
@@ -1597,7 +1597,7 @@ fn exec_movs(
 }
 
 fn string_movs(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     size: usize,
     rep: bool,
@@ -1736,7 +1736,7 @@ fn ranges_overlap(a: u64, b: u64, len: u64) -> bool {
 }
 
 fn exec_lods(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     size: usize,
@@ -1747,7 +1747,7 @@ fn exec_lods(
 }
 
 fn string_lods(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     size: usize,
     rep: bool,
@@ -1785,7 +1785,7 @@ fn string_lods(
 }
 
 fn exec_scas(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     size: usize,
@@ -1803,7 +1803,7 @@ fn exec_scas(
 }
 
 fn string_scas(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     size: usize,
     rep: bool,
@@ -1845,7 +1845,7 @@ fn string_scas(
 }
 
 fn exec_cmps(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     size: usize,
@@ -1863,7 +1863,7 @@ fn exec_cmps(
 }
 
 fn string_cmps(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     size: usize,
     rep: bool,
@@ -1910,7 +1910,7 @@ fn string_cmps(
 }
 
 fn exec_test(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -1923,7 +1923,7 @@ fn exec_test(
 }
 
 fn exec_inc_dec(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     inc: bool,
@@ -1948,7 +1948,7 @@ fn exec_inc_dec(
 }
 
 fn exec_neg(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -1963,7 +1963,7 @@ fn exec_neg(
 }
 
 fn exec_not(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -1975,7 +1975,7 @@ fn exec_not(
 }
 
 fn exec_shift(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     kind: ShiftKind,
@@ -2058,7 +2058,7 @@ fn exec_shift(
 }
 
 fn exec_jmp(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -2074,7 +2074,7 @@ fn exec_jcc(regs: &mut RegFile, instr: &Instruction, taken: bool) {
 }
 
 fn exec_call(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     return_ip: u64,
@@ -2088,7 +2088,7 @@ fn exec_call(
 }
 
 fn exec_ret(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -2103,7 +2103,7 @@ fn exec_ret(
 }
 
 fn exec_xchg(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -2118,7 +2118,7 @@ fn exec_xchg(
 ///
 /// Flags follow a CMP of ACC vs dest (same width). `LOCK` is ignored (single-threaded guest).
 fn exec_cmpxchg(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
@@ -2205,7 +2205,7 @@ pub fn reset_iced_counters() {
 }
 
 fn branch_target(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<u64, StepExecError> {
@@ -2222,7 +2222,7 @@ fn branch_target(
 }
 
 fn push_n(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     value: u64,
     size: usize,
@@ -2233,19 +2233,19 @@ fn push_n(
     Ok(())
 }
 
-fn pop_n(mem: &mut GuestMemory, regs: &mut RegFile, size: usize) -> Result<u64, StepExecError> {
+fn pop_n(mem: &GuestMemory, regs: &mut RegFile, size: usize) -> Result<u64, StepExecError> {
     let rsp = regs.rsp();
     let val = read_mem_value(mem, rsp, size)?;
     regs.set_rsp(rsp.wrapping_add(u64::try_from(size).unwrap_or(8)));
     Ok(val)
 }
 
-fn pop64(mem: &mut GuestMemory, regs: &mut RegFile) -> Result<u64, StepExecError> {
+fn pop64(mem: &GuestMemory, regs: &mut RegFile) -> Result<u64, StepExecError> {
     pop_n(mem, regs, 8)
 }
 
 fn read_op(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: u32,
@@ -2273,7 +2273,7 @@ fn read_op(
 }
 
 fn write_op(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: u32,
@@ -2284,7 +2284,7 @@ fn write_op(
 }
 
 fn write_op_sized(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
     op: u32,
@@ -2401,7 +2401,7 @@ fn read_mem_value(mem: &GuestMemory, addr: u64, size: usize) -> Result<u64, Step
 }
 
 fn write_mem_value(
-    mem: &mut GuestMemory,
+    mem: &GuestMemory,
     addr: u64,
     value: u64,
     size: usize,
