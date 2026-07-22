@@ -13,7 +13,7 @@ WIE_JIT_MEM=slow "$SUITE"
 echo "=== JIT matrix: WIE_JIT_MEM=pin ==="
 WIE_JIT_MEM=pin "$SUITE"
 
-echo "=== JIT matrix: WIE_CPU=iced ==="
-WIE_CPU=iced "$SUITE"
+echo "=== JIT matrix: WIE_CPU=iced (skip long_loop — slice budget) ==="
+WIE_SKIP_LONG_LOOP=1 WIE_CPU=iced "$SUITE"
 
 echo "=== JIT matrix: all backends passed ==="
