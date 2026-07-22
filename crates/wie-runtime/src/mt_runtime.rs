@@ -192,6 +192,8 @@ fn worker_main(
         let park_reason: Option<HostParkReason>;
         {
             let mut st = lock(&shared_winapi);
+            st.threads.activate(tid);
+
             if st.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
