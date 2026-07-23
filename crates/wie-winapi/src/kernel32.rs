@@ -6432,17 +6432,20 @@ fn handle_create_event(
     })
 }
 
-/// `DuplicateHandle` — duplicate a kernel handle (often a pseudohandle
-/// like `GetCurrentProcess()` or `GetCurrentThread()`) into a real handle
-/// usable by another process or for access modification.
+/// `DuplicateHandle` — duplicate a kernel handle.
+///
+/// Pseudohandles (`GetCurrentProcess`, `GetCurrentThread`) are resolved to
+/// real kernel object handles.  Unknown handles are rejected with
+/// `ERROR_INVALID_HANDLE`.  `DUPLICATE_CLOSE_SOURCE` closes the source after
+/// duplication.
 fn handle_duplicate_handle(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    // RCX = hSourceProcessHandle (GetCurrentProcess pseudo-handle or real)
-    // RDX = hSourceHandle      (handle to duplicate)
+    // RCX = hSourceProcessHandle
+    // RDX = hSourceHandle
     // R8  = hTargetProcessHandle
-    // R9  = lpTargetHandle     (guest pointer to receive the duplicated handle)
+    // R9  = lpTargetHandle (guest pointer for the duplicated handle)
     // [RSP+0x28] = dwDesiredAccess
     // [RSP+0x30] = bInheritHandle
     // [RSP+0x38] = dwOptions
@@ -6451,34 +6454,77 @@ fn handle_duplicate_handle(
     let _target_proc = engine.read_r8()?;
     let target_handle_ptr = engine.read_r9()?;
 
-    // Map pseudohandles to their kernel objects. Windows uses:
-    //   (HANDLE)-1 = GetCurrentProcess
-    //   (HANDLE)-2 = GetCurrentThread
-    let source_obj = if source_handle == u64::MAX {
-        // Current process pseudohandle: there is no explicit kernel object.
-        // The target pseudo-handle is just the raw value — accept it.
-        None
-    } else if source_handle == u64::MAX - 1 {
-        // Current thread pseudohandle: similarly, just pass it through.
-        None
+    // Read dwOptions from the guest stack to honour DUPLICATE_CLOSE_SOURCE.
+    let rsp = engine.read_rsp()?;
+    let mut opt_bytes = [0_u8; 4];
+    let close_source = if engine.mem_read(rsp.wrapping_add(0x38), &mut opt_bytes).is_ok() {
+        let opts = u32::from_le_bytes(opt_bytes);
+        (opts & 0x1) != 0 // DUPLICATE_CLOSE_SOURCE = 0x1
     } else {
-        // Real kernel handle: look up the object.
+        false
+    };
+
+    // Resolve pseudohandles to real kernel objects.
+    // Windows: (HANDLE)-1 = GetCurrentProcess, (HANDLE)-2 = GetCurrentThread.
+    let source_obj = if source_handle == u64::MAX {
+        // Current process pseudohandle: create a placeholder entry.
+        // WIE doesn't model process kernel objects — map to the primary
+        // thread so CloseHandle has something to remove.
+        state
+            .sync
+            .objects
+            .values()
+            .find_map(|obj| match obj {
+                crate::KernelObject::Thread(t)
+                    if t.tid == crate::PRIMARY_THREAD_ID =>
+                {
+                    Some(obj.clone())
+                }
+                _ => None,
+            })
+    } else if source_handle == u64::MAX - 1 {
+        // Current thread pseudohandle: find or create the active thread object.
+        let cur_tid = state.threads.current_tid();
+        state
+            .sync
+            .objects
+            .values()
+            .find_map(|obj| match obj {
+                crate::KernelObject::Thread(t) if t.tid == cur_tid => Some(obj.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                // Primary thread or late-discovered thread: create the object
+                // now so DuplicateHandle can return a real handle.
+                let (_, th_obj) = state
+                    .sync
+                    .register_thread(cur_tid, Default::default());
+                Some(crate::KernelObject::Thread(th_obj))
+            })
+    } else {
+        // Real kernel handle: lookup.
         state.sync.objects.get(&source_handle).cloned()
     };
 
-    let new_handle = if let Some(obj) = source_obj {
-        // Real kernel object: register a duplicate handle.
-        let handle = state.sync.next_handle;
-        state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
-        state.sync.objects.insert(handle, obj);
-        handle
-    } else {
-        // Pseudohandle: pass the same pseudohandle value through.
-        // C++ CRT startup duplicates GetCurrentProcess/Thread this way.
-        source_handle
+    let Some(obj) = source_obj else {
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?; // FALSE
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
     };
 
-    // Write the duplicated handle into guest memory.
+    // Duplicate the object under a new handle.
+    let new_handle = state.sync.next_handle;
+    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+    state.sync.objects.insert(new_handle, obj);
+
+    // Honour DUPLICATE_CLOSE_SOURCE: close the source handle after duplication.
+    if close_source && source_handle != u64::MAX && source_handle != u64::MAX - 1 {
+        state.sync.objects.remove(&source_handle);
+    }
+
     engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
     state.last_error = 0;
     let return_address = engine.return_from_win64_api(1)?; // TRUE
@@ -6489,11 +6535,29 @@ fn handle_duplicate_handle(
 }
 
 /// `GetThreadPriority` → THREAD_PRIORITY_NORMAL (0).
+///
+/// No priority model — all guest threads run at the same host priority.
+/// Validates the handle: returns `THREAD_PRIORITY_ERROR_RETURN` with
+/// `ERROR_INVALID_HANDLE` for garbage values.
 fn handle_get_thread_priority(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    // RCX = hThread — ignored; single-threaded emulation.
+    let h_thread = engine.read_rcx()?;
+
+    // Pseudohandle CURRENT_THREAD (-2), or a real kernel handle.
+    let valid = h_thread == u64::MAX - 1 || state.sync.objects.contains_key(&h_thread);
+
+    if !valid {
+        state.last_error = ERROR_INVALID_HANDLE;
+        // THREAD_PRIORITY_ERROR_RETURN = MAXLONG (0x7FFFFFFF)
+        let return_address = engine.return_from_win64_api(0x7FFF_FFFF)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0x7FFF_FFFF,
+        });
+    }
+
     let return_address = engine.return_from_win64_api(0)?; // THREAD_PRIORITY_NORMAL
     Ok(WinApiHandlerResult {
         return_address,
