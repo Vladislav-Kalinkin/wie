@@ -439,30 +439,15 @@ pub fn virtual_unwind(
     rsp = rsp.saturating_add(8);
     ctx.rsp = rsp;
 
-    // Extract handler info if present.  Both EHANDLER and UHANDLER frames
-    // have handler data — UHANDLER is used for cleanup/termination functions
-    // (destructors without a catch).
-    let handler_flags = UnwindInfo::FLAG_EHANDLER | UnwindInfo::FLAG_UHANDLER;
-    let (handler_rva, handler_data) = if info.flags & handler_flags != 0 {
-        let data_off = unwind_va.saturating_add(info.header_size() as u64);
-        let mut h_buf = [0_u8; 8];
-        read_mem(data_off, &mut h_buf)?;
-        let hrva = u32::from_le_bytes([h_buf[0], h_buf[1], h_buf[2], h_buf[3]]);
-        let hdata = u32::from_le_bytes([h_buf[4], h_buf[5], h_buf[6], h_buf[7]]);
-        (Some(hrva), Some(hdata))
-    } else {
-        (None, None)
-    };
+    // Data after the padded codes: for CHAININFO it's a chain pointer (4 bytes);
+    // for EHANDLER/UHANDLER it's handler_rva (4 bytes) + handler_data (4 bytes).
+    let data_off = unwind_va.saturating_add(info.header_size() as u64);
 
-    // FLAG_CHAININFO: the unwind info is followed by another UNWIND_INFO
-    // for the parent function.  Follow the chain recursively.
     if info.flags & UnwindInfo::FLAG_CHAININFO != 0 {
-        let chain_rva = u32::from_le_bytes([
-            codes_buf.get(codes_size).copied().unwrap_or(0),
-            codes_buf.get(codes_size + 1).copied().unwrap_or(0),
-            codes_buf.get(codes_size + 2).copied().unwrap_or(0),
-            codes_buf.get(codes_size + 3).copied().unwrap_or(0),
-        ]);
+        // Chain info: 4-byte RVA pointing to another UNWIND_INFO.
+        let mut chain_buf = [0_u8; 4];
+        read_mem(data_off, &mut chain_buf)?;
+        let chain_rva = u32::from_le_bytes(chain_buf);
         if chain_rva != 0 {
             let chain_entry = RuntimeFunction {
                 begin_address: entry.begin_address,
@@ -472,15 +457,30 @@ pub fn virtual_unwind(
             let chained = virtual_unwind(read_mem, image_base, &chain_entry, UnwindContext {
                 rip: ctx.rip, rsp, ..ctx
             })?;
+            // Chain entry may also have EHANDLER/UHANDLER flags;
+            // prefer its handler data over any data we'd read here.
             return Ok(UnwindResult {
                 ctx: chained.ctx,
-                handler_rva: handler_rva.or(chained.handler_rva),
-                handler_data: handler_data.or(chained.handler_data),
+                handler_rva: chained.handler_rva,
+                handler_data: chained.handler_data,
             });
         }
+        // Chain RVA is 0 — no chain, fall through to handler check.
     }
 
-    Ok(UnwindResult { ctx, handler_rva, handler_data })
+    // Extract handler info if present (only when CHAININFO is NOT set,
+    // otherwise the data at data_off would be interpreted as chain, not
+    // as handler info).
+    let handler_flags = UnwindInfo::FLAG_EHANDLER | UnwindInfo::FLAG_UHANDLER;
+    if info.flags & handler_flags != 0 {
+        let mut h_buf = [0_u8; 8];
+        read_mem(data_off, &mut h_buf)?;
+        let hrva = u32::from_le_bytes([h_buf[0], h_buf[1], h_buf[2], h_buf[3]]);
+        let hdata = u32::from_le_bytes([h_buf[4], h_buf[5], h_buf[6], h_buf[7]]);
+        Ok(UnwindResult { ctx, handler_rva: Some(hrva), handler_data: Some(hdata) })
+    } else {
+        Ok(UnwindResult { ctx, handler_rva: None, handler_data: None })
+    }
 }
 
 /// Unwind a leaf function (no unwind info).  Simply pops the return address.

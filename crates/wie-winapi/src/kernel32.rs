@@ -6673,7 +6673,7 @@ pub(crate) fn handle_raise_exception(
         dcbuf[0x28..0x30].copy_from_slice(&ctx_ptr.to_le_bytes());
         // +0x30: LanguageHandler
         dcbuf[0x30..0x38].copy_from_slice(&handler_va.to_le_bytes());
-        // +0x38: HandlerData = LSDA pointer
+        // +0x38: HandlerData = guest VA of the LSDA (.gcc_except_table entry).
         let hdata_va = image_base.saturating_add(u64::from(handler_data));
         dcbuf[0x38..0x40].copy_from_slice(&hdata_va.to_le_bytes());
         engine.mem_write(disp_ctx_ptr, &dcbuf)
@@ -6711,12 +6711,6 @@ pub(crate) fn handle_raise_exception(
     let table_count = state.sync.function_tables.len();
     let total_entries: usize = state.sync.function_tables.values().map(|v| v.len()).sum();
     tracing::info!(tables = table_count, entries = total_entries, throw_rip = format_args!("{:#x}", throw_rip), "RaiseException dispatch");
-    // Log the .pdata range for diagnostic.
-    for (&base, entries) in &state.sync.function_tables {
-        if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
-            tracing::info!(image_base = format_args!("{:#x}", base), first = format_args!("{:#x}", first.begin_address), last_end = format_args!("{:#x}", last.end_address), "function table range");
-        }
-    }
 
     let mut handler_found: Option<(u64, u32, u64, crate::exception::RuntimeFunction, crate::exception::UnwindContext)> = None;
 
@@ -6750,7 +6744,10 @@ pub(crate) fn handle_raise_exception(
         );
         if let (Some(handler_rva), Some(handler_data)) = (result.handler_rva, result.handler_data) {
             let handler_va = entry.image_base.saturating_add(u64::from(handler_rva));
-            match call_personality(handler_va, &ctx, 0, handler_data, entry.image_base, entry.entry) {
+            tracing::info!(frame = _frame, handler_va = format_args!("{:#x}", handler_va), handler_data = format_args!("{:#x}", handler_data), "calling personality");
+            let disp = call_personality(handler_va, &ctx, 0, handler_data, entry.image_base, entry.entry);
+            tracing::info!(frame = _frame, disposition = ?disp, "personality search result");
+            match disp {
                 Ok(URC_HANDLER_FOUND) => {
                     handler_found = Some((handler_va, handler_data, entry.image_base, *entry.entry, ctx));
                     break;
@@ -6783,9 +6780,10 @@ pub(crate) fn handle_raise_exception(
         tracing::info!(pass = 2, frame = _frame, rip = format_args!("{:#x}", ctx2.rip), "unwind step");
         if ctx2.rip == catch_ctx.rip {
             // At the catching frame — call personality with unwind + handler flags.
-            // EXCEPTION_UNWINDING (1) | EXCEPTION_EXECUTE_HANDLER (2) = 3
-            // Without EXCEPTION_EXECUTE_HANDLER the personality won't install the landing pad.
-            let disposition = call_personality(handler_va, &catch_ctx, 3, handler_data, image_base, &func_entry);
+            // EXCEPTION_UNWINDING (0x1) | EXCEPTION_EXECUTE_HANDLER (0x4) = 5
+            // EXECUTE_HANDLER is bit 2 (not bit 1).  Without it the personality
+            // won't install the landing pad.
+            let disposition = call_personality(handler_va, &catch_ctx, 5, handler_data, image_base, &func_entry);
             tracing::info!(pass = 2, disposition = ?disposition, "personality returned at handler frame");
             match disposition {
                 Ok(URC_INSTALL_CONTEXT) | Ok(URC_HANDLER_FOUND) => {
@@ -6795,11 +6793,23 @@ pub(crate) fn handle_raise_exception(
                     // DispatcherContext at stack_frame+0x240.
                     let rsp_after_return = engine.read_rsp()?;
                     let ctx_ptr = rsp_after_return + 0x100;
+                    let disp_ctx_ptr = rsp_after_return + 0x240;
+                    // The personality communicates the landing pad through
+                    // either DispatcherContext.TargetIp (+0x20) or
+                    // CONTEXT.Rip (offset 0xF8) depending on implementation.
                     let mut cbuf = [0u8; 256];
                     engine.mem_read(ctx_ptr, &mut cbuf)?;
-                    // The personality writes the landing pad address into
-                    // CONTEXT.Rip (offset 0xF8) and CONTEXT.Rsp (offset 0x98).
-                    let catch_rip = u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap_or([0; 8]));
+                    let mut tbuf = [0u8; 8];
+                    let catch_rip = if engine.mem_read(disp_ctx_ptr + 0x20, &mut tbuf).is_ok() {
+                        let ip = u64::from_le_bytes(tbuf);
+                        if ip != 0 { ip } else {
+                            u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap_or([0; 8]))
+                        }
+                    } else {
+                        u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap_or([0; 8]))
+                    };
+                    // Context.Rsp was modified by the personality to the
+                    // landing pad's RSP.  Read it from CONTEXT (offset 0x98).
                     let catch_rsp = u64::from_le_bytes(cbuf[0x98..0xA0].try_into().unwrap_or([0; 8]));
                     tracing::info!(catch_rip = format_args!("{:#x}", catch_rip), catch_rsp = format_args!("{:#x}", catch_rsp), "installing catch context");
                     if catch_rip == 0 { anyhow::bail!("personality returned null catch RIP"); }
