@@ -26,21 +26,41 @@ type MemRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), ()> + 'a;
 
 const MAX_FRAMES: usize = 64;
 
-/// Optional C++ throw payload attached to a dispatch (MSVC `_CxxThrowException`).
+/// Optional C++ throw payload attached to a dispatch.
+///
+/// - **MSVC** (`_CxxThrowException`): `exception_object` + `throw_info` (ThrowInfo VA).
+/// - **GCC/Mingw** (`_Unwind_RaiseException` / `RaiseException(0x20474343)`):
+///   `exception_object` is the `_Unwind_Exception*` (ExceptionInformation[0]);
+///   `gcc_throw` is set; typeinfo is read from the `__cxa_exception` header.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThrowPayload {
     pub exception_object: u64,
     pub throw_info: u64,
+    /// GCC/libstdc++ SEH exception (`ExceptionCode == 0x2047_4343`).
+    pub gcc_throw: bool,
 }
+
+/// GCC `RaiseException` code: `' GCC'` (`0x20474343`).
+pub const GCC_EXCEPTION_CODE: u32 = 0x2047_4343;
+/// MSVC C++ exception code: `'msc' | 0xE000_0000`.
+pub const MSVC_EXCEPTION_CODE: u32 = 0xE06D_7363;
+
+/// Offset from `_Unwind_Exception*` back to the `__cxa_exception.exceptionType`
+/// pointer as laid out by current libstdc++ (object at header+0x40, type at object-0x90
+/// → type at header−0x50). Clean-room from public layout / binary observation.
+const GCC_TYPEINFO_FROM_UNWIND_HDR: u64 = 0x50;
+/// `adjustedPtr` sits immediately before `_Unwind_Exception` (see `__cxa_begin_catch`
+/// reading `-8(%header)` on this mingw libstdc++).
+const GCC_ADJUSTED_PTR_FROM_UNWIND_HDR: u64 = 8;
+/// Thrown object storage is immediately after `_Unwind_Exception` (0x40 bytes) on
+/// this libstdc++ (`__cxa_throw` uses `lea -0x40(%object)` for the header).
+const GCC_OBJECT_FROM_UNWIND_HDR: u64 = 0x40;
 
 /// One step of the SEH continuation machine (guest-callable).
 #[derive(Debug, Clone)]
 pub enum SehStep {
     /// Call a guest UnwindMap action with `RDX = establisher`.
-    Action {
-        target: u64,
-        establisher: u64,
-    },
+    Action { target: u64, establisher: u64 },
     /// Call an MSVC catch funclet; on return, jump to RAX (continuation).
     MsvcCatch {
         handler: u64,
@@ -53,13 +73,16 @@ pub enum SehStep {
         image_base: u64,
         throw_info: u64,
     },
-    /// Direct transfer (Mingw landing pad).
+    /// Direct transfer (Mingw / Itanium landing pad).
     Jump {
         rip: u64,
         rsp: u64,
         gpr: [u64; 16],
         xmm: [u128; 16],
+        /// Exception pointer for RAX (`_Unwind_Exception*` or object).
         rax: Option<u64>,
+        /// Handler switch value for RDX (Itanium landing-pad selector).
+        rdx: Option<u64>,
     },
 }
 
@@ -70,6 +93,9 @@ pub struct SehPending {
     pub steps: Vec<SehStep>,
     /// After a catch funclet returns, treat RAX as continuation IP.
     pub expect_catch_return: bool,
+    /// After an Itanium cleanup landing pad, guest calls `_Unwind_Resume` /
+    /// `RtlUnwindEx` — continue with the next pending step.
+    pub expect_cleanup_resume: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -77,11 +103,125 @@ pub struct SehPending {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// `RaiseException` entry: throw site = return address of the API call.
+///
+/// Win64 ABI of `RaiseException` (kernel32):
+/// ```text
+/// RCX = dwExceptionCode
+/// RDX = dwExceptionFlags
+/// R8  = nNumberOfArguments
+/// R9  = lpArguments  (ULONG_PTR*)
+/// ```
+///
+/// Also accepts the internal/MSVC-style convention used by our
+/// `_CxxThrowException` stub: RCX = `EXCEPTION_RECORD*` with code at `*RCX`
+/// (high dword of code is never a canonical user VA, so we disambiguate).
 pub fn dispatch_exception(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    dispatch_exception_with_payload(engine, state, ThrowPayload::default())
+    let payload = read_raise_exception_payload(engine).unwrap_or_default();
+    dispatch_exception_with_payload(engine, state, payload)
+}
+
+/// Recover C++ throw payload from `RaiseException` register arguments.
+fn read_raise_exception_payload(engine: &mut dyn wie_cpu::CpuEngine) -> Result<ThrowPayload> {
+    let rcx = engine.read_rcx()?;
+    let r8 = engine.read_r8()?;
+    let r9 = engine.read_r9()?;
+
+    // Path A: standard WinAPI — RCX is the exception code (32-bit value).
+    if rcx == u64::from(GCC_EXCEPTION_CODE) {
+        let exc = read_arg_slot(engine, r9, 0).unwrap_or(0);
+        tracing::debug!(
+            exc = format_args!("{exc:#x}"),
+            n = r8,
+            "seh GCC RaiseException (WinAPI args)"
+        );
+        return Ok(ThrowPayload {
+            exception_object: exc,
+            throw_info: 0,
+            gcc_throw: true,
+        });
+    }
+    if rcx == u64::from(MSVC_EXCEPTION_CODE) {
+        // Guest CRT may call RaiseException(0xE06D7363, flags, 3, &info).
+        let obj = read_arg_slot(engine, r9, 1).unwrap_or(0);
+        let ti = read_arg_slot(engine, r9, 2).unwrap_or(0);
+        // Some layouts put magic in [0], object in [1], ThrowInfo in [2].
+        let (exception_object, throw_info) = if ti != 0 {
+            (obj, ti)
+        } else {
+            // Fallback: [0]=obj [1]=throwinfo
+            (
+                read_arg_slot(engine, r9, 0).unwrap_or(0),
+                read_arg_slot(engine, r9, 1).unwrap_or(0),
+            )
+        };
+        return Ok(ThrowPayload {
+            exception_object,
+            throw_info,
+            gcc_throw: false,
+        });
+    }
+
+    // Path B: RCX points at an EXCEPTION_RECORD (our `_CxxThrowException` stub
+    // and some internal paths). Codes live in the low 32 bits at *RCX.
+    if rcx >= 0x10000 {
+        let mut code_buf = [0u8; 4];
+        if engine.mem_read(rcx, &mut code_buf).is_ok() {
+            let code = u32::from_le_bytes(code_buf);
+            if code == GCC_EXCEPTION_CODE {
+                let mut info0 = [0u8; 8];
+                // ExceptionInformation[0] at +32
+                if engine.mem_read(rcx.saturating_add(32), &mut info0).is_ok() {
+                    let exc = u64::from_le_bytes(info0);
+                    return Ok(ThrowPayload {
+                        exception_object: exc,
+                        throw_info: 0,
+                        gcc_throw: true,
+                    });
+                }
+            }
+            if code == MSVC_EXCEPTION_CODE {
+                let mut info1 = [0u8; 8];
+                let mut info2 = [0u8; 8];
+                if engine.mem_read(rcx.saturating_add(40), &mut info1).is_ok()
+                    && engine.mem_read(rcx.saturating_add(48), &mut info2).is_ok()
+                {
+                    return Ok(ThrowPayload {
+                        exception_object: u64::from_le_bytes(info1),
+                        throw_info: u64::from_le_bytes(info2),
+                        gcc_throw: false,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(ThrowPayload::default())
+}
+
+fn read_arg_slot(engine: &mut dyn wie_cpu::CpuEngine, args_base: u64, index: u64) -> Option<u64> {
+    if args_base == 0 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    engine
+        .mem_read(args_base.saturating_add(index.saturating_mul(8)), &mut buf)
+        .ok()?;
+    Some(u64::from_le_bytes(buf))
+}
+
+/// Read `std::type_info*` from a GCC `__cxa_exception` given its `_Unwind_Exception*`.
+fn gcc_thrown_typeinfo_from_mem(read_mem: &mut MemRead<'_>, unwind_exception: u64) -> Option<u64> {
+    if unwind_exception == 0 {
+        return None;
+    }
+    let type_slot = unwind_exception.saturating_sub(GCC_TYPEINFO_FROM_UNWIND_HDR);
+    let mut buf = [0u8; 8];
+    read_mem(type_slot, &mut buf).ok()?;
+    let ti = u64::from_le_bytes(buf);
+    if ti == 0 { None } else { Some(ti) }
 }
 
 /// Dispatch with an optional C++ throw payload (MSVC path).
@@ -123,7 +263,10 @@ pub fn continue_pending(
                 "MSVC catch funclet returned invalid continuation RAX={cont:#x}"
             ));
         }
-        tracing::debug!(cont = format_args!("{cont:#x}"), "seh catch funclet continuation");
+        tracing::debug!(
+            cont = format_args!("{cont:#x}"),
+            "seh catch funclet continuation"
+        );
         // RSP after catch ret is already the frame RSP (funclet epilogue + ret).
         engine.write_rip(cont)?;
         if pending.steps.is_empty() {
@@ -137,18 +280,44 @@ pub fn continue_pending(
         return run_next_step(engine, state);
     }
 
+    if pending.expect_cleanup_resume {
+        pending.expect_cleanup_resume = false;
+        tracing::debug!(
+            remaining = pending.steps.len(),
+            "seh cleanup _Unwind_Resume → next step"
+        );
+        state.seh_pending = Some(pending);
+        return run_next_step(engine, state);
+    }
+
     state.seh_pending = Some(pending);
     run_next_step(engine, state)
 }
 
+/// True when a cleanup landing pad is in progress and `_Unwind_Resume`/`RtlUnwindEx`
+/// should drain the next [`SehPending`] step instead of a generic forced unwind.
+#[must_use]
+pub fn has_cleanup_resume(state: &WinApiState) -> bool {
+    state
+        .seh_pending
+        .as_ref()
+        .is_some_and(|p| p.expect_cleanup_resume && !p.steps.is_empty())
+}
+
 /// `RtlUnwindEx`-style forced unwind to `target_ip` (and optional target frame RSP).
+///
+/// When an Itanium cleanup pad left [`SehPending::expect_cleanup_resume`], drain
+/// the next planned step (usually the real catch) instead of a blind unwind.
 pub fn forced_unwind_to(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &WinApiState,
+    state: &mut WinApiState,
     target_ip: u64,
     target_frame_rsp: Option<u64>,
     return_value: u64,
 ) -> Result<WinApiHandlerResult> {
+    if has_cleanup_resume(state) {
+        return continue_pending(engine, state);
+    }
     if target_ip == 0 && target_frame_rsp.is_none() {
         let return_address = engine.return_from_win64_api(return_value)?;
         return Ok(WinApiHandlerResult {
@@ -210,6 +379,8 @@ struct HandlerFound {
     exception_object: Option<u64>,
     msvc: Option<MsvcCatch>,
     image_base: u64,
+    /// Itanium landing-pad switch value (RDX); `None` for MSVC funclets.
+    switch_value: Option<u64>,
 }
 
 fn search_and_plan(
@@ -223,6 +394,11 @@ fn search_and_plan(
     let mut read = |va: u64, buf: &mut [u8]| engine.mem_read(va, buf).map_err(|_e| ());
     let mut frame = new_ctx(throw_rip, throw_rsp, tctx);
     let mut action_steps: Vec<SehStep> = Vec::new();
+    let thrown_typeinfo = if payload.gcc_throw {
+        gcc_thrown_typeinfo_from_mem(&mut read, payload.exception_object)
+    } else {
+        None
+    };
 
     for i in 0..MAX_FRAMES {
         tracing::debug!(
@@ -233,13 +409,20 @@ fn search_and_plan(
         let (unwound, handler_data) = unwind_one(&mut read, state, &frame)?;
 
         if let Some(hdata) = handler_data
-            && let Some(resolved) =
-                resolve_landing_pad(&mut read, frame.rip, &unwound, hdata, payload)
+            && let Some(resolved) = resolve_landing_pad(
+                &mut read,
+                frame.rip,
+                &unwound,
+                hdata,
+                payload,
+                thrown_typeinfo,
+            )
         {
             tracing::debug!(
                 frame = i,
                 landing_pad = format_args!("{:#x}", resolved.landing_pad),
                 disp_catch_obj = resolved.msvc.as_ref().map_or(0, |m| m.disp_catch_obj),
+                switch = resolved.switch_value.unwrap_or(0),
                 "seh found landing pad"
             );
 
@@ -271,17 +454,21 @@ fn search_and_plan(
                 },
                 msvc: resolved.msvc,
                 image_base: unwound.image_base,
+                switch_value: resolved.switch_value,
             };
             return Ok((handler, action_steps));
         }
 
-        // Intermediate frame: collect UnwindMap actions before we would unwind past it.
+        // Intermediate frame: MSVC UnwindMap actions and/or Mingw cleanup pads.
         if let Some(hdata) = handler_data {
-            for &fi_va in &exception::language_data_candidates(
+            let candidates = exception::language_data_candidates(
                 unwound.image_base,
                 unwound.unwind_va,
                 hdata,
-            ) {
+                unwound.exception_data_va,
+            );
+            let mut saw_msvc = false;
+            for &fi_va in &candidates {
                 if let Some(info) = msvc_eh::parse_func_info(&mut read, fi_va) {
                     if let Some(st) =
                         msvc_eh::state_for_ip(&mut read, unwound.image_base, &info, frame.rip)
@@ -301,7 +488,35 @@ fn search_and_plan(
                             });
                         }
                     }
+                    saw_msvc = true;
                     break;
+                }
+            }
+            if !saw_msvc {
+                // Mingw intermediate cleanup landing pad (action_index == 0).
+                let func_start = unwound.entry.begin_va(unwound.image_base);
+                for &lsda_va in &candidates {
+                    if let Some(c) = exception::find_cleanup_landing_pad(
+                        &mut read,
+                        lsda_va,
+                        unwound.image_base,
+                        func_start,
+                        frame.rip,
+                    ) {
+                        action_steps.push(SehStep::Jump {
+                            rip: c.landing_pad,
+                            rsp: frame.rsp,
+                            gpr: frame.gpr,
+                            xmm: frame.xmm,
+                            rax: if payload.exception_object != 0 {
+                                Some(payload.exception_object)
+                            } else {
+                                None
+                            },
+                            rdx: Some(0),
+                        });
+                        break;
+                    }
                 }
             }
         }
@@ -321,6 +536,7 @@ fn search_and_plan(
 struct ResolvedPad {
     landing_pad: u64,
     msvc: Option<MsvcCatch>,
+    switch_value: Option<u64>,
 }
 
 fn begin_or_finish(
@@ -351,12 +567,14 @@ fn begin_or_finish(
             gpr: handler.catch_ctx.gpr,
             xmm: handler.catch_ctx.xmm,
             rax: handler.exception_object,
+            rdx: handler.switch_value,
         });
     }
 
     state.seh_pending = Some(SehPending {
         steps: action_steps,
         expect_catch_return: false,
+        expect_cleanup_resume: false,
     });
     run_next_step(engine, state)
 }
@@ -440,8 +658,19 @@ fn run_next_step(
             gpr,
             xmm,
             rax,
+            rdx,
         } => {
-            state.seh_pending = None;
+            // Intermediate cleanup pads end in `_Unwind_Resume`; keep remaining
+            // steps and mark expect_cleanup_resume so RtlUnwindEx continues us.
+            let more = !pending.steps.is_empty();
+            if more {
+                pending.expect_cleanup_resume = true;
+            }
+            // Drop the borrow before clearing pending on the terminal jump.
+            let cleanup_resume = more;
+            if !more {
+                state.seh_pending = None;
+            }
             let mut tctx = engine.snapshot_thread_context();
             tctx.gpr = gpr;
             tctx.xmm = xmm;
@@ -450,9 +679,30 @@ fn run_next_step(
             engine.restore_thread_context(&tctx);
             engine.write_rip(rip)?;
             engine.write_rsp(rsp)?;
-            if let Some(obj) = rax {
-                engine.write_rax(obj)?;
+            if let Some(exc) = rax {
+                // Personality normally sets `__cxa_exception.adjustedPtr` to the
+                // (possibly base-adjusted) thrown object before entering the pad.
+                let object = exc.saturating_add(GCC_OBJECT_FROM_UNWIND_HDR);
+                let adj_slot = exc.saturating_sub(GCC_ADJUSTED_PTR_FROM_UNWIND_HDR);
+                if let Err(e) = engine.mem_write(adj_slot, &object.to_le_bytes()) {
+                    tracing::warn!(
+                        slot = format_args!("{adj_slot:#x}"),
+                        "seh GCC adjustedPtr write failed: {e}"
+                    );
+                }
+                engine.write_rax(exc)?;
             }
+            if let Some(sv) = rdx {
+                engine.write_rdx(sv)?;
+            }
+            tracing::debug!(
+                rip = format_args!("{rip:#x}"),
+                rsp = format_args!("{rsp:#x}"),
+                rax = format_args!("{:#x}", rax.unwrap_or(0)),
+                rdx = format_args!("{:#x}", rdx.unwrap_or(0)),
+                cleanup_resume,
+                "seh Itanium landing pad jump"
+            );
             Ok(WinApiHandlerResult {
                 return_address: rip,
                 return_value: rax.unwrap_or(0),
@@ -544,6 +794,7 @@ struct Unwound {
     image_base: u64,
     entry: exception::RuntimeFunction,
     unwind_va: u64,
+    exception_data_va: Option<u64>,
 }
 
 fn unwind_one(
@@ -567,6 +818,7 @@ fn unwind_one(
                 image_base: 0,
                 entry: dummy_entry(),
                 unwind_va: 0,
+                exception_data_va: None,
             },
             None,
         ));
@@ -582,6 +834,7 @@ fn unwind_one(
             image_base: entry.image_base,
             entry: *entry.entry,
             unwind_va,
+            exception_data_va: result.exception_data_va,
         },
         result.handler_data,
     ))
@@ -616,16 +869,23 @@ fn resolve_landing_pad(
     unwound: &Unwound,
     language_data: u32,
     payload: ThrowPayload,
+    thrown_typeinfo: Option<u64>,
 ) -> Option<ResolvedPad> {
     if unwound.image_base == 0 || unwound.unwind_va == 0 {
         return None;
     }
     let func_start = unwound.entry.begin_va(unwound.image_base);
     let func_end = unwound.entry.end_va(unwound.image_base);
-    let candidates =
-        exception::language_data_candidates(unwound.image_base, unwound.unwind_va, language_data);
+    let candidates = exception::language_data_candidates(
+        unwound.image_base,
+        unwound.unwind_va,
+        language_data,
+        unwound.exception_data_va,
+    );
 
-    let msvc_throw = payload.throw_info != 0 || payload.exception_object != 0;
+    // MSVC FuncInfo path only for real `_CxxThrowException` (ThrowInfo present).
+    let msvc_throw = !payload.gcc_throw && payload.throw_info != 0;
+
     let in_image = |va: u64| -> bool {
         unwound.image_base != 0
             && va >= unwound.image_base
@@ -646,39 +906,68 @@ fn resolve_landing_pad(
                 return Some(ResolvedPad {
                     landing_pad: c.landing_pad,
                     msvc: Some(c),
+                    switch_value: None,
                 });
             }
         }
         return None;
     }
 
+    // Mingw / Itanium LSDA (embedded ExceptionData or relocated pointer).
     for &lsda_va in &candidates {
-        if let Some((lp, _)) = exception::find_landing_pad(
+        if let Some(m) = exception::find_landing_pad_ex(
             read_mem,
             lsda_va,
             unwound.image_base,
             func_start,
-            func_end,
             control_pc,
-        ) && lp != 0
-            && in_image(lp)
+            thrown_typeinfo,
+        ) && m.landing_pad != 0
+            && in_image(m.landing_pad)
         {
             return Some(ResolvedPad {
-                landing_pad: lp,
+                landing_pad: m.landing_pad,
                 msvc: None,
+                switch_value: Some(m.switch_value.cast_unsigned()),
             });
         }
+        // Retry without type filter if typed match failed (allows catch-all-only tables).
+        if thrown_typeinfo.is_some()
+            && let Some(m) = exception::find_landing_pad_ex(
+                read_mem,
+                lsda_va,
+                unwound.image_base,
+                func_start,
+                control_pc,
+                None,
+            )
+            && m.landing_pad != 0
+            && in_image(m.landing_pad)
+            && m.switch_value == 0
+        {
+            // Only accept untyped retry when the match is catch-all.
+            return Some(ResolvedPad {
+                landing_pad: m.landing_pad,
+                msvc: None,
+                switch_value: Some(0),
+            });
+        }
+        let _ = func_end;
     }
 
-    for &fi_va in &candidates {
-        if let Some(c) =
-            msvc_eh::find_msvc_catch(read_mem, unwound.image_base, fi_va, control_pc, 0)
-            && in_image(c.landing_pad)
-        {
-            return Some(ResolvedPad {
-                landing_pad: c.landing_pad,
-                msvc: Some(c),
-            });
+    // Fallback: MSVC FuncInfo without ThrowInfo (catch-all only).
+    if !payload.gcc_throw {
+        for &fi_va in &candidates {
+            if let Some(c) =
+                msvc_eh::find_msvc_catch(read_mem, unwound.image_base, fi_va, control_pc, 0)
+                && in_image(c.landing_pad)
+            {
+                return Some(ResolvedPad {
+                    landing_pad: c.landing_pad,
+                    msvc: Some(c),
+                    switch_value: None,
+                });
+            }
         }
     }
 

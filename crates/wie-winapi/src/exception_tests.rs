@@ -221,9 +221,69 @@ mod tests {
 
     #[test]
     fn language_data_candidates_dedup_paths() {
-        let c = language_data_candidates(0x14000_0000, 0x14000_5000, 0x20);
+        let c = language_data_candidates(0x14000_0000, 0x14000_5000, 0x20, None);
         assert_eq!(c[0], 0x14000_0020); // image + rva
         assert_eq!(c[1], 0x14000_5020); // unwind + full
-        assert_eq!(c[2], 0x14000_5020); // unwind + low16 (same when high=0)
+        // low16 collapses with full when high half is 0
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn language_data_candidates_prefers_embedded_lsda() {
+        let emb = 0x14000_5010u64;
+        let c = language_data_candidates(0x14000_0000, 0x14000_5000, 0x20, Some(emb));
+        assert_eq!(c[0], emb);
+        assert!(c.contains(&0x14000_0020));
+    }
+
+    /// Real Mingw-style LSDA: uleb call sites + catch-all action (filter 0).
+    #[test]
+    fn lsda_mingw_uleb_call_site_ip_minus_one() {
+        // lp=omit, ttype=udata4 abs (no pcrel), cs=uleb
+        // call site: start=0x3a len=5 lp=0x3f action=1
+        // action@1: filter=0 (catch-all), next=0
+        // type table empty (catch-all does not read it)
+        let lsda = vec![
+            0xff, // lp omit
+            0x03, // ttype udata4
+            0x04, // ttype base offset → past call-site+action
+            0x01, // cs uleb128
+            0x08, // cs len
+            0x3a, 0x05, 0x3f, 0x01, // site 0
+            0x47, 0x22, 0x00, 0x00, // site 1 (no lp)
+            0x00, 0x00, // action: filter=0, next=0
+            // type table padding so base offset lands after actions
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let base = 0x2000u64;
+        let mut mem = MemSim::new();
+        mem.map(base, lsda.len() + 16);
+        mem.write_bytes(base, &lsda);
+        let func = 0x1400_73e0u64;
+        // Return address after call = func+0x3f → needs IP-1 to hit [0x3a,0x3f)
+        let mut r = mem.reader();
+        let m = find_landing_pad_ex(&mut r, base, 0x14000_0000, func, func + 0x3f, None)
+            .expect("landing pad");
+        assert_eq!(m.landing_pad, func + 0x3f);
+        assert_eq!(m.switch_value, 0);
+    }
+
+    #[test]
+    fn lsda_cleanup_only_not_a_catch() {
+        // action_index 0 + landing pad = cleanup; search must ignore it.
+        let lsda = vec![
+            0xff, 0xff, 0x01, 0x04, // omit omit uleb len=4
+            0x3a, 0x05, 0x3b, 0x00, // site with cleanup lp, act=0
+        ];
+        let base = 0x3000u64;
+        let mut mem = MemSim::new();
+        mem.map(base, 32);
+        mem.write_bytes(base, &lsda);
+        let func = 0x1000u64;
+        let mut r = mem.reader();
+        assert!(find_landing_pad_ex(&mut r, base, 0, func, func + 0x3f, None).is_none());
+        let mut r = mem.reader();
+        let c = find_cleanup_landing_pad(&mut r, base, 0, func, func + 0x3f).expect("cleanup");
+        assert_eq!(c.landing_pad, func + 0x3b);
     }
 }

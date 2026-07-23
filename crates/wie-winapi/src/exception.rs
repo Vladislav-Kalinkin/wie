@@ -15,11 +15,14 @@
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
     clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
     clippy::as_conversions,
     clippy::integer_division,
     clippy::match_same_arms,
     clippy::result_unit_err,
-    clippy::needless_range_loop
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
 )]
 
 /// One entry in the `.pdata` section.  12 bytes.  4-byte aligned.
@@ -270,26 +273,75 @@ pub struct UnwindResult {
     ///
     /// ABI interpretation differs:
     /// - **MSVC**: RVA of language data (`FuncInfo` / scope table) relative to image base.
-    /// - **Mingw-w64 SEH**: often a small offset from the `UNWIND_INFO` base (low 16 bits
-    ///   significant; high half may be zero/padding). See [`language_data_candidates`].
+    /// - **Mingw-w64 SEH**: first 4 bytes of the **embedded** LSDA (not an RVA). See
+    ///   [`language_data_candidates`].
     pub handler_data: Option<u32>,
+    /// Guest VA of `ExceptionData[]` (first byte after the personality RVA in
+    /// `UNWIND_INFO`). Mingw embeds the Itanium LSDA here; MSVC stores FuncInfo RVA.
+    pub exception_data_va: Option<u64>,
 }
 
 /// Candidate guest VAs for language-specific data (LSDA or FuncInfo).
 ///
-/// Tries MSVC image-relative RVA first, then Mingw-style offsets from the
-/// `UNWIND_INFO` VA (full DWORD and low 16 bits). Deduplicates.
+/// Order (clean-room PE/COFF + Mingw SEH practice):
+/// 1. `exception_data_va` — embedded LSDA (GCC/Mingw `__gxx_personality_seh0`)
+/// 2. `image_base + language_data` — MSVC FuncInfo / scope-table RVA
+/// 3. `unwind_va + language_data` and low-16 variant — legacy offset packing
+///
+/// Duplicates are collapsed while preserving order.
 pub fn language_data_candidates(
     image_base: u64,
     unwind_va: u64,
     language_data: u32,
-) -> [u64; 3] {
+    exception_data_va: Option<u64>,
+) -> Vec<u64> {
     let full = u64::from(language_data);
-    [
-        image_base.saturating_add(full),
-        unwind_va.saturating_add(full),
-        unwind_va.saturating_add(full & 0xffff),
-    ]
+    let mut out = Vec::with_capacity(4);
+    let push = |v: &mut Vec<u64>, x: u64| {
+        if x != 0 && !v.contains(&x) {
+            v.push(x);
+        }
+    };
+    if let Some(ed) = exception_data_va {
+        push(&mut out, ed);
+    }
+    push(&mut out, image_base.saturating_add(full));
+    push(&mut out, unwind_va.saturating_add(full));
+    push(&mut out, unwind_va.saturating_add(full & 0xffff));
+    out
+}
+
+// ── DWARF EH pointer encodings (Itanium C++ ABI / GCC dwarf2.h) ────────
+
+/// `DW_EH_PE_*` application / format bits used in LSDA headers.
+mod dw_eh_pe {
+    pub(super) const OMIT: u8 = 0xff;
+    pub(super) const ABSPTR: u8 = 0x00;
+    pub(super) const ULEB128: u8 = 0x01;
+    pub(super) const UDATA2: u8 = 0x02;
+    pub(super) const UDATA4: u8 = 0x03;
+    pub(super) const UDATA8: u8 = 0x04;
+    pub(super) const SLEB128: u8 = 0x09;
+    pub(super) const SDATA2: u8 = 0x0a;
+    pub(super) const SDATA4: u8 = 0x0b;
+    pub(super) const SDATA8: u8 = 0x0c;
+    pub(super) const PCREL: u8 = 0x10;
+    pub(super) const TEXTREL: u8 = 0x20;
+    pub(super) const DATAREL: u8 = 0x30;
+    pub(super) const FUNCREL: u8 = 0x40;
+    pub(super) const ALIGNED: u8 = 0x50;
+    pub(super) const INDIRECT: u8 = 0x80;
+}
+
+/// Result of host-side Itanium LSDA call-site + action matching.
+#[derive(Debug, Clone, Copy)]
+pub struct LandingPadMatch {
+    /// Absolute guest VA of the landing pad (or cleanup).
+    pub landing_pad: u64,
+    /// 1-based action table index from the call-site entry (`0` = no action).
+    pub action_index: u64,
+    /// Value loaded into RDX at landing-pad entry (handler switch / type filter).
+    pub switch_value: i64,
 }
 
 // ── Virtual unwinding ──────────────────────────────────────────────────
@@ -503,6 +555,7 @@ pub fn virtual_unwind(
                 ctx: chained.ctx,
                 handler_rva: chained.handler_rva,
                 handler_data: chained.handler_data,
+                exception_data_va: chained.exception_data_va,
             });
         }
         // Chain RVA is 0 — no chain, fall through to handler check.
@@ -516,120 +569,548 @@ pub fn virtual_unwind(
         let mut h_buf = [0_u8; 8];
         read_mem(data_off, &mut h_buf)?;
         let hrva = u32::from_le_bytes([h_buf[0], h_buf[1], h_buf[2], h_buf[3]]);
-        // Full language-data DWORD (MSVC: FuncInfo RVA; Mingw: offset packing).
+        // Full language-data DWORD (MSVC: FuncInfo RVA; Mingw: first LSDA dword).
         let hdata = u32::from_le_bytes([h_buf[4], h_buf[5], h_buf[6], h_buf[7]]);
+        // ExceptionData starts immediately after the personality RVA.
+        let exception_data_va = data_off.saturating_add(4);
         Ok(UnwindResult {
             ctx,
             handler_rva: Some(hrva),
             handler_data: Some(hdata),
+            exception_data_va: Some(exception_data_va),
         })
     } else {
         Ok(UnwindResult {
             ctx,
             handler_rva: None,
             handler_data: None,
+            exception_data_va: None,
         })
     }
 }
 
+// ── LSDA helpers ───────────────────────────────────────────────────────
+
+fn read_uleb128(read_mem: &mut MemRead<'_>, cursor: &mut u64) -> Option<u64> {
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let mut b = [0u8; 1];
+        read_mem(*cursor, &mut b).ok()?;
+        *cursor = cursor.saturating_add(1);
+        v |= u64::from(b[0] & 0x7f) << shift;
+        if b[0] & 0x80 == 0 {
+            return Some(v);
+        }
+        shift = shift.saturating_add(7);
+        if shift > 56 {
+            return None;
+        }
+    }
+}
+
+fn read_sleb128(read_mem: &mut MemRead<'_>, cursor: &mut u64) -> Option<i64> {
+    let mut v = 0i64;
+    let mut shift = 0u32;
+    let mut b = [0u8; 1];
+    loop {
+        read_mem(*cursor, &mut b).ok()?;
+        *cursor = cursor.saturating_add(1);
+        v |= i64::from(b[0] & 0x7f) << shift;
+        shift = shift.saturating_add(7);
+        if b[0] & 0x80 == 0 {
+            if shift < 64 && (b[0] & 0x40) != 0 {
+                v |= -1i64 << shift;
+            }
+            return Some(v);
+        }
+        if shift > 56 {
+            return None;
+        }
+    }
+}
+
+/// Size in bytes of a fixed-width DWARF EH format nibble, or `None` for LEB/omit/unknown.
+fn dw_format_size(format: u8) -> Option<u64> {
+    match format {
+        dw_eh_pe::ABSPTR | dw_eh_pe::UDATA8 | dw_eh_pe::SDATA8 => Some(8),
+        dw_eh_pe::UDATA2 | dw_eh_pe::SDATA2 => Some(2),
+        dw_eh_pe::UDATA4 | dw_eh_pe::SDATA4 => Some(4),
+        _ => None,
+    }
+}
+
+fn is_signed_format(format: u8) -> bool {
+    matches!(
+        format,
+        dw_eh_pe::SLEB128 | dw_eh_pe::SDATA2 | dw_eh_pe::SDATA4 | dw_eh_pe::SDATA8
+    )
+}
+
+/// Read an encoded pointer value; advances `cursor`. Returns the raw numeric
+/// value before application of pcrel/datarel/indirect (those need the value's
+/// storage address and bases).
+fn read_encoded_value(
+    read_mem: &mut MemRead<'_>,
+    cursor: &mut u64,
+    encoding: u8,
+) -> Option<(u64, u64)> {
+    // Returns (raw_value_as_u64, value_storage_va)
+    if encoding == dw_eh_pe::OMIT {
+        return Some((0, *cursor));
+    }
+    let format = encoding & 0x0f;
+    let storage = *cursor;
+    let raw = match format {
+        dw_eh_pe::ULEB128 => read_uleb128(read_mem, cursor)?,
+        dw_eh_pe::SLEB128 => read_sleb128(read_mem, cursor)? as u64,
+        f => {
+            let sz = dw_format_size(f)?;
+            let mut buf = [0u8; 8];
+            read_mem(*cursor, &mut buf[..sz as usize]).ok()?;
+            *cursor = cursor.saturating_add(sz);
+            let mut v = 0u64;
+            for i in 0..sz as usize {
+                v |= u64::from(buf[i]) << (i * 8);
+            }
+            if is_signed_format(f) {
+                let bits = sz * 8;
+                let sign = 1u64 << (bits - 1);
+                if v & sign != 0 {
+                    v |= !((1u64 << bits) - 1);
+                }
+            }
+            v
+        }
+    };
+    Some((raw, storage))
+}
+
+/// Apply DW_EH_PE application + optional indirect to a raw encoded value.
+fn apply_encoding(
+    read_mem: &mut MemRead<'_>,
+    encoding: u8,
+    raw: u64,
+    storage_va: u64,
+    image_base: u64,
+    func_start: u64,
+    data_base: u64,
+) -> Option<u64> {
+    if encoding == dw_eh_pe::OMIT {
+        return Some(0);
+    }
+    // Zero raw value → null pointer (Itanium type-table catch-all, omit reloc).
+    if raw == 0 {
+        return Some(0);
+    }
+    let app = encoding & 0x70;
+    let mut addr = match app {
+        0x00 => raw, // absptr / absolute
+        dw_eh_pe::PCREL => storage_va.wrapping_add(raw),
+        dw_eh_pe::TEXTREL => image_base.wrapping_add(raw),
+        dw_eh_pe::DATAREL => data_base.wrapping_add(raw),
+        dw_eh_pe::FUNCREL => func_start.wrapping_add(raw),
+        dw_eh_pe::ALIGNED => raw, // rare; treat as absolute
+        _ => raw,
+    };
+    if encoding & dw_eh_pe::INDIRECT != 0 && addr != 0 {
+        let mut buf = [0u8; 8];
+        read_mem(addr, &mut buf).ok()?;
+        addr = u64::from_le_bytes(buf);
+    }
+    Some(addr)
+}
+
 /// Parse the Itanium LSDA call-site table and find the landing pad for `control_pc`.
 ///
-/// Returns `(landing_pad_va, action_index)` or `None` if no handler is found.
+/// Clean-room Itanium C++ ABI §EH + GCC `dwarf2.h` encodings. Handles:
+/// - Embedded Mingw SEH LSDA (`ExceptionData` after personality RVA)
+/// - `DW_EH_PE_pcrel` / `datarel` / `funcrel` / `indirect` on LPStart and types
+/// - Call-site PC match with **IP−1** when `control_pc` is a return address
+///   (standard `_Unwind_GetIPInfo` adjustment for call sites)
+///
+/// When `thrown_typeinfo` is `Some`, walks the action table and picks the first
+/// matching catch (type pointer equality or catch-all). When `None`, accepts the
+/// first catch-all / any typed action (used when the throw payload is unknown).
+///
+/// Returns [`LandingPadMatch`] or `None` if no handler covers the PC.
 pub fn find_landing_pad(
     read_mem: &mut MemRead<'_>,
     lsda_va: u64,
-    _image_base: u64,
+    image_base: u64,
     func_start: u64,
     _func_end: u64,
     control_pc: u64,
 ) -> Option<(u64, u64)> {
-    // Read LSDA header: 3 encoding bytes
-    let mut hdr = [0u8; 3];
-    read_mem(lsda_va, &mut hdr).ok()?;
-    let lp_enc = hdr[0];
-    let ttype_enc = hdr[1];
-    let cs_enc = hdr[2];
-    
-    // Advance cursor past variable-length header
-    let mut cursor = lsda_va + 3;
-    // Skip LPStart value (present when encoding != 0xFF)
-    if lp_enc != 0xFF {
-        let lp_size = match lp_enc & 0x0f { 0x00 => 8, 0x02 | 0x03 => 2, 0x04 | 0x05 => 4, 0x06 | 0x07 => 8, _ => 0 };
-        cursor += lp_size;
+    find_landing_pad_ex(
+        read_mem,
+        lsda_va,
+        image_base,
+        func_start,
+        control_pc,
+        None,
+    )
+    .map(|m| (m.landing_pad, m.action_index))
+}
+
+/// Extended LSDA match with optional thrown-typeinfo filtering and switch value.
+pub fn find_landing_pad_ex(
+    read_mem: &mut MemRead<'_>,
+    lsda_va: u64,
+    image_base: u64,
+    func_start: u64,
+    control_pc: u64,
+    thrown_typeinfo: Option<u64>,
+) -> Option<LandingPadMatch> {
+    let mut cursor = lsda_va;
+
+    // LPStart encoding + value
+    let mut b1 = [0u8; 1];
+    read_mem(cursor, &mut b1).ok()?;
+    cursor = cursor.saturating_add(1);
+    let lp_enc = b1[0];
+    let mut lp_base = func_start;
+    if lp_enc != dw_eh_pe::OMIT {
+        let (raw, storage) = read_encoded_value(read_mem, &mut cursor, lp_enc)?;
+        lp_base = apply_encoding(
+            read_mem,
+            lp_enc,
+            raw,
+            storage,
+            image_base,
+            func_start,
+            image_base,
+        )?;
+        if lp_base == 0 {
+            lp_base = func_start;
+        }
     }
-    // Skip ttype offset (ULEB128, present when encoding != 0xFF)
-    if ttype_enc != 0xFF {
-        loop { let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1; if b[0] & 0x80 == 0 { break; } }
+
+    // TType encoding + base offset (ULEB128 from after the ULEB itself)
+    read_mem(cursor, &mut b1).ok()?;
+    cursor = cursor.saturating_add(1);
+    let ttype_enc = b1[0];
+    let mut ttype_base = 0u64;
+    if ttype_enc != dw_eh_pe::OMIT {
+        let off = read_uleb128(read_mem, &mut cursor)?;
+        ttype_base = cursor.saturating_add(off);
     }
-    
-    // Read call-site table length (ULEB128)
-    let mut cs_len = 0u64;
-    let mut sft = 0;
-    loop {
-        let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1;
-        cs_len |= u64::from(b[0] & 0x7f) << sft;
-        if b[0] & 0x80 == 0 { break; }
-        sft += 7;
+
+    // Call-site encoding + table length
+    read_mem(cursor, &mut b1).ok()?;
+    cursor = cursor.saturating_add(1);
+    let cs_enc = b1[0];
+    let cs_len = read_uleb128(read_mem, &mut cursor)?;
+    if cs_len == 0 {
+        return None;
     }
-    if cs_len == 0 { return None; }
-    let cs_end = cursor + cs_len;
-    
-    // Walk call-site entries
-    let base_enc = cs_enc & 0x0f;
+    let cs_end = cursor.saturating_add(cs_len);
+    let action_table = cs_end;
+
+    // IP-1: exception PC for a CALL is typically the return address (one past
+    // the call). GCC call-site ranges cover the call insn only, so match IP-1.
+    let match_pc = control_pc.saturating_sub(1);
+    let pcs = [match_pc, control_pc];
+
+    let format = cs_enc & 0x0f;
+    let abs = format == dw_eh_pe::ABSPTR;
+
     while cursor < cs_end {
-        // Read entry fields: (start, length, landing_pad, action_index)
-        // Field format depends on the base encoding:
-        // 0x00=absptr(8), 0x01=ULEB128, 0x02/03=udata2/sdata2(2),
-        // 0x04/05=udata4/sdata4(4), 0x06/07=udata8/sdata8(8)
-        let (cs_s, cs_len_v, lp, aidx) = match base_enc {
-            0x01 => {
-                // All ULEB128
-                let mut u = |c: &mut u64| -> Option<u64> {
-                    let mut v = 0u64; let mut s = 0;
-                    loop { let mut b = [0u8; 1]; read_mem(*c, &mut b).ok()?; *c += 1;
-                           v |= u64::from(b[0] & 0x7f) << s; if b[0] & 0x80 == 0 { break; } s += 7; if s > 56 { return None; } }
-                    Some(v)
-                };
-                (u(&mut cursor)?, u(&mut cursor)?, u(&mut cursor)?, u(&mut cursor)?)
-            }
-            0x00 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 => {
-                let sz: u64 = match base_enc { 0x00 | 0x06 | 0x07 => 8, 0x02 | 0x03 => 2, _ => 4 };
-                let mut r64 = |c: &mut u64, s: u64| -> Option<u64> {
-                    let mut buf = vec![0u8; s as usize];
-                    read_mem(*c, &mut buf).ok()?; *c += s;
-                    let mut v = 0u64;
-                    for i in 0..s as usize { v |= u64::from(buf[i]) << (i * 8); }
-                    if matches!(base_enc, 0x03 | 0x05 | 0x07) {
-                        let bits = s * 8; let sb = 1u64 << (bits - 1);
-                        if v & sb != 0 { v |= !((1u64 << bits) - 1); }
-                    }
-                    Some(v)
-                };
-                let s = r64(&mut cursor, sz)?;
-                let len = r64(&mut cursor, sz)?;
-                let pad = r64(&mut cursor, sz)?;
-                // action_index is always ULEB128
-                let a = {
-                    let mut v = 0u64; let mut shift = 0;
-                    loop { let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1;
-                           v |= u64::from(b[0] & 0x7f) << shift; if b[0] & 0x80 == 0 { break; } shift += 7; if shift > 56 { return None; } }
-                    v
-                };
-                (s, len, pad, a)
-            }
-            _ => return None,
+        let site_start_cursor = cursor;
+        let (cs_s, cs_len_v, lp_raw, aidx) = if format == dw_eh_pe::ULEB128 {
+            (
+                read_uleb128(read_mem, &mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+            )
+        } else {
+            // Validate fixed-width format before reading four fields.
+            let _sz = dw_format_size(format)?;
+            let mut read_fix = |c: &mut u64| -> Option<u64> {
+                let (raw, _) = read_encoded_value(read_mem, c, format)?;
+                Some(raw)
+            };
+            let s = read_fix(&mut cursor)?;
+            let len = read_fix(&mut cursor)?;
+            let pad = read_fix(&mut cursor)?;
+            // action_index is always ULEB128 in the Itanium LSDA.
+            let a = read_uleb128(read_mem, &mut cursor)?;
+            let _ = site_start_cursor;
+            (s, len, pad, a)
         };
-        
-        if lp == 0 { continue; }
-        // For absptr encoding, values are absolute addresses, not offsets.
-        // For all others, they're offsets from func_start.
-        let abs = base_enc == 0x00;
-        let (rstart, rend) = if abs { (cs_s, cs_s + cs_len_v) } else { (func_start + cs_s, func_start + cs_s + cs_len_v) };
-        if control_pc < rstart || control_pc >= rend { continue; }
-        let landing_va = if abs { lp } else { func_start + lp };
-        return Some((landing_va, aidx));
+
+        if lp_raw == 0 {
+            continue;
+        }
+
+        let (rstart, rend) = if abs {
+            (cs_s, cs_s.saturating_add(cs_len_v))
+        } else {
+            (
+                lp_base.saturating_add(cs_s),
+                lp_base.saturating_add(cs_s).saturating_add(cs_len_v),
+            )
+        };
+
+        let covers = pcs.iter().any(|&p| p >= rstart && p < rend);
+        if !covers {
+            continue;
+        }
+
+        let landing_va = if abs {
+            lp_raw
+        } else {
+            lp_base.saturating_add(lp_raw)
+        };
+        if landing_va == 0 {
+            continue;
+        }
+
+        // action_index == 0 with a landing pad is a **cleanup-only** site
+        // (run dtors, then `_Unwind_Resume`). Never treat as a catch during search.
+        if aidx == 0 {
+            continue;
+        }
+        // No type table: cannot match typed/catch-all handlers reliably.
+        if ttype_enc == dw_eh_pe::OMIT {
+            continue;
+        }
+
+        // Walk action records (1-based byte offset into action table).
+        if let Some(sw) =
+            match_action(read_mem, action_table, aidx, ttype_base, ttype_enc, image_base, func_start, thrown_typeinfo)
+        {
+            return Some(LandingPadMatch {
+                landing_pad: landing_va,
+                action_index: aidx,
+                switch_value: sw,
+            });
+        }
+        // Typed mismatch / cleanup-only action chain: keep searching.
     }
     None
+}
+
+/// Find a cleanup-only landing pad for `control_pc` (phase-2 intermediate frames).
+///
+/// Call-site with `landing_pad != 0` and `action_index == 0`, or an action chain
+/// that has no catch (cleanup filters only).
+pub fn find_cleanup_landing_pad(
+    read_mem: &mut MemRead<'_>,
+    lsda_va: u64,
+    image_base: u64,
+    func_start: u64,
+    control_pc: u64,
+) -> Option<LandingPadMatch> {
+    let mut cursor = lsda_va;
+    let mut b1 = [0u8; 1];
+    read_mem(cursor, &mut b1).ok()?;
+    cursor = cursor.saturating_add(1);
+    let lp_enc = b1[0];
+    let mut lp_base = func_start;
+    if lp_enc != dw_eh_pe::OMIT {
+        let (raw, storage) = read_encoded_value(read_mem, &mut cursor, lp_enc)?;
+        lp_base = apply_encoding(
+            read_mem,
+            lp_enc,
+            raw,
+            storage,
+            image_base,
+            func_start,
+            image_base,
+        )?;
+        if lp_base == 0 {
+            lp_base = func_start;
+        }
+    }
+    read_mem(cursor, &mut b1).ok()?;
+    cursor = cursor.saturating_add(1);
+    let ttype_enc = b1[0];
+    if ttype_enc != dw_eh_pe::OMIT {
+        let _off = read_uleb128(read_mem, &mut cursor)?;
+    }
+    read_mem(cursor, &mut b1).ok()?;
+    cursor = cursor.saturating_add(1);
+    let cs_enc = b1[0];
+    let cs_len = read_uleb128(read_mem, &mut cursor)?;
+    if cs_len == 0 {
+        return None;
+    }
+    let cs_end = cursor.saturating_add(cs_len);
+    let match_pc = control_pc.saturating_sub(1);
+    let pcs = [match_pc, control_pc];
+    let format = cs_enc & 0x0f;
+    let abs = format == dw_eh_pe::ABSPTR;
+
+    while cursor < cs_end {
+        let (cs_s, cs_len_v, lp_raw, aidx) = if format == dw_eh_pe::ULEB128 {
+            (
+                read_uleb128(read_mem, &mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+            )
+        } else {
+            let _sz = dw_format_size(format)?;
+            let mut read_fix = |c: &mut u64| -> Option<u64> {
+                let (raw, _) = read_encoded_value(read_mem, c, format)?;
+                Some(raw)
+            };
+            (
+                read_fix(&mut cursor)?,
+                read_fix(&mut cursor)?,
+                read_fix(&mut cursor)?,
+                read_uleb128(read_mem, &mut cursor)?,
+            )
+        };
+        if lp_raw == 0 || aidx != 0 {
+            // Only pure cleanups (action 0). Catch sites are handled in search.
+            continue;
+        }
+        let (rstart, rend) = if abs {
+            (cs_s, cs_s.saturating_add(cs_len_v))
+        } else {
+            (
+                lp_base.saturating_add(cs_s),
+                lp_base.saturating_add(cs_s).saturating_add(cs_len_v),
+            )
+        };
+        if !pcs.iter().any(|&p| p >= rstart && p < rend) {
+            continue;
+        }
+        let landing_va = if abs {
+            lp_raw
+        } else {
+            lp_base.saturating_add(lp_raw)
+        };
+        if landing_va != 0 {
+            return Some(LandingPadMatch {
+                landing_pad: landing_va,
+                action_index: 0,
+                switch_value: 0,
+            });
+        }
+    }
+    None
+}
+
+/// Walk LSDA action records starting at 1-based `action_index`.
+///
+/// Two-pass (matches libstdc++ personality preference):
+/// 1. Prefer a **typed** catch whose typeinfo equals the thrown type
+/// 2. Otherwise accept catch-all (`filter == 0` or null typeinfo entry)
+///
+/// Returns the handler switch value for RDX (`filter` for typed, `0` for `...`).
+fn match_action(
+    read_mem: &mut MemRead<'_>,
+    action_table: u64,
+    action_index: u64,
+    ttype_base: u64,
+    ttype_enc: u8,
+    image_base: u64,
+    func_start: u64,
+    thrown_typeinfo: Option<u64>,
+) -> Option<i64> {
+    if action_index == 0 {
+        return None; // cleanup-only; not a catch
+    }
+    let mut catch_all: Option<i64> = None;
+    let mut idx = action_index;
+    for _ in 0..32 {
+        let rec = action_table.saturating_add(idx.saturating_sub(1));
+        let mut cursor = rec;
+        let filter = read_sleb128(read_mem, &mut cursor)?;
+        let next = read_sleb128(read_mem, &mut cursor)?;
+
+        if filter == 0 {
+            // Catch-all (`...`). Remember; typed matches win if present later.
+            if catch_all.is_none() {
+                catch_all = Some(0);
+            }
+        } else if filter > 0 {
+            let slot_ti = resolve_ttype(
+                read_mem,
+                ttype_base,
+                ttype_enc,
+                filter as u64,
+                image_base,
+                func_start,
+            );
+            match slot_ti {
+                Some(0) => {
+                    // Null typeinfo entry → catch-all under a non-zero filter.
+                    if catch_all.is_none() {
+                        catch_all = Some(filter);
+                    }
+                }
+                Some(entry) => {
+                    let matched = match thrown_typeinfo {
+                        None => true,
+                        Some(ti) => entry == ti,
+                    };
+                    if matched {
+                        return Some(filter);
+                    }
+                }
+                None => {}
+            }
+        }
+        // filter < 0: cleanup / exception-spec — skip for catch selection.
+        if next == 0 {
+            break;
+        }
+        // `next` is a signed byte displacement from the start of the next field.
+        let mut c2 = rec;
+        let _f = read_sleb128(read_mem, &mut c2)?;
+        let disp_field = c2;
+        let next_i = (disp_field as i64).saturating_add(next);
+        if next_i <= 0 {
+            break;
+        }
+        let next_va = next_i as u64;
+        if next_va < action_table {
+            break;
+        }
+        idx = next_va.saturating_sub(action_table).saturating_add(1);
+    }
+    catch_all
+}
+
+/// Resolve a 1-based type-table index to a typeinfo pointer VA.
+fn resolve_ttype(
+    read_mem: &mut MemRead<'_>,
+    ttype_base: u64,
+    ttype_enc: u8,
+    index: u64,
+    image_base: u64,
+    func_start: u64,
+) -> Option<u64> {
+    if index == 0 || ttype_enc == dw_eh_pe::OMIT {
+        return None;
+    }
+    let format = ttype_enc & 0x0f;
+    let entry_size = match format {
+        dw_eh_pe::ULEB128 | dw_eh_pe::SLEB128 => return None, // variable — uncommon for ttype
+        f => dw_format_size(f).unwrap_or(0),
+    };
+    if entry_size == 0 {
+        return None;
+    }
+    // Type table grows downward from ttype_base; entry N is at base - N*size.
+    let slot = ttype_base.saturating_sub(index.saturating_mul(entry_size));
+    let mut cursor = slot;
+    let (raw, storage) = read_encoded_value(read_mem, &mut cursor, ttype_enc & 0x0f)?;
+    // Re-apply with full encoding (pcrel/indirect use storage = slot).
+    apply_encoding(
+        read_mem,
+        ttype_enc,
+        raw,
+        storage,
+        image_base,
+        func_start,
+        image_base, // datarel base ≈ image base on PE
+    )
 }
 
 /// Unwind a leaf function (no unwind info).  Simply pops the return address.
@@ -638,7 +1119,12 @@ fn unwind_leaf(read_mem: &mut MemRead<'_>, mut ctx: UnwindContext) -> Result<Unw
     read_mem(ctx.rsp, &mut rip_buf)?;
     ctx.rip = u64::from_le_bytes(rip_buf);
     ctx.rsp = ctx.rsp.saturating_add(8);
-    Ok(UnwindResult { ctx, handler_rva: None, handler_data: None })
+    Ok(UnwindResult {
+        ctx,
+        handler_rva: None,
+        handler_data: None,
+        exception_data_va: None,
+    })
 }
 
 

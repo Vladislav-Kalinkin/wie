@@ -910,6 +910,7 @@ fn handle_cxx_throw_exception(
         crate::seh::ThrowPayload {
             exception_object: pexception_object,
             throw_info: pthrow_info,
+            gcc_throw: false,
         },
     )
     .map_err(|e| {
