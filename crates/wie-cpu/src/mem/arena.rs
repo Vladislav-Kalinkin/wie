@@ -28,8 +28,13 @@ pub(super) struct MmapArena {
 }
 
 // SAFETY: arenas are only accessed through exclusive/shared borrows on the
-// owning backend; not shared across threads.
+// owning backend; not shared across threads.  `host` pointer is immutable
+// after construction (never written through mutable references from multiple
+// threads); mmap'd memory supports concurrent access.
 unsafe impl Send for MmapArena {}
+// SAFETY: shared (&) access never mutates the `host` pointer or arena bounds;
+// the mmap backing is safe for concurrent reads and non-overlapping writes.
+unsafe impl Sync for MmapArena {}
 
 impl Drop for MmapArena {
     fn drop(&mut self) {
@@ -144,7 +149,6 @@ impl MmapArena {
     /// # Safety
     /// Caller holds a shared borrow of the arena for the slice lifetime.
     pub(super) unsafe fn as_slice(&self) -> &[u8] {
-        // SAFETY: live mmap of `size`; shared borrow of arena.
         unsafe { std::slice::from_raw_parts(self.host, self.size) }
     }
 
@@ -153,7 +157,6 @@ impl MmapArena {
     /// # Safety
     /// Caller holds an exclusive borrow of the arena for the slice lifetime.
     pub(super) unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        // SAFETY: live mmap of `size`; exclusive borrow of arena.
         unsafe { std::slice::from_raw_parts_mut(self.host, self.size) }
     }
 }
@@ -270,6 +273,29 @@ impl ArenaSet {
     /// Guest base of the arena containing `va`, if any.
     pub(super) fn arena_guest_base_for_va(&self, va: u64) -> Option<u64> {
         Some(self.find_va(va)?.guest_base())
+    }
+
+    /// Host pointer for writing at guest `address` (lock-free data-plane path).
+    ///
+    /// Returns `None` when the VA is unmapped or the arena host pointer is null.
+    /// The returned pointer is valid only while the arena is alive (generation
+    /// unchanged); caller must pair with a generation check to guard against
+    /// concurrent `munmap` via `VirtualFree(MEM_RELEASE)`.
+    /// Caller must validate `address + len` fits within one page before using
+    /// this pointer for a multi-byte write (pages within one arena are contiguous,
+    /// but cross-page writes need multiple resolves).
+    #[inline]
+    pub(super) fn write_ptr(&self, address: u64) -> Option<*mut u8> {
+        let arena = self.find_va(address)?;
+        if arena.host().is_null() {
+            return None;
+        }
+        let off = address.saturating_sub(arena.guest_base());
+        let off_usize = usize::try_from(off).ok()?;
+        if off_usize >= arena.size() {
+            return None;
+        }
+        Some(unsafe { arena.host().add(off_usize) })
     }
 
     /// Read `bytes.len()` from guest `address` into `bytes` (may span arenas page-wise).
@@ -458,7 +484,6 @@ impl ArenaSet {
         let off_usize = usize::try_from(off).map_err(|_| ())?;
         // Host base is host-page aligned; require offset multiple of host page size.
         let host_ps = {
-            #[expect(unsafe_code)]
             let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
             if n > 0 {
                 usize::try_from(n).unwrap_or(0x1000)

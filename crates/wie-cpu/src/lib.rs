@@ -6,6 +6,7 @@
 //! Scope: **x86-64 only** (no i386). Universal PE64 — no per-EXE cheats.
 //! Unicorn has been removed; see git history for the former reference backend.
 
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 mod exec;
@@ -18,14 +19,15 @@ mod regs;
 pub use exec::{dump_iced_counters, reset_iced_counters};
 pub use iced_cpu::IcedCpu;
 pub use jit::{
-    FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitStats, dump_mem_path_stats,
+    FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitShared, JitStats, PerThreadJitState,
+    dump_mem_path_stats,
 };
 /// Windows `PAGE_*` constants and software access checks (Phase 3).
 pub use mem::protect;
 pub use mem::{
     ERROR_INVALID_ADDRESS, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
-    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestRegion, MEM_COMMIT, MEM_DECOMMIT, MEM_FREE,
-    MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType, MemoryBasicInformation,
+    GUEST_ALLOC_GRANULARITY, GuestMemBackend, GuestMemory, GuestRegion, MEM_COMMIT, MEM_DECOMMIT,
+    MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEM_RELEASE, MEM_RESERVE, MemType, MemoryBasicInformation,
     MmapArenaBackend, PAGE_SIZE, PAGE_SIZE_USIZE, PageMap, PageRun, PageState, RegionKind,
     RegionTable, VadNode, VadTable, align_down, align_up, win32_from_cpu_error,
 };
@@ -486,6 +488,70 @@ pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
     match name {
         "iced" => Ok(Box::new(IcedCpu::open_x86_64())),
         _ => Ok(Box::new(JitCpu::open_x86_64())),
+    }
+}
+
+/// Open a CPU backend and return the engine together with its shared JIT state.
+///
+/// Bundled CPU backend: engine + optional shared state for per-thread workers.
+pub enum CpuBackend {
+    /// Cranelift JIT: engine + shared compilation cache.
+    Jit {
+        engine: Box<dyn CpuEngine>,
+        shared: Arc<crate::jit::JitShared>,
+    },
+    /// iced-x86 interpreter: standalone engine + shared guest memory.
+    Iced {
+        engine: Box<dyn CpuEngine>,
+        guest_mem: Arc<RwLock<GuestMemory>>,
+    },
+}
+
+impl CpuBackend {
+    pub fn engine(&self) -> &dyn CpuEngine {
+        match self {
+            Self::Jit { engine, .. } | Self::Iced { engine, .. } => &**engine,
+        }
+    }
+    pub fn engine_mut(&mut self) -> &mut dyn CpuEngine {
+        match self {
+            Self::Jit { engine, .. } | Self::Iced { engine, .. } => &mut **engine,
+        }
+    }
+    pub fn into_engine(self) -> Box<dyn CpuEngine> {
+        match self {
+            Self::Jit { engine, .. } | Self::Iced { engine, .. } => engine,
+        }
+    }
+    pub fn shared_jit(&self) -> Option<&Arc<crate::jit::JitShared>> {
+        match self {
+            Self::Jit { shared, .. } => Some(shared),
+            Self::Iced { .. } => None,
+        }
+    }
+}
+
+/// Open the default CPU backend (JIT or `WIE_CPU=iced`).
+///
+/// # Errors
+/// Backend open failure.
+pub fn open_cpu() -> Result<CpuBackend, CpuError> {
+    let name = active_backend_name();
+    tracing::info!(backend = name, "opening WIE CPU backend");
+    if name == "iced" {
+        let cpu = IcedCpu::open_x86_64();
+        let guest_mem = Arc::clone(cpu.guest_mem_arc());
+        Ok(CpuBackend::Iced {
+            engine: Box::new(cpu),
+            guest_mem,
+        })
+    } else {
+        let cpu = JitCpu::open_x86_64();
+        let shared = Arc::clone(cpu.shared_jit());
+        Ok(CpuBackend::Jit {
+            engine: Box::new(cpu),
+            shared,
+        })
     }
 }
 

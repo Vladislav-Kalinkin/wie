@@ -1,42 +1,43 @@
 //! iced-x86 interpreter backend (WIE Phase 1). x86-64 only.
 
 use crate::exec::{self, HookWindow, StepResult};
-// Re-export for JIT host-stop checks.
 use crate::mem::{GuestMemory, GuestRegion};
 use crate::regs::RegFile;
 use crate::{CodeHookOutcome, InvalidMemoryAccess};
 use crate::{CpuEngine, CpuError, RunUntilHook};
+use std::sync::{Arc, RwLock};
 
-/// Power-of-two RIP ring capacity (mask indexing avoids `%` side-effect lints).
+fn lock_rd<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_wr<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 const RIP_TRACE_CAP: usize = 32;
 const RIP_TRACE_MASK: usize = RIP_TRACE_CAP - 1;
 
 /// Software x86-64 CPU using iced-x86 decode + interpret.
 ///
-/// Universal PE64 backend — no app-specific shortcuts. Completeness grows with
-/// the implemented mnemonic set in [`crate::exec`].
-///
-/// # Safety / `Send`
-/// Guest memory arenas are process-private; MT.2 serializes access with a
-/// process mutex before moving the engine across host threads.
+/// Guest memory is shared behind `Arc<RwLock<>>` so per-thread `IcedCpu`
+/// engines can read page tables and guest memory concurrently, while
+/// structural mutations (map, protect, VirtualAlloc) take exclusive access.
 pub struct IcedCpu {
-    mem: GuestMemory,
+    mem: Arc<RwLock<GuestMemory>>,
     regs: RegFile,
     hooks: Option<HookWindow>,
-    /// Recent RIP history for diagnostics (ring buffer).
     rip_trace: [u64; RIP_TRACE_CAP],
     rip_trace_i: usize,
     rip_trace_n: usize,
-    /// Instructions retired via interpreter (Phase 0 baselines).
     iced_steps: u64,
 }
 
 impl IcedCpu {
-    /// Create a fresh x86-64 interpreter instance.
     #[must_use]
     pub fn open_x86_64() -> Self {
         Self {
-            mem: GuestMemory::new(),
+            mem: Arc::new(RwLock::new(GuestMemory::new())),
             regs: RegFile::new(),
             hooks: None,
             rip_trace: [0; RIP_TRACE_CAP],
@@ -46,7 +47,39 @@ impl IcedCpu {
         }
     }
 
-    /// Interpreter step counter (also used when JIT falls back to iced).
+    #[must_use]
+    pub fn new_shared(source: &Self) -> Self {
+        Self {
+            mem: Arc::clone(&source.mem),
+            regs: RegFile::new(),
+            hooks: None,
+            rip_trace: [0; RIP_TRACE_CAP],
+            rip_trace_i: 0,
+            rip_trace_n: 0,
+            iced_steps: 0,
+        }
+    }
+
+    /// Create a temporary IcedCpu from a shared `GuestMemory` handle, used
+    /// only as a source for [`Self::new_shared`] when spawning workers.
+    #[must_use]
+    pub fn new_standalone_with_mem(mem: Arc<RwLock<GuestMemory>>) -> Self {
+        Self {
+            mem,
+            regs: RegFile::new(),
+            hooks: None,
+            rip_trace: [0; RIP_TRACE_CAP],
+            rip_trace_i: 0,
+            rip_trace_n: 0,
+            iced_steps: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn guest_mem_arc(&self) -> &Arc<RwLock<GuestMemory>> {
+        &self.mem
+    }
+
     #[must_use]
     pub fn iced_steps(&self) -> u64 {
         self.iced_steps
@@ -63,7 +96,6 @@ impl IcedCpu {
         }
     }
 
-    /// Recent RIP values (oldest → newest), for crash diagnostics.
     #[must_use]
     pub fn rip_trace_vec(&self) -> Vec<u64> {
         let n = self.rip_trace_n;
@@ -78,53 +110,48 @@ impl IcedCpu {
         out
     }
 
-    /// Expose registers for tests / debugging.
     #[must_use]
     pub fn regs(&self) -> &RegFile {
         &self.regs
     }
 
-    /// Mutable registers for tests.
     pub fn regs_mut(&mut self) -> &mut RegFile {
         &mut self.regs
     }
 
-    /// Runtime hook window (JIT consults stop-bitmap before entering a block).
     #[must_use]
+    #[expect(dead_code)]
     pub(crate) fn hooks_ref(&self) -> Option<&HookWindow> {
         self.hooks.as_ref()
     }
 
-    /// Read guest bytes without going through the `CpuEngine` trait (JIT decode).
+    #[expect(dead_code)]
     pub(crate) fn mem_read_into(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.mem.read(address, bytes)
+        lock_rd(&self.mem).read(address, bytes)
     }
 
-    /// Mutable guest memory pointer for JIT host load/store callbacks.
-    pub(crate) fn guest_mem_mut(&mut self) -> &mut GuestMemory {
-        &mut self.mem
+    #[expect(dead_code)]
+    pub(crate) fn guest_mem_mut(&mut self) -> impl std::ops::DerefMut<Target = GuestMemory> + '_ {
+        lock_wr(&self.mem)
     }
 
-    /// Immutable guest memory (code invalidation span lookup, etc.).
-    pub(crate) fn guest_mem(&self) -> &GuestMemory {
-        &self.mem
+    #[expect(dead_code)]
+    pub(crate) fn guest_mem(&self) -> impl std::ops::Deref<Target = GuestMemory> + '_ {
+        lock_rd(&self.mem)
     }
 
-    /// One step returning the raw [`StepResult`] (shared by `step_once` and JIT fallback).
     pub(crate) fn step_once_result(&mut self) -> Result<StepResult, CpuError> {
         self.push_rip_trace(self.regs.rip);
         let hook = self.hooks.as_ref();
-        let result = exec::step(&mut self.mem, &mut self.regs, hook)?;
+        let mem_guard = lock_rd(&self.mem);
+        let result = exec::step(&mem_guard, &mut self.regs, hook)?;
+        drop(mem_guard);
         if matches!(result, StepResult::Continue) {
             self.iced_steps = self.iced_steps.saturating_add(1);
         }
         Ok(result)
     }
 
-    /// Execute a single instruction at the current `RIP`.
-    ///
-    /// # Errors
-    /// Decode/execute failure, invalid memory, or host-stop hit.
     pub fn step_once(&mut self) -> Result<(), CpuError> {
         match self.step_once_result()? {
             StepResult::Continue => Ok(()),
@@ -141,23 +168,23 @@ impl IcedCpu {
 
 impl CpuEngine for IcedCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.mem.map(address, size, perms)
+        lock_wr(&self.mem).map(address, size, perms)
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        self.mem.write(address, bytes)
+        lock_rd(&self.mem).write(address, bytes)
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.mem.read(address, bytes)
+        lock_rd(&self.mem).read(address, bytes)
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        self.mem.host_span(address, len, write)
+        lock_rd(&self.mem).host_span(address, len, write)
     }
 
     fn mem_generation(&self) -> u64 {
-        self.mem.generation()
+        lock_rd(&self.mem).generation()
     }
 
     fn virtual_alloc(
@@ -167,11 +194,11 @@ impl CpuEngine for IcedCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        self.mem.virtual_alloc(addr, size, alloc_type, protect)
+        lock_wr(&self.mem).virtual_alloc(addr, size, alloc_type, protect)
     }
 
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
-        self.mem.virtual_free(addr, size, free_type)
+        lock_wr(&self.mem).virtual_free(addr, size, free_type)
     }
 
     fn virtual_protect(
@@ -180,27 +207,26 @@ impl CpuEngine for IcedCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        self.mem.virtual_protect(addr, size, new_protect)
+        lock_wr(&self.mem).virtual_protect(addr, size, new_protect)
     }
 
     fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
-        self.mem.virtual_query(addr)
+        lock_rd(&self.mem).virtual_query(addr)
     }
 
     fn mem_map_image(&mut self, address: u64, size: usize, perms: u32) -> Result<(), CpuError> {
-        self.mem.map_image(address, size, perms)
+        lock_wr(&self.mem).map_image(address, size, perms)
     }
 
     fn register_region(&mut self, region: GuestRegion) {
-        self.mem.register_region(region);
+        lock_wr(&self.mem).register_region(region);
     }
 
     fn find_region(&self, va: u64) -> Option<GuestRegion> {
-        self.mem.find_region(va).cloned()
+        lock_rd(&self.mem).find_region(va).cloned()
     }
 
     fn cpu_stats(&self) -> Option<crate::JitStats> {
-        // Pure iced backend: report step count in the shared stats shape.
         Some(crate::JitStats {
             iced_insns: self.iced_steps,
             ..crate::JitStats::default()
@@ -208,7 +234,7 @@ impl CpuEngine for IcedCpu {
     }
 
     fn mem_backend_name(&self) -> &'static str {
-        self.mem.backend_name()
+        lock_rd(&self.mem).backend_name()
     }
 
     fn install_runtime_hooks(
@@ -243,29 +269,23 @@ impl CpuEngine for IcedCpu {
         _hook_end: u64,
     ) -> Result<RunUntilHook, CpuError> {
         self.regs.rip = begin;
-        let budget = if count == 0 {
-            // Unicorn: 0 means unlimited; keep a hard cap so a bug cannot hang forever.
-            100_000_000_usize
-        } else {
-            count
-        };
+        let budget = if count == 0 { 100_000_000_usize } else { count };
 
         let mut executed = 0_usize;
         while executed < budget {
-            // Unicorn: stop when RIP reaches `until` (before executing that address).
             if until != 0 && self.regs.rip == until {
                 break;
             }
 
             let rip_before = self.regs.rip;
-            // Sampled RIP history (every 16th) — full every-insn ring was pure overhead
-            // on the open-rom hot path (~97% emu wall). Fault path still has recent samples.
             if executed.is_multiple_of(16) {
                 self.push_rip_trace(rip_before);
             }
             let hook_ref = self.hooks.as_ref();
-            match exec::step(&mut self.mem, &mut self.regs, hook_ref) {
+            let mem_guard = lock_rd(&self.mem);
+            match exec::step(&mem_guard, &mut self.regs, hook_ref) {
                 Ok(StepResult::Continue) => {
+                    drop(mem_guard);
                     executed = executed.saturating_add(1);
                     self.iced_steps = self.iced_steps.saturating_add(1);
                 }
@@ -307,7 +327,7 @@ impl CpuEngine for IcedCpu {
                         .iter()
                         .map(|r| format!("{r:#x}"))
                         .collect::<Vec<_>>()
-                        .join(" → ");
+                        .join(" -> ");
                     let r = &self.regs;
                     return Err(CpuError::Message(format!(
                         "{e}; iced_regs rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} \
@@ -352,9 +372,11 @@ impl CpuEngine for IcedCpu {
     fn return_from_win64_api(&mut self, rax: u64) -> Result<u64, CpuError> {
         let rsp = self.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
-        self.mem
+        let mem_guard = lock_rd(&self.mem);
+        mem_guard
             .read(rsp, &mut ret_bytes)
             .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
+        drop(mem_guard);
         let return_address = u64::from_le_bytes(ret_bytes);
         self.regs.set_rsp(rsp.wrapping_add(8));
         self.regs.set_rax(rax);
@@ -426,7 +448,5 @@ impl CpuEngine for IcedCpu {
         self.regs.restore(ctx);
     }
 
-    fn on_thread_switch(&mut self) {
-        // Interpreter has no sticky TLB/pins.
-    }
+    fn on_thread_switch(&mut self) {}
 }

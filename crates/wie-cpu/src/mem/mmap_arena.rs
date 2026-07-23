@@ -83,16 +83,20 @@ impl GuestMemBackend for MmapArenaBackend {
         self.arenas.read(address, bytes)
     }
 
-    fn page_data_ptr(&mut self, page_key: u64) -> Option<*mut u8> {
-        self.arenas.page_data_ptr(page_key)
-    }
-
-    fn page_data_ptr_walk(&self, page_key: u64) -> Option<*mut u8> {
+    fn page_data_ptr(&self, page_key: u64) -> Option<*mut u8> {
         self.arenas.page_data_ptr(page_key)
     }
 
     fn name(&self) -> &'static str {
         "mmap"
+    }
+}
+
+impl MmapArenaBackend {
+    /// Lock-free host pointer for data-plane write (no arena mutation).
+    #[inline]
+    pub(super) fn write_ptr(&self, address: u64) -> Option<*mut u8> {
+        self.arenas.write_ptr(address)
     }
 }
 

@@ -8,11 +8,11 @@ use crate::memory::{
     DEFAULT_LAYOUT, RuntimeMemoryLayout, build_default_environment_strings_w,
     default_winapi_environment, default_winapi_state, write_process_identity_strings,
 };
-use crate::mt_runtime::ProcessResources;
+use crate::mt_runtime::{ProcessConfig, ProcessResources};
 use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 /// Bootstrap options for a new guest session (argv / stdin injection).
@@ -473,7 +473,7 @@ fn register_layout_regions(
 /// The session owns the CPU engine, guest memory, WinAPI state and
 /// dispatcher metadata so execution can yield and later resume.
 pub struct RuntimeSession {
-    /// CPU + WinAPI (local until first `CreateThread`, then shared).
+    /// CPU + WinAPI (single struct for both JIT and Iced).
     process: ProcessResources,
     entry_point_va: u64,
     initial_rsp: u64,
@@ -494,6 +494,9 @@ struct SessionInit {
     winapi_state: wie_winapi::WinApiState,
     soft_apis: SoftApiTable,
     layout: RuntimeMemoryLayout,
+    stop_bitmap: Vec<u8>,
+    shared_jit: Option<Arc<wie_cpu::JitShared>>,
+    guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
     entry_point_va: u64,
     initial_rsp: u64,
 }
@@ -501,22 +504,50 @@ struct SessionInit {
 impl RuntimeSession {
     fn from_init(init: SessionInit) -> Self {
         let profile_enabled = std::env::var_os("WIE_RUNTIME_PROFILE").is_some();
+        let entry_point_va = init.entry_point_va;
+        let initial_rsp = init.initial_rsp;
+        let process = Self::build_process(init);
         Self {
-            process: ProcessResources::new(
-                init.engine,
-                init.winapi_state,
-                init.soft_apis,
-                init.environment,
-                init.layout,
-            ),
-            entry_point_va: init.entry_point_va,
-            initial_rsp: init.initial_rsp,
+            process,
+            entry_point_va,
+            initial_rsp,
             next_api_index: 0,
             no_hook_slices: 0,
             pending_callbacks: Vec::new(),
             profile_enabled,
             profile: RuntimeProfile::default(),
             last_published_last_error: None,
+        }
+    }
+
+    fn build_process(init: SessionInit) -> ProcessResources {
+        let SessionInit {
+            engine,
+            environment,
+            winapi_state,
+            soft_apis,
+            layout,
+            stop_bitmap,
+            shared_jit,
+            guest_mem,
+            ..
+        } = init;
+        let config = ProcessConfig {
+            soft_apis,
+            environment,
+            layout,
+            stop_bitmap,
+            primary_tid: wie_winapi::PRIMARY_THREAD_ID,
+        };
+        let shared_winapi = Arc::new(Mutex::new(winapi_state));
+
+        ProcessResources {
+            config,
+            engine,
+            shared_jit,
+            guest_mem,
+            shared_winapi,
+            worker_joins: Vec::new(),
         }
     }
 
@@ -603,8 +634,12 @@ impl RuntimeSession {
         let image_size =
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
 
-        // WIE CPU backend (Unicorn default; `WIE_CPU=iced` for interpreter).
-        let mut engine = crate::open_default_cpu().context("failed to open WIE CPU backend")?;
+        // WIE CPU backend (JIT default; `WIE_CPU=iced` for interpreter).
+        let backend = wie_cpu::open_cpu().context("failed to open WIE CPU backend")?;
+        let (mut engine, shared_jit, guest_mem) = match backend {
+            wie_cpu::CpuBackend::Jit { engine, shared } => (engine, Some(shared), None),
+            wie_cpu::CpuBackend::Iced { engine, guest_mem } => (engine, None, Some(guest_mem)),
+        };
 
         // Phase 3.3: one MEM_IMAGE arena, temporary RWX — headers/sections/IAT
         // are written directly into guest memory (no intermediate Vec<u8> buffer).
@@ -815,7 +850,7 @@ impl RuntimeSession {
         }
 
         engine
-            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap)
+            .install_runtime_hooks(layout.fake_api_base, fake_api_end, stop_bitmap.clone())
             .context("failed to install persistent runtime hooks")?;
 
         // Selective precompile: only in-guest stubs (GetLastError / CS / …).
@@ -1033,6 +1068,9 @@ impl RuntimeSession {
             winapi_state,
             soft_apis,
             layout,
+            stop_bitmap,
+            shared_jit,
+            guest_mem,
             entry_point_va: image_summary.entry_point_va,
             initial_rsp,
         });
@@ -1123,7 +1161,7 @@ impl RuntimeSession {
     /// Returns the guest memory layout used by this session.
     #[must_use]
     pub fn layout(&self) -> RuntimeMemoryLayout {
-        self.process.layout
+        *self.process.layout()
     }
 
     /// Changes the behavior of `GetMessageA` when the queue is empty.
@@ -1140,10 +1178,10 @@ impl RuntimeSession {
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
     /// or processes `max_api` additional API calls.
     pub fn run_until_stop(&mut self, max_api: usize) -> Result<RuntimeRunSummary> {
-        let layout = self.process.layout;
-        let environment = self.process.environment;
-        let soft_apis = self.process.soft_apis.clone();
-        let primary_tid = self.process.primary_tid;
+        let layout = *self.process.layout();
+        let environment = *self.process.environment();
+        let soft_apis = self.process.soft_apis().clone();
+        let primary_tid = self.process.primary_tid();
 
         let fake_api_size_u64 =
             u64::try_from(layout.fake_api_size).context("fake API size does not fit u64")?;
@@ -1201,7 +1239,8 @@ impl RuntimeSession {
 
                 // Ensure primary TLS/TID active when shared with workers.
                 if winapi_state.threads.active.tid != primary_tid {
-                    crate::mt_runtime::load_thread(engine, winapi_state, primary_tid);
+                    // Per-thread engines: primary regs are in `engine`, no context restore needed.
+                    winapi_state.threads.activate(primary_tid);
                 }
 
                 let current_rip = engine
@@ -1609,11 +1648,9 @@ impl RuntimeSession {
                                         continue 'outer;
                                     }
                                     Some(wie_winapi::WinApiControlSignal::HostPark { reason }) => {
-                                        crate::mt_runtime::save_thread(
-                                            engine,
-                                            winapi_state,
-                                            primary_tid,
-                                        );
+                                        // Per-thread engine: primary regs are already in `engine`;
+                                        // only persist thread bookkeeping for TLS tracking.
+                                        winapi_state.threads.save_active();
                                         quantum = Quantum::Park(*reason);
                                     }
                                     Some(wie_winapi::WinApiControlSignal::ExitThread { code }) => {
@@ -1668,9 +1705,9 @@ impl RuntimeSession {
                                 .process
                                 .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
                             q.park_brief();
-                            // Retry Enter: restore primary regs; RIP still at API.
-                            self.process.with_mut(|eng, st| {
-                                crate::mt_runtime::load_thread(eng, st, primary_tid);
+                            // Retry Enter: per-thread engine keeps primary regs; only restore TLS.
+                            self.process.with_mut(|_eng, st| {
+                                st.threads.activate(primary_tid);
                             });
                             // Do not charge API index again — undo increment.
                             self.next_api_index = self.next_api_index.saturating_sub(1);
@@ -1686,9 +1723,10 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                crate::mt_runtime::load_thread(eng, st, primary_tid);
-                                drop(eng.return_from_win64_api(u64::from(result)));
-                                crate::mt_runtime::save_thread(eng, st, primary_tid);
+                                st.threads.activate(primary_tid);
+                                let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
+                                    tracing::error!("guest stack corrupted on wait park: {e}")
+                                });
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
@@ -1713,9 +1751,10 @@ impl RuntimeSession {
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
-                                crate::mt_runtime::load_thread(eng, st, primary_tid);
-                                drop(eng.return_from_win64_api(u64::from(result)));
-                                crate::mt_runtime::save_thread(eng, st, primary_tid);
+                                st.threads.activate(primary_tid);
+                                let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
+                                    tracing::error!("guest stack corrupted on wait park: {e}")
+                                });
                             });
                             charged_api = charged_api.saturating_add(1);
                         }
@@ -1896,7 +1935,7 @@ impl RuntimeSession {
         outer_name: &str,
         outer_fake_va: u64,
     ) -> Result<()> {
-        let trampoline = self.process.layout.callback_return_trampoline_va;
+        let trampoline = self.process.layout().callback_return_trampoline_va;
         let dispatch_rsp = self.process.with_mut(|engine, _| {
             crate::guest_callback::install_guest_callback_frame(engine, &request, trampoline)
         })?;

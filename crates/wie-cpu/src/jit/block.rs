@@ -1,6 +1,7 @@
 //! Decode a lowerable straight-line block for Cranelift (GPR + simple mem + jcc/jmp term).
 
-use crate::iced_cpu::IcedCpu;
+use crate::exec::HookWindow;
+use crate::mem::GuestMemory;
 use iced_x86::{Decoder, DecoderOptions, Instruction, MemorySize, Mnemonic, OpKind, Register};
 
 /// Max instructions per compiled block (keeps compile time bounded).
@@ -53,13 +54,17 @@ pub(super) enum BlockKind {
 ///
 /// A near `jcc`/`jmp` terminator is **included** and ends the block. Other
 /// non-lowerable insns are **not** included (interpreter runs them next).
-pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
+pub(super) fn decode_pure_gpr_block(
+    mem: &GuestMemory,
+    hooks: Option<&HookWindow>,
+    start: u64,
+) -> BlockKind {
     let mut insns = Vec::with_capacity(MAX_BLOCK_INSNS);
     let mut rip = start;
     let mut bytes_len = 0_u32;
     let mut term: Option<BlockTerm> = None;
 
-    if let Some(h) = cpu.hooks_ref()
+    if let Some(h) = hooks
         && h.should_host_stop(start)
     {
         return BlockKind::NotPure;
@@ -67,7 +72,7 @@ pub(super) fn decode_pure_gpr_block(cpu: &IcedCpu, start: u64) -> BlockKind {
 
     for _ in 0..MAX_BLOCK_INSNS {
         let mut buf = [0_u8; 15];
-        if cpu.mem_read_into(rip, &mut buf).is_err() {
+        if mem.read(rip, &mut buf).is_err() {
             break;
         }
         let mut decoder = Decoder::with_ip(64, &buf, rip, DecoderOptions::NONE);

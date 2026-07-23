@@ -881,7 +881,7 @@ unsafe fn tlb_page_ptr(ctx: &mut JitCtx, addr: u64, size: usize, write: bool) ->
     }
     // Miss: resolve via GuestMemory (committed + protect meta + host ptr).
     // SAFETY: `mem` set by `run_compiled` to the live guest map.
-    let mem = unsafe { &mut *ctx.mem };
+    let mem = unsafe { &*ctx.mem };
     let Some(entry) = mem
         .page_tlb_entry_walk(page_key)
         .or_else(|| mem.page_tlb_entry(page_key))
@@ -925,7 +925,7 @@ pub(super) unsafe extern "C" fn wie_jit_host_span(
         return 0;
     }
     // SAFETY: mem pointer set by run_compiled.
-    let mem = unsafe { &mut *ctx.mem };
+    let mem = unsafe { &*ctx.mem };
     match mem.host_span(guest_va, len_usize, write != 0) {
         Some(p) if !p.is_null() => p as u64,
         _ => 0,
@@ -1020,7 +1020,7 @@ pub(super) unsafe extern "C" fn wie_jit_load(
     }
     // Slow path: multi-page, miss, or SPC deny on TLB.
     // SAFETY: `mem` set by `run_compiled`.
-    let mem = unsafe { &mut *ctx.mem };
+    let mem = unsafe { &*ctx.mem };
     let mut buf = [0_u8; 8];
     if mem.read(addr, &mut buf[..size_usize]).is_err() {
         set_fault(ctx, insn_ip, addr, size, 0);
@@ -1064,7 +1064,7 @@ pub(super) unsafe extern "C" fn wie_jit_store(
         return;
     }
     // SAFETY: `mem` set by `run_compiled`.
-    let mem = unsafe { &mut *ctx.mem };
+    let mem = unsafe { &*ctx.mem };
     if mem.write(addr, &bytes[..size_usize]).is_err() {
         set_fault(ctx, insn_ip, addr, size, 1);
     }
@@ -1115,7 +1115,7 @@ pub(super) unsafe extern "C" fn wie_jit_string(
     regs.rip = insn_ip;
 
     // SAFETY: mem pointer set by run_compiled.
-    let mem = unsafe { &mut *ctx.mem };
+    let mem = unsafe { &*ctx.mem };
     match exec::run_string_op(mem, &mut regs, kind, size_usize, rep, repe, repne) {
         Ok(stay) => {
             for i in 0..16 {
