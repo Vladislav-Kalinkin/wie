@@ -476,11 +476,83 @@ pub fn virtual_unwind(
         let mut h_buf = [0_u8; 8];
         read_mem(data_off, &mut h_buf)?;
         let hrva = u32::from_le_bytes([h_buf[0], h_buf[1], h_buf[2], h_buf[3]]);
-        let hdata = u32::from_le_bytes([h_buf[4], h_buf[5], h_buf[6], h_buf[7]]);
+        // Mingw-w64 stores handler_data as a 16-bit offset within .xdata
+        // at bytes 6-7.  Bytes 4-5 are padding/alignment.
+        let hdata = u32::from(u16::from_le_bytes([h_buf[6], h_buf[7]]));
         Ok(UnwindResult { ctx, handler_rva: Some(hrva), handler_data: Some(hdata) })
     } else {
         Ok(UnwindResult { ctx, handler_rva: None, handler_data: None })
     }
+}
+
+/// Parse the Itanium LSDA call-site table and find the landing pad for `control_pc`.
+///
+/// Returns `(landing_pad_va, action_index)` or `None` if no handler is found.
+pub fn find_landing_pad(
+    read_mem: &mut MemRead<'_>,
+    lsda_va: u64,
+    _image_base: u64,
+    func_start: u64,
+    _func_end: u64,
+    control_pc: u64,
+) -> Option<(u64, u64)> {
+    // Read LSDA header: 3 encoding bytes
+    let mut hdr = [0u8; 3];
+    read_mem(lsda_va, &mut hdr).ok()?;
+    let lp_enc = hdr[0];
+    let ttype_enc = hdr[1];
+    let cs_enc = hdr[2];
+    
+    // Advance cursor past variable-length header
+    let mut cursor = lsda_va + 3;
+    // Skip LPStart value (present when encoding != 0xFF)
+    if lp_enc != 0xFF { cursor += 8; } // assume absptr 8 bytes
+    // Skip ttype offset (ULEB128, present when encoding != 0xFF)
+    if ttype_enc != 0xFF {
+        loop { let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1; if b[0] & 0x80 == 0 { break; } }
+    }
+    
+    // Read call-site table length (ULEB128)
+    let mut cs_len = 0u64;
+    let mut sft = 0;
+    loop {
+        let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1;
+        cs_len |= u64::from(b[0] & 0x7f) << sft;
+        if b[0] & 0x80 == 0 { break; }
+        sft += 7;
+    }
+    if cs_len == 0 { return None; }
+    let cs_end = cursor + cs_len;
+    
+    // Walk call-site entries
+    while cursor < cs_end {
+        // Entry format: ULEB128 for 0x01, or 4-byte fixed for other encodings
+        let (cs_s, cs_l, lp_off, _aidx) = match cs_enc {
+            0x01 => {
+                // ULEB128 encoding: (start, length, pad, action_index)
+                let mut u = |c: &mut u64| -> Option<u64> {
+                    let mut v = 0u64; let mut s = 0;
+                    loop { let mut b = [0u8; 1]; read_mem(*c, &mut b).ok()?; *c += 1;
+                           v |= u64::from(b[0] & 0x7f) << s; if b[0] & 0x80 == 0 { break; } s += 7; if s > 56 { return None; } }
+                    Some(v)
+                };
+                (u(&mut cursor)?, u(&mut cursor)?, u(&mut cursor)?, u(&mut cursor)?)
+            }
+            _ => {
+                let mut buf = [0u8; 16]; read_mem(cursor, &mut buf).ok()?; cursor += 16;
+                (u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])),
+                 u64::from(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])),
+                 u64::from(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])),
+                 u64::from(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])))
+            }
+        };
+        if lp_off == 0 { continue; }
+        if control_pc < func_start + cs_s || control_pc >= func_start + cs_s + cs_l {
+            continue;
+        }
+        return Some((func_start + lp_off, _aidx));
+    }
+    None
 }
 
 /// Unwind a leaf function (no unwind info).  Simply pops the return address.

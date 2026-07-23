@@ -1057,10 +1057,7 @@ impl RuntimeSession {
                 if let Some(raw) = pe_bytes.get(off..off.saturating_add(sz)) {
                     let entries = wie_winapi::exception::parse_pdata(raw);
                     if !entries.is_empty() {
-                        winapi_state
-                            .sync
-                            .function_tables
-                            .insert(image_summary.image_base, entries);
+                        winapi_state.sync.function_tables.insert(image_summary.image_base, entries);
                     }
                 }
             }
