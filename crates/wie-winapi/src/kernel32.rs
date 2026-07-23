@@ -6563,12 +6563,161 @@ fn handle_get_thread_priority(
 
 /// `RaiseException` — start SEH exception processing.
 ///
-/// No SEH dispatcher yet (see docs/cpp-exceptions.md Phase 4).
+/// Single-pass SEH dispatch: walks the handler chain via RtlVirtualUnwind,
+/// calls each frame's personality function (e.g. __gxx_personality_seh0),
+/// and transfers control to the catch block when found.
 fn handle_raise_exception(
-    _engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    anyhow::bail!("RaiseException: SEH dispatcher not yet implemented")
+    let exception_record_ptr = engine.read_rcx()?;
+
+    // Snapshot current guest register state into an UnwindContext.
+    let tctx = engine.snapshot_thread_context();
+    let rip = tctx.rip;
+    let rsp = engine.read_rsp()?;
+    let mut ctx = crate::exception::UnwindContext {
+        rip,
+        rsp,
+        gpr: tctx.gpr,
+    };
+
+    // Guest memory reader for the unwinder.  Uses a raw pointer to avoid
+    // conflicting with other mutable borrows of `engine` in the dispatch loop.
+    let engine_ptr: *mut dyn wie_cpu::CpuEngine = engine;
+    let mut read_mem = |va: u64, buf: &mut [u8]| {
+        #[expect(unsafe_code)]
+        unsafe { (*engine_ptr).mem_read(va, buf).map_err(|_| ()) }
+    };
+
+    // Walk frames looking for a handler.
+    let max_frames = 64; // safety limit
+    for _frame in 0..max_frames {
+        let entry = match crate::exception::lookup_function_entry(&state.sync, ctx.rip) {
+            Some(e) => e,
+            None => {
+                // Leaf function or no table — unwind blindly.
+                let mut rip_buf = [0_u8; 8];
+                if read_mem(ctx.rsp, &mut rip_buf).is_err() {
+                    break;
+                }
+                ctx.rip = u64::from_le_bytes(rip_buf);
+                ctx.rsp = ctx.rsp.saturating_add(8);
+                continue;
+            }
+        };
+
+        let result = match crate::exception::virtual_unwind(
+            &mut read_mem, entry.image_base, entry.entry, ctx,
+        ) {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+
+        if let (Some(handler_rva), Some(_handler_data)) = (result.handler_rva, result.handler_data) {
+            // Call the personality function as guest code.
+            let handler_va = entry.image_base.saturating_add(u64::from(handler_rva));
+
+            // Save current guest state.
+            let saved_rip = engine.read_rip()?;
+            let saved_rsp = engine.read_rsp()?;
+
+            // Set up arguments for personality(EXCEPTION_POINTERS*).
+            // EXCEPTION_POINTERS = { ExceptionRecord*, ContextRecord* }.
+            // We pass the exception record pointer and a pointer to a
+            // minimal CONTEXT we write to guest stack.
+            let stack_frame = saved_rsp.saturating_sub(0x100); // make room
+            let context_ptr = stack_frame;
+            let except_ptrs_ptr = stack_frame.saturating_add(0x80);
+
+            // Write a minimal CONTEXT64 at context_ptr.
+            // We only need Rip, Rsp, and nonvolatile GPRs for the handler.
+            let mut ctx_buf = [0_u8; 256];
+            // ContextFlags = 0x10001F (CONTEXT_ALL)
+            ctx_buf[0..4].copy_from_slice(&0x0010_001F_u32.to_le_bytes());
+            // Rip at offset 0xF8
+            ctx_buf[0xF8..0x100].copy_from_slice(&ctx.rip.to_le_bytes());
+            // Rsp at offset 0x98
+            ctx_buf[0x98..0xA0].copy_from_slice(&ctx.rsp.to_le_bytes());
+            // Write nonvolatile GPRs (Rbx offset 0xA8, Rbp 0xB0, etc.)
+            // Simplified: just write the key ones
+            ctx_buf[0xA8..0xB0].copy_from_slice(&ctx.gpr[3].to_le_bytes()); // Rbx
+            ctx_buf[0xB0..0xB8].copy_from_slice(&ctx.gpr[5].to_le_bytes()); // Rbp
+
+            engine.mem_write(context_ptr, &ctx_buf).ok();
+            // EXCEPTION_POINTERS at except_ptrs_ptr
+            engine.mem_write(except_ptrs_ptr, &exception_record_ptr.to_le_bytes()).ok();
+            engine
+                .mem_write(
+                    except_ptrs_ptr.saturating_add(8),
+                    &context_ptr.to_le_bytes(),
+                )
+                .ok();
+
+            // Set up the guest call: RCX = EXCEPTION_POINTERS*, RIP = handler.
+            engine.write_rcx(except_ptrs_ptr)?;
+            engine.write_rsp(stack_frame.saturating_sub(32))?; // shadow space
+            engine.write_rip(handler_va)?;
+
+            // Run the personality function (limited budget — it should return quickly).
+            let hook = engine.run_until_stop(
+                handler_va, 0, 0, 100_000,
+                0, 0, // hook range unused
+            );
+
+            // Restore saved RIP/RSP (the personality function may have changed them).
+            let disposition = engine.read_rax()? as u32;
+
+            match hook {
+                Ok(_) => {
+                    // Personality returned.  Check disposition.
+                    // ExceptionContinueSearch (1) = not handled, keep unwinding.
+                    // ExceptionCollidedUnwind (3) = handler found on search pass.
+                    if disposition == 1 {
+                        // Continue searching — advance to caller frame.
+                        ctx = result.ctx;
+                        continue;
+                    }
+                    if disposition == 3 {
+                        // Handler found!  The personality modified the CONTEXT
+                        // to point at the catch block.  Restore guest state from
+                        // the modified CONTEXT.
+                        let mut final_ctx = [0_u8; 256];
+                        if engine.mem_read(context_ptr, &mut final_ctx).is_ok() {
+                            let catch_rip = u64::from_le_bytes(
+                                final_ctx[0xF8..0x100].try_into().unwrap_or([0; 8]),
+                            );
+                            let catch_rsp = u64::from_le_bytes(
+                                final_ctx[0x98..0xA0].try_into().unwrap_or([0; 8]),
+                            );
+                            if catch_rip != 0 {
+                                engine.write_rip(catch_rip)?;
+                                engine.write_rsp(catch_rsp)?;
+                                // Return with a fake return address — the catch
+                                // block expects to have been "called" by the
+                                // personality function.  We set RIP directly
+                                // so no return_from_win64_api needed.
+                                return Ok(WinApiHandlerResult {
+                                    return_address: saved_rip, // won't be used
+                                    return_value: 0,
+                                });
+                            }
+                        }
+                        break; // failed to read back context
+                    }
+                    // Other dispositions — abort unwinding.
+                    break;
+                }
+                Err(_) => break, // personality function crashed
+            }
+        }
+
+        // Advance to the caller frame.
+        ctx = result.ctx;
+    }
+
+    // No handler found — terminate with a fatal error.
+    anyhow::bail!("RaiseException: no handler found (unhandled C++ exception)")
 }
 
 /// `SetEvent`.

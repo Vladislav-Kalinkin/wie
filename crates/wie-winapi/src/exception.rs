@@ -248,7 +248,7 @@ pub struct UnwindResult {
 // ── Virtual unwinding ──────────────────────────────────────────────────
 
 /// Guest memory reader callback: `fn(guest_va, buffer) -> Result`.
-pub type MemRead = dyn Fn(u64, &mut [u8]) -> Result<(), ()>;
+pub type MemRead<'a> = dyn FnMut(u64, &mut [u8]) -> Result<(), ()> + 'a;
 
 /// Reverse one function's prologue.  Given a `ctx` with RIP inside a
 /// function, returns the caller's context and any registered handler.
@@ -259,7 +259,7 @@ pub type MemRead = dyn Fn(u64, &mut [u8]) -> Result<(), ()>;
 /// * `entry` — the `RUNTIME_FUNCTION` entry for the function.
 /// * `ctx` — current register state.
 pub fn virtual_unwind(
-    read_mem: &MemRead,
+    read_mem: &mut MemRead<'_>,
     image_base: u64,
     entry: &RuntimeFunction,
     mut ctx: UnwindContext,
@@ -393,7 +393,7 @@ pub fn virtual_unwind(
 }
 
 /// Unwind a leaf function (no unwind info).  Simply pops the return address.
-fn unwind_leaf(read_mem: &MemRead, mut ctx: UnwindContext) -> Result<UnwindResult, ()> {
+fn unwind_leaf(read_mem: &mut MemRead<'_>, mut ctx: UnwindContext) -> Result<UnwindResult, ()> {
     let mut rip_buf = [0_u8; 8];
     read_mem(ctx.rsp, &mut rip_buf)?;
     ctx.rip = u64::from_le_bytes(rip_buf);
