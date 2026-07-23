@@ -19,6 +19,7 @@ mod guest_string;
 pub mod idle;
 pub mod kernel32;
 pub mod mingw_dispatch;
+pub mod seh;
 pub mod ole32;
 pub mod oleaut32;
 pub mod shell32;

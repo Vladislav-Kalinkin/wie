@@ -180,16 +180,18 @@ pub fn lookup_function_entry<'a>(
         let first_va = entries[0].begin_va(image_base);
         let last_va = entries.last()?.end_va(image_base);
         if control_pc < first_va || control_pc >= last_va {
+            tracing::debug!(control_pc = format_args!("{:#x}", control_pc), first_va = format_args!("{:#x}", first_va), last_va = format_args!("{:#x}", last_va), "lookup: out of range");
             continue;
         }
-        // Binary search by begin_address (RVA).
-        match entries.binary_search_by_key(&((control_pc - image_base) as u32), |e| e.begin_address)
-        {
+        let key = (control_pc - image_base) as u32;
+        match entries.binary_search_by_key(&key, |e| e.begin_address) {
             Ok(i) => return Some(FunctionEntry { entry: &entries[i], image_base }),
-            Err(0) => continue, // unreachable: range check above prevents this
+            Err(0) => { tracing::debug!(key, "lookup: before first entry"); continue; }
             Err(i) => {
                 let candidate = &entries[i - 1];
-                if (control_pc - image_base) < u64::from(candidate.end_address) {
+                let match_rva = control_pc - image_base;
+                tracing::debug!(key, candidate_begin = candidate.begin_address, candidate_end = candidate.end_address, "lookup: binary search miss, checking candidate");
+                if match_rva < u64::from(candidate.end_address) {
                     return Some(FunctionEntry { entry: candidate, image_base });
                 }
             }
