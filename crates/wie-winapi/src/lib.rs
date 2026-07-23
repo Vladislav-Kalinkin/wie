@@ -36,7 +36,7 @@ pub use sync_obj::{
     wait_multiple,
 };
 pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
-pub use exception::RuntimeFunction;
+pub use exception::{RuntimeFunction, lookup_function_entry};
 // HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
     COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,

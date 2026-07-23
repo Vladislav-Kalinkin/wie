@@ -158,3 +158,58 @@ pub mod uwop {
     pub const PUSH_MACHFRAME: u8 = 8;
 }
 
+// ── Function table lookup ──────────────────────────────────────────────
+
+/// Result of `RtlLookupFunctionEntry`: the found entry + its module base.
+#[derive(Debug, Clone, Copy)]
+pub struct FunctionEntry<'a> {
+    pub entry: &'a RuntimeFunction,
+    pub image_base: u64,
+}
+
+/// Look up the `RUNTIME_FUNCTION` covering `control_pc` from the registered
+/// function tables.  Binary search per-module.
+pub fn lookup_function_entry<'a>(
+    tables: &'a crate::sync_obj::SyncState,
+    control_pc: u64,
+) -> Option<FunctionEntry<'a>> {
+    for (&image_base, entries) in &tables.function_tables {
+        if entries.is_empty() {
+            continue;
+        }
+        let first_va = entries[0].begin_va(image_base);
+        let last_va = entries.last()?.end_va(image_base);
+        if control_pc < first_va || control_pc >= last_va {
+            continue;
+        }
+        // Binary search by begin_address (RVA).
+        match entries.binary_search_by_key(&((control_pc - image_base) as u32), |e| e.begin_address)
+        {
+            Ok(i) => return Some(FunctionEntry { entry: &entries[i], image_base }),
+            Err(0) => continue, // before the first entry
+            Err(i) => {
+                let candidate = &entries[i - 1];
+                if (control_pc - image_base) < u64::from(candidate.end_address) {
+                    return Some(FunctionEntry { entry: candidate, image_base });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse `.pdata` section bytes into a sorted `Vec<RuntimeFunction>`.
+/// Returns an empty vec if the section is empty or malformed.
+pub fn parse_pdata(bytes: &[u8]) -> Vec<RuntimeFunction> {
+    let count = bytes.len() / RuntimeFunction::SIZE;
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        if let Some(e) = RuntimeFunction::from_bytes(bytes, i * RuntimeFunction::SIZE) {
+            entries.push(e);
+        }
+    }
+    entries.sort_by_key(|e| e.begin_address);
+    entries
+}
+
+

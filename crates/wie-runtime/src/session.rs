@@ -1048,6 +1048,24 @@ impl RuntimeSession {
             let _ = winapi_state.sync.register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
         }
 
+        // Register .pdata function table for C++ exception handling.
+        // RtlLookupFunctionEntry needs this to find unwind info by RIP.
+        if let Some(pdata) = pe_map_plan.sections.iter().find(|s| s.name.starts_with(".pdata")) {
+            let off = pdata.pointer_to_raw_data as usize;
+            let sz = pdata.size_of_raw_data as usize;
+            if off > 0 && sz > 0 {
+                if let Some(raw) = pe_bytes.get(off..off.saturating_add(sz)) {
+                    let entries = wie_winapi::exception::parse_pdata(raw);
+                    if !entries.is_empty() {
+                        winapi_state
+                            .sync
+                            .function_tables
+                            .insert(image_summary.image_base, entries);
+                    }
+                }
+            }
+        }
+
         winapi_state.message_queue_idle_policy = idle_policy;
         winapi_state.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,

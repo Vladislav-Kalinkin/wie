@@ -43,6 +43,9 @@ pub struct SyncState {
     pub multi_wait: HashMap<u32, MultiWaitRequest>,
     /// Process is dying (`ExitProcess`); workers should stop.
     pub process_dying: bool,
+    /// Per-module function tables (image_base → sorted Vec of RuntimeFunction).
+    /// Used by `RtlLookupFunctionEntry` to find unwind info for a given RIP.
+    pub function_tables: HashMap<u64, Vec<crate::exception::RuntimeFunction>>,
 }
 
 /// Detached args for one `WaitForMultipleObjects` host park.
@@ -70,6 +73,7 @@ impl SyncState {
             suspended_spawns: HashMap::new(),
             multi_wait: HashMap::new(),
             process_dying: false,
+            function_tables: HashMap::new(),
         }
     }
 
