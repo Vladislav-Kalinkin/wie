@@ -304,10 +304,10 @@ pub fn virtual_unwind(
         match code.unwind_op {
             uwop::PUSH_NONVOL => {
                 let reg = usize::from(code.op_info);
-                rsp = rsp.saturating_sub(8);
                 let mut val_buf = [0_u8; 8];
                 read_mem(rsp, &mut val_buf).ok();
                 ctx.gpr[reg] = u64::from_le_bytes(val_buf);
+                rsp = rsp.saturating_add(8);
                 code_idx += 1;
             }
             uwop::ALLOC_LARGE => {
