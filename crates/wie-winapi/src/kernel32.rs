@@ -6466,59 +6466,55 @@ fn handle_duplicate_handle(
 
     // Resolve pseudohandles to real kernel objects.
     // Windows: (HANDLE)-1 = GetCurrentProcess, (HANDLE)-2 = GetCurrentThread.
-    let source_obj = if source_handle == u64::MAX {
-        // Current process pseudohandle: create a placeholder entry.
-        // WIE doesn't model process kernel objects — map to the primary
-        // thread so CloseHandle has something to remove.
-        state
-            .sync
-            .objects
-            .values()
-            .find_map(|obj| match obj {
-                crate::KernelObject::Thread(t)
-                    if t.tid == crate::PRIMARY_THREAD_ID =>
-                {
-                    Some(obj.clone())
-                }
-                _ => None,
-            })
-    } else if source_handle == u64::MAX - 1 {
-        // Current thread pseudohandle: find or create the active thread object.
-        let cur_tid = state.threads.current_tid();
-        state
-            .sync
-            .objects
-            .values()
-            .find_map(|obj| match obj {
-                crate::KernelObject::Thread(t) if t.tid == cur_tid => Some(obj.clone()),
-                _ => None,
-            })
-            .or_else(|| {
-                // Primary thread or late-discovered thread: create the object
-                // now so DuplicateHandle can return a real handle.
-                let (_, th_obj) = state
-                    .sync
-                    .register_thread(cur_tid, Default::default());
-                Some(crate::KernelObject::Thread(th_obj))
-            })
+    // Both are resolved to a ThreadObject for the calling thread.  WIE does
+    // not model process kernel objects — all handles map to threads.
+    let tid = if source_handle == u64::MAX || source_handle == u64::MAX - 1 {
+        // Pseudohandle → resolve the current TID.  For GetCurrentProcess we
+        // use the primary TID since there is no process object.
+        state.threads.current_tid()
     } else {
-        // Real kernel handle: lookup.
-        state.sync.objects.get(&source_handle).cloned()
-    };
-
-    let Some(obj) = source_obj else {
+        // Real kernel handle — skip resolution, lookup directly below.
+        let obj = state.sync.objects.get(&source_handle).cloned();
+        if let Some(obj) = obj {
+            let new_handle = state.sync.next_handle;
+            state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+            state.sync.objects.insert(new_handle, obj.clone());
+            if close_source {
+                state.sync.objects.remove(&source_handle);
+            }
+            engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(1)?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 1,
+            });
+        }
         state.last_error = ERROR_INVALID_HANDLE;
-        let return_address = engine.return_from_win64_api(0)?; // FALSE
+        let return_address = engine.return_from_win64_api(0)?;
         return Ok(WinApiHandlerResult {
             return_address,
             return_value: 0,
         });
     };
 
-    // Duplicate the object under a new handle.
+    // Pseudohandle path: find or create the ThreadObject for `tid`.
+    let source_obj = state
+        .sync
+        .objects
+        .values()
+        .find_map(|obj| match obj {
+            crate::KernelObject::Thread(t) if t.tid == tid => Some(obj.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            let (_, th) = state.sync.register_thread(tid, Default::default());
+            crate::KernelObject::Thread(th)
+        });
+
     let new_handle = state.sync.next_handle;
     state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
-    state.sync.objects.insert(new_handle, obj);
+    state.sync.objects.insert(new_handle, source_obj);
 
     // Honour DUPLICATE_CLOSE_SOURCE: close the source handle after duplication.
     if close_source && source_handle != u64::MAX && source_handle != u64::MAX - 1 {

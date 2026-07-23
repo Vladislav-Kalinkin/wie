@@ -1041,6 +1041,13 @@ impl RuntimeSession {
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
 
+        // Register the primary thread kernel object so DuplicateHandle
+        // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
+        {
+            let ctx = wie_cpu::ThreadContext::default();
+            let _ = winapi_state.sync.register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
+        }
+
         winapi_state.message_queue_idle_policy = idle_policy;
         winapi_state.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
