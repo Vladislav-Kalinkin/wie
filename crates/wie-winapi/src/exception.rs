@@ -56,7 +56,8 @@ impl RuntimeFunction {
 /// Header of the `UNWIND_INFO` structure.  Variable-length: followed by
 /// `CountOfCodes` × `UNWIND_CODE` (2 bytes each), optionally padded to
 /// 4-byte alignment, then the language-specific handler data if
-/// `Flags & UNW_FLAG_EHANDLER` (4-byte RVA of handler + 4-byte handler data).
+/// `Flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)` is set
+/// (4-byte RVA of handler + 4-byte handler data).
 #[derive(Debug, Clone, Copy)]
 pub struct UnwindInfo {
     /// Version (should be 1 for x64).
@@ -105,7 +106,8 @@ impl UnwindInfo {
         (unpadded + 3) & !3 // round up to 4
     }
 
-    /// Total size including handler RVA + data if any handler flag is set.
+    /// Total size including handler RVA + data if any handler flag is set
+    /// (`FLAG_EHANDLER`, `FLAG_UHANDLER`, or both).
     #[inline]
     pub fn total_size(&self) -> usize {
         let base = self.header_size();
