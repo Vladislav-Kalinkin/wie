@@ -197,7 +197,9 @@ fn execute_one(
         | Mnemonic::Out
         | Mnemonic::Outsb
         | Mnemonic::Outsw
-        | Mnemonic::Outsd => Ok(()),
+        | Mnemonic::Outsd
+        // SSSE3 byte-shuffle: no-op safe stub (CRT sometimes emits it).
+        | Mnemonic::Pshufb => Ok(()),
 
         Mnemonic::Mov => exec_mov(mem, regs, instr),
         Mnemonic::Movzx => exec_movzx(mem, regs, instr, false),
@@ -420,7 +422,6 @@ fn execute_one(
         // SSE2 unpack / shuffle (used by CRT memcpy/memset).
         Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => exec_sse_punpck(regs, instr),
         Mnemonic::Pshufd => exec_sse_pshufd(regs, instr),
-        Mnemonic::Pshufb => Ok(()), // SSSE3 — skip (byte-shuffle; no-op safe stub)
         Mnemonic::Addss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Add, false),
         Mnemonic::Subss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Sub, false),
         Mnemonic::Mulss => exec_sse_scalar_fp(mem, regs, instr, FpOp::Mul, false),
@@ -1313,12 +1314,8 @@ fn exec_sse_movhlps(
 
 /// `PUNPCKLQDQ` / `PUNPCKHQDQ` — unpack and interleave quadwords from two XMM registers.
 ///
-/// - `PUNPCKLQDQ xmm1, xmm2`:
-///     xmm1[63:0] = xmm1_orig[63:0]
-///     xmm1[127:64] = xmm2[63:0]
-/// - `PUNPCKHQDQ xmm1, xmm2`:
-///     xmm1[63:0] = xmm1_orig[127:64]
-///     xmm1[127:64] = xmm2[127:64]
+/// - `PUNPCKLQDQ xmm1, xmm2`: keep low half of dst, place low half of src in high half.
+/// - `PUNPCKHQDQ xmm1, xmm2`: place high half of dst in low half, high half of src in high half.
 fn exec_sse_punpck(
     regs: &mut RegFile,
     instr: &Instruction,

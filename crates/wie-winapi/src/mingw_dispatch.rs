@@ -58,14 +58,30 @@ pub fn dispatch_stdcpp(
             let rip = engine.read_rip()?;
             let rsp = engine.read_rsp()?;
             let rec = rsp.saturating_sub(0x100);
-            engine.mem_write(rec, &0xE06D7363_u32.to_le_bytes()).context("exc code")?;         // +0: ExceptionCode
-            engine.mem_write(rec + 4, &0_u32.to_le_bytes()).context("exc flags")?;              // +4: ExceptionFlags
-            engine.mem_write(rec + 8, &[0u8; 8]).context("exc record")?;                         // +8: ExceptionRecord (null)
-            engine.mem_write(rec + 16, &rip.to_le_bytes()).context("exc addr")?;                // +16: ExceptionAddress
-            engine.mem_write(rec + 24, &3_u32.to_le_bytes()).context("num params")?;            // +24: NumberParameters
-            engine.mem_write(rec + 32, &0x19930522_u64.to_le_bytes()).context("param0")?;       // +32: Parameters[0] (magic)
-            engine.mem_write(rec + 40, &exc_obj.to_le_bytes()).context("param1")?;              // +40: Parameters[1] (obj)
-            engine.mem_write(rec + 48, &typeinfo.to_le_bytes()).context("param2")?;             // +48: Parameters[2] (typeinfo)
+            engine
+                .mem_write(rec, &0xE06D_7363_u32.to_le_bytes())
+                .context("exc code")?;
+            engine
+                .mem_write(rec.saturating_add(4), &0_u32.to_le_bytes())
+                .context("exc flags")?;
+            engine
+                .mem_write(rec.saturating_add(8), &[0u8; 8])
+                .context("exc record")?;
+            engine
+                .mem_write(rec.saturating_add(16), &rip.to_le_bytes())
+                .context("exc addr")?;
+            engine
+                .mem_write(rec.saturating_add(24), &3_u32.to_le_bytes())
+                .context("num params")?;
+            engine
+                .mem_write(rec.saturating_add(32), &0x1993_0522_u64.to_le_bytes())
+                .context("param0")?;
+            engine
+                .mem_write(rec.saturating_add(40), &exc_obj.to_le_bytes())
+                .context("param1")?;
+            engine
+                .mem_write(rec.saturating_add(48), &typeinfo.to_le_bytes())
+                .context("param2")?;
 
             // Set RCX to point to the record and dispatch.
             engine.write_rcx(rec)?;

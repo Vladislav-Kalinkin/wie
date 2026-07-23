@@ -8,6 +8,20 @@
 //! - How to reverse the function's prologue during stack unwinding (`UNWIND_INFO` + `UNWIND_CODE`)
 //! - Where the language-specific exception handler lives (flags in `UNWIND_INFO`)
 
+// PE / UWOP interpreters use fixed field strides and guest-buffer indexes; saturating
+// every intermediate offset would obscure the PE layout. Bounds are checked via
+// `get` / `read_mem` failure, not panic-free arithmetic at every step.
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    clippy::integer_division,
+    clippy::match_same_arms,
+    clippy::result_unit_err,
+    clippy::needless_range_loop
+)]
+
 /// One entry in the `.pdata` section.  12 bytes.  4-byte aligned.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeFunction {
@@ -169,10 +183,10 @@ pub struct FunctionEntry<'a> {
 
 /// Look up the `RUNTIME_FUNCTION` covering `control_pc` from the registered
 /// function tables.  Binary search per-module.
-pub fn lookup_function_entry<'a>(
-    tables: &'a crate::sync_obj::SyncState,
+pub fn lookup_function_entry(
+    tables: &crate::sync_obj::SyncState,
     control_pc: u64,
-) -> Option<FunctionEntry<'a>> {
+) -> Option<FunctionEntry<'_>> {
     for (&image_base, entries) in &tables.function_tables {
         if entries.is_empty() {
             continue;
@@ -186,7 +200,9 @@ pub fn lookup_function_entry<'a>(
         let key = (control_pc - image_base) as u32;
         match entries.binary_search_by_key(&key, |e| e.begin_address) {
             Ok(i) => return Some(FunctionEntry { entry: &entries[i], image_base }),
-            Err(0) => { tracing::debug!(key, "lookup: before first entry"); continue; }
+            Err(0) => {
+                tracing::debug!(key, "lookup: before first entry");
+            }
             Err(i) => {
                 let candidate = &entries[i - 1];
                 let match_rva = control_pc - image_base;
@@ -248,10 +264,32 @@ impl UnwindContext {
 pub struct UnwindResult {
     /// Context of the caller frame.
     pub ctx: UnwindContext,
-    /// Handler RVA (guest address of the language-specific handler), if any.
+    /// Handler RVA (relative to image base) of the language-specific handler, if any.
     pub handler_rva: Option<u32>,
-    /// Handler data pointer, if any (passed to the handler as argument).
+    /// Raw DWORD immediately following the handler RVA in `.xdata`.
+    ///
+    /// ABI interpretation differs:
+    /// - **MSVC**: RVA of language data (`FuncInfo` / scope table) relative to image base.
+    /// - **Mingw-w64 SEH**: often a small offset from the `UNWIND_INFO` base (low 16 bits
+    ///   significant; high half may be zero/padding). See [`language_data_candidates`].
     pub handler_data: Option<u32>,
+}
+
+/// Candidate guest VAs for language-specific data (LSDA or FuncInfo).
+///
+/// Tries MSVC image-relative RVA first, then Mingw-style offsets from the
+/// `UNWIND_INFO` VA (full DWORD and low 16 bits). Deduplicates.
+pub fn language_data_candidates(
+    image_base: u64,
+    unwind_va: u64,
+    language_data: u32,
+) -> [u64; 3] {
+    let full = u64::from(language_data);
+    [
+        image_base.saturating_add(full),
+        unwind_va.saturating_add(full),
+        unwind_va.saturating_add(full & 0xffff),
+    ]
 }
 
 // ── Virtual unwinding ──────────────────────────────────────────────────
@@ -478,12 +516,19 @@ pub fn virtual_unwind(
         let mut h_buf = [0_u8; 8];
         read_mem(data_off, &mut h_buf)?;
         let hrva = u32::from_le_bytes([h_buf[0], h_buf[1], h_buf[2], h_buf[3]]);
-        // Mingw-w64 stores handler_data as a 16-bit offset within .xdata
-        // at bytes 6-7.  Bytes 4-5 are padding/alignment.
-        let hdata = u32::from(u16::from_le_bytes([h_buf[6], h_buf[7]]));
-        Ok(UnwindResult { ctx, handler_rva: Some(hrva), handler_data: Some(hdata) })
+        // Full language-data DWORD (MSVC: FuncInfo RVA; Mingw: offset packing).
+        let hdata = u32::from_le_bytes([h_buf[4], h_buf[5], h_buf[6], h_buf[7]]);
+        Ok(UnwindResult {
+            ctx,
+            handler_rva: Some(hrva),
+            handler_data: Some(hdata),
+        })
     } else {
-        Ok(UnwindResult { ctx, handler_rva: None, handler_data: None })
+        Ok(UnwindResult {
+            ctx,
+            handler_rva: None,
+            handler_data: None,
+        })
     }
 }
 

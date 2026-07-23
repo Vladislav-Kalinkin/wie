@@ -1,7 +1,17 @@
 //! Helpers for building SEH test fixtures without raw-byte manipulation.
 //! Only compiled in test configurations.
 
-#![allow(dead_code, unreachable_pub)]
+#![allow(
+    dead_code,
+    unreachable_pub,
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::return_self_not_must_use,
+    clippy::integer_division,
+    clippy::trivially_copy_pass_by_ref
+)]
 
 use super::exception::{RuntimeFunction, UnwindCode, UnwindInfo, UnwindContext, uwop};
 

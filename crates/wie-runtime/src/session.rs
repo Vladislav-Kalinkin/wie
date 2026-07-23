@@ -1051,14 +1051,18 @@ impl RuntimeSession {
         // Register .pdata function table for C++ exception handling.
         // RtlLookupFunctionEntry needs this to find unwind info by RIP.
         if let Some(pdata) = pe_map_plan.sections.iter().find(|s| s.name.starts_with(".pdata")) {
-            let off = pdata.pointer_to_raw_data as usize;
-            let sz = pdata.size_of_raw_data as usize;
-            if off > 0 && sz > 0 {
-                if let Some(raw) = pe_bytes.get(off..off.saturating_add(sz)) {
-                    let entries = wie_winapi::exception::parse_pdata(raw);
-                    if !entries.is_empty() {
-                        winapi_state.sync.function_tables.insert(image_summary.image_base, entries);
-                    }
+            let off = usize::try_from(pdata.pointer_to_raw_data).unwrap_or(0);
+            let sz = usize::try_from(pdata.size_of_raw_data).unwrap_or(0);
+            if off > 0
+                && sz > 0
+                && let Some(raw) = pe_bytes.get(off..off.saturating_add(sz))
+            {
+                let entries = wie_winapi::exception::parse_pdata(raw);
+                if !entries.is_empty() {
+                    winapi_state
+                        .sync
+                        .function_tables
+                        .insert(image_summary.image_base, entries);
                 }
             }
         }
@@ -1255,39 +1259,47 @@ impl RuntimeSession {
             let mut quantum = Quantum::Continue;
             let mut break_term: Option<EntryTraceTermination> = None;
 
+            // Activate primary under WinAPI lock only — pure guest run must not
+            // hold `shared_winapi` so worker quanta can overlap (per-thread engines).
             {
-                let mut pair = self.process.lock_pair();
-                let (engine, winapi_state) = pair.both();
-
-                // Ensure primary TLS/TID active when shared with workers.
-                if winapi_state.threads.active.tid != primary_tid {
-                    // Per-thread engines: primary regs are in `engine`, no context restore needed.
-                    winapi_state.threads.activate(primary_tid);
+                let mut st = self
+                    .process
+                    .shared_winapi
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if st.threads.active.tid != primary_tid {
+                    st.threads.activate(primary_tid);
                 }
+            }
 
+            let begin = {
+                let engine = &mut *self.process.engine;
                 let current_rip = engine
                     .read_rip()
                     .context("failed to read RIP before runtime step")?;
-
-                let begin = if current_rip == 0 {
+                if current_rip == 0 {
                     self.entry_point_va
                 } else {
                     current_rip
-                };
-
-                let emu_t0 = self.profile_enabled.then(Instant::now);
-                let hook_result = engine.run_until_stop(
-                    begin,
-                    0,
-                    0,
-                    instruction_budget,
-                    layout.fake_api_base,
-                    fake_api_end,
-                );
-                if let Some(t0) = emu_t0 {
-                    self.profile.emu_ns =
-                        self.profile.emu_ns.saturating_add(t0.elapsed().as_nanos());
                 }
+            };
+
+            let emu_t0 = self.profile_enabled.then(Instant::now);
+            let hook_result = self.process.engine.run_until_stop(
+                begin,
+                0,
+                0,
+                instruction_budget,
+                layout.fake_api_base,
+                fake_api_end,
+            );
+            if let Some(t0) = emu_t0 {
+                self.profile.emu_ns = self.profile.emu_ns.saturating_add(t0.elapsed().as_nanos());
+            }
+
+            {
+                let mut pair = self.process.lock_pair();
+                let (engine, winapi_state) = pair.both();
 
                 let (hook, invalid_memory) = match hook_result {
                     Ok(result) => (result.code, result.invalid_memory),

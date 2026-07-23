@@ -1,5 +1,16 @@
 //! SEH pipeline diagnostics: verify each layer independently.
 
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::unreadable_literal,
+    clippy::unusual_byte_groupings
+)]
+
 #[cfg(test)]
 mod tests {
     use crate::exception::*;
@@ -145,11 +156,74 @@ mod tests {
         let xdata = encode_unwind(&info, &codes);
         mem.map(0x6000, xdata.len() + 8);
         mem.write_bytes(0x6000, &xdata);
-        mem.write_u64(0x6000 + info.header_size() as u64, 0x3000); // handler_rva=0x3000
+        // handler_rva at +0, language_data at +4
+        mem.write_bytes(0x6000 + info.header_size() as u64, &0x3000u32.to_le_bytes());
+        mem.write_bytes(0x6000 + info.header_size() as u64 + 4, &0x4000u32.to_le_bytes());
 
         let entry = runtime_function(0x1000, 0x1100, 0x6000);
         let ctx = unwind_ctx(0x401050, 0x1000);
         let r = virtual_unwind(&mut mem.reader(), 0, &entry, ctx).expect("unwind");
         assert_eq!(r.handler_rva, Some(0x3000));
+        assert_eq!(r.handler_data, Some(0x4000));
+    }
+
+    #[test]
+    fn multi_frame_restore_nonvolatiles() {
+        // Outer: push rbx; sub rsp,0x20  — saved RBX = 0xAAAA
+        // Inner: push rbp; sub rsp,0x10  — saved RBP = 0xBBBB
+        // Unwind inner then outer: RBX and RBP restored.
+        let outer_codes = [
+            at(alloc_small(0x20), 2),
+            at(push_nonvol(3), 4), // RBX
+        ];
+        let outer_info = unwind_info(&outer_codes, 0, 8, 0, 0);
+        let outer_xdata = encode_unwind(&outer_info, &outer_codes);
+
+        let inner_codes = [
+            at(alloc_small(0x10), 2),
+            at(push_nonvol(5), 4), // RBP
+        ];
+        let inner_info = unwind_info(&inner_codes, 0, 8, 0, 0);
+        let inner_xdata = encode_unwind(&inner_info, &inner_codes);
+
+        let mut mem = MemSim::new();
+        // Stack (high → low): [ret_to_main][saved RBX][outer frame 0x20][ret_to_outer][saved RBP][inner 0x10]
+        // Inner RSP after prologue = 0x2000
+        //   0x2000..0x2010 alloc, 0x2010 saved RBP, 0x2018 ret to outer
+        // Outer after prologue would have been 0x2020:
+        //   0x2020..0x2040 alloc, 0x2040 saved RBX, 0x2048 ret to main
+        mem.map(0x2000, 0x100);
+        mem.write_u64(0x2010, 0xBBBB); // saved RBP
+        mem.write_u64(0x2018, 0x401_100); // return to outer body
+        mem.write_u64(0x2040, 0xAAAA); // saved RBX
+        mem.write_u64(0x2048, 0x401_000); // return to main
+
+        mem.map(0x6000, outer_xdata.len());
+        mem.write_bytes(0x6000, &outer_xdata);
+        mem.map(0x6100, inner_xdata.len());
+        mem.write_bytes(0x6100, &inner_xdata);
+
+        let outer_entry = runtime_function(0x1000, 0x1100, 0x6000);
+        let inner_entry = runtime_function(0x1200, 0x1300, 0x6100);
+
+        let ctx = unwind_ctx(0x401_250, 0x2000);
+        let r1 = virtual_unwind(&mut mem.reader(), 0, &inner_entry, ctx).expect("inner");
+        assert_eq!(r1.ctx.gpr[5], 0xBBBB, "RBP restored from inner");
+        assert_eq!(r1.ctx.rip, 0x401_100);
+        assert_eq!(r1.ctx.rsp, 0x2020);
+
+        let r2 = virtual_unwind(&mut mem.reader(), 0, &outer_entry, r1.ctx).expect("outer");
+        assert_eq!(r2.ctx.gpr[3], 0xAAAA, "RBX restored from outer");
+        assert_eq!(r2.ctx.gpr[5], 0xBBBB, "RBP preserved");
+        assert_eq!(r2.ctx.rip, 0x401_000);
+        assert_eq!(r2.ctx.rsp, 0x2050);
+    }
+
+    #[test]
+    fn language_data_candidates_dedup_paths() {
+        let c = language_data_candidates(0x14000_0000, 0x14000_5000, 0x20);
+        assert_eq!(c[0], 0x14000_0020); // image + rva
+        assert_eq!(c[1], 0x14000_5020); // unwind + full
+        assert_eq!(c[2], 0x14000_5020); // unwind + low16 (same when high=0)
     }
 }

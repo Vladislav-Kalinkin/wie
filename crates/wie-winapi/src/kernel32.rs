@@ -6510,7 +6510,9 @@ fn handle_duplicate_handle(
             _ => None,
         })
         .unwrap_or_else(|| {
-            let (_, th) = state.sync.register_thread(tid, Default::default());
+            let (_, th) = state
+                .sync
+                .register_thread(tid, wie_cpu::ThreadContext::default());
             crate::KernelObject::Thread(th)
         });
 
@@ -6563,19 +6565,7 @@ fn handle_get_thread_priority(
     })
 }
 
-/// `RaiseException` — start exception processing.
-///
-/// Two-pass dispatch for the Itanium ABI (Mingw-w64 uses this via
-/// `__gxx_personality_seh0`).  Pass 1 searches for a handler; pass 2
-/// unwinds to it, running destructors along the way.
-/// `RaiseException` — start exception processing.
-///
-/// Two-pass dispatch for the Itanium ABI (Mingw-w64 uses this via
-/// `__gxx_personality_seh0`).  Pass 1 searches for a handler; pass 2
-/// unwinds to it, running destructors along the way.
-///  — start exception processing.
-///
-/// Delegates to the SEH dispatcher in [].
+/// `RaiseException` — start exception processing (two-pass SEH dispatch).
 pub(crate) fn handle_raise_exception(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -6587,57 +6577,82 @@ fn handle_rtl_capture_context(
     engine: &mut dyn wie_cpu::CpuEngine,
     _state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    use anyhow::Context;
+
     let ctx_ptr = engine.read_rcx()?;
     if ctx_ptr == 0 {
-        let return_address = engine.return_from_win64_api(0)
+        let return_address = engine
+            .return_from_win64_api(0)
             .context("RtlCaptureContext: return failed")?;
-        return Ok(WinApiHandlerResult { return_address, return_value: 0 });
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
     }
 
     let tctx = engine.snapshot_thread_context();
-    use anyhow::Context;
-    // Write CONTEXT64 at ctx_ptr.
+    // Write CONTEXT64 at ctx_ptr (subset of the Win64 CONTEXT layout).
     let mut cbuf = [0u8; 0x200];
     // ContextFlags at +0x30
-    cbuf[0x30..0x34].copy_from_slice(&0x0010_001Fu32.to_le_bytes());
-    // GPRs at +0x78..+0xF8 (Rax..R15, then Rip at +0xF8)
-    for reg in 0..16 {
-        let off = 0x78 + reg * 8;
-        cbuf[off..off + 8].copy_from_slice(&tctx.gpr[reg].to_le_bytes());
+    if let Some(slot) = cbuf.get_mut(0x30..0x34) {
+        slot.copy_from_slice(&0x0010_001Fu32.to_le_bytes());
     }
-    cbuf[0xF8..0x100].copy_from_slice(&tctx.rip.to_le_bytes());
+    // GPRs at +0x78..+0xF8 (Rax..R15), Rip at +0xF8
+    for reg in 0_usize..16 {
+        let off = 0x78_usize.saturating_add(reg.saturating_mul(8));
+        if let (Some(slot), Some(val)) = (cbuf.get_mut(off..off.saturating_add(8)), tctx.gpr.get(reg))
+        {
+            slot.copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    if let Some(slot) = cbuf.get_mut(0xF8..0x100) {
+        slot.copy_from_slice(&tctx.rip.to_le_bytes());
+    }
     // Rflags at +0x44
-    cbuf[0x44..0x4C].copy_from_slice(&tctx.rflags.to_le_bytes());
-    // XMM registers at +0x100 (128-bit each, XMM0..XMM15)
-    for i in 0..16 {
-        let off = 0x100 + i * 16;
-        cbuf[off..off + 16].copy_from_slice(&tctx.xmm[i].to_le_bytes());
+    if let Some(slot) = cbuf.get_mut(0x44..0x4C) {
+        slot.copy_from_slice(&tctx.rflags.to_le_bytes());
     }
-    engine.mem_write(ctx_ptr, &cbuf)
+    // XMM0..XMM15 at +0x100
+    for i in 0_usize..16 {
+        let off = 0x100_usize.saturating_add(i.saturating_mul(16));
+        if let (Some(slot), Some(val)) = (
+            cbuf.get_mut(off..off.saturating_add(16)),
+            tctx.xmm.get(i),
+        ) {
+            slot.copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    engine
+        .mem_write(ctx_ptr, &cbuf)
         .context("RtlCaptureContext: failed to write context")?;
-    let return_address = engine.return_from_win64_api(0)
+    let return_address = engine
+        .return_from_win64_api(0)
         .context("RtlCaptureContext: return failed")?;
-    Ok(WinApiHandlerResult { return_address, return_value: 0 })
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
 }
 
 /// `RtlUnwindEx` — forced stack unwinding.
 ///
-/// Called by `__cxa_end_catch` during catch block cleanup.  WIE's
-/// `handle_raise_exception` already performed the full unwind, so
-/// this is a no-op stub — just return 0 (success).
-///
-/// RCX = TargetFrame (frame to unwind to, NULL = all)
-/// RDX = TargetIp    (landing pad after unwind)
-/// R8  = ExceptionRecord
-/// R9  = ReturnValue
+/// RCX = TargetFrame (establisher RSP to stop at; NULL = no frame target)
+/// RDX = TargetIp    (landing pad after unwind; NULL = keep frame RIP)
+/// R8  = ExceptionRecord (ignored for now)
+/// R9  = ReturnValue → RAX after unwind
 fn handle_rtl_unwind_ex(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
-    use anyhow::Context;
-    let return_address = engine.return_from_win64_api(0)
-        .context("RtlUnwindEx: return failed")?;
-    Ok(WinApiHandlerResult { return_address, return_value: 0 })
+    let target_frame = engine.read_rcx()?;
+    let target_ip = engine.read_rdx()?;
+    let return_value = engine.read_r9()?;
+    let target_frame_rsp = if target_frame == 0 {
+        None
+    } else {
+        Some(target_frame)
+    };
+    crate::seh::forced_unwind_to(engine, state, target_ip, target_frame_rsp, return_value)
 }
 
 /// `SetEvent`.

@@ -192,50 +192,65 @@ fn worker_main(
     }
 
     loop {
+        // Activate + liveness under WinAPI lock only — do **not** hold the lock
+        // across pure guest execution (per-thread engines need concurrent quanta).
+        {
+            let mut st = lock(&shared_winapi);
+            st.threads.activate(tid);
+            if st.sync.process_dying {
+                finish_tid(&st, tid, 1);
+                return;
+            }
+        }
+
+        let begin = engine.read_rip().unwrap_or(0);
+        if begin == 0 {
+            let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, code);
+            return;
+        }
+
+        // Guest compute / iced / JIT: no shared WinAPI mutex.
+        let hook = match engine.run_until_stop(
+            begin,
+            0,
+            0,
+            budget,
+            layout.fake_api_base,
+            fake_api_end,
+        ) {
+            Ok(r) if r.code.hit => r.code,
+            Ok(_) => {
+                std::thread::yield_now();
+                continue;
+            }
+            Err(_) => {
+                let st = lock(&shared_winapi);
+                finish_tid(&st, tid, 1);
+                return;
+            }
+        };
+
+        if hook.address == layout.callback_return_trampoline_va {
+            continue;
+        }
+
+        let Some(resolved) = resolve_fake_api_at(hook.address, &config.soft_apis) else {
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, 1);
+            return;
+        };
+
         let park_reason: Option<HostParkReason>;
         {
             let mut st = lock(&shared_winapi);
             st.threads.activate(tid);
-
             if st.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
 
-            let begin = engine.read_rip().unwrap_or(0);
-            if begin == 0 {
-                let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
-                finish_tid(&st, tid, code);
-                return;
-            }
-
-            let hook = match engine.run_until_stop(
-                begin,
-                0,
-                0,
-                budget,
-                layout.fake_api_base,
-                fake_api_end,
-            ) {
-                Ok(r) if r.code.hit => r.code,
-                Ok(_) => {
-                    std::thread::yield_now();
-                    continue;
-                }
-                Err(_) => {
-                    finish_tid(&st, tid, 1);
-                    return;
-                }
-            };
-
-            if hook.address == layout.callback_return_trampoline_va {
-                continue;
-            }
-
-            let Some(resolved) = resolve_fake_api_at(hook.address, &config.soft_apis) else {
-                finish_tid(&st, tid, 1);
-                return;
-            };
             if resolved.traits.exit_process() {
                 st.sync.process_dying = true;
                 let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
@@ -270,7 +285,7 @@ fn worker_main(
                     }
                 }
             }
-        } // drop WinAPI lock
+        } // drop WinAPI lock before host park
 
         if let Some(reason) = park_reason {
             handle_park(&mut engine, &shared_winapi, tid, reason);

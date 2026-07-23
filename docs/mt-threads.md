@@ -15,13 +15,13 @@
 | CPU engine | Shared after first `CreateThread` (`ProcessResources`) |
 | Memory generation | `AtomicU64` acquire/release (`GuestMemory::generation`) |
 
-**1:1 host thread ↔ guest thread.** Guest execution is **serialized** on one shared `CpuEngine` (process mutex). Host wait (`WaitFor*`, contended CS, `Sleep`) **drops** the engine lock so other guest threads can run. This preserves single-thread speed until the first `CreateThread` (local engine, no mutex).
+**1:1 host thread ↔ guest thread.** Each guest thread owns a **`CpuEngine`** (JIT: shared `Arc<JitShared>` compile cache; Iced: shared `Arc<RwLock<GuestMemory>>`). WinAPI / kernel objects / heap sit behind **`Arc<Mutex<WinApiState>>`**.
 
-Thread switch always **saves** the previous guest CPU context before restoring the next (`activate_thread`); otherwise a worker that wins the process lock between primary quanta would clobber unsaved primary registers.
+**Lock scope (critical):** the WinAPI mutex is held only for **activate / dispatch / state mutate**, **not** across pure `run_until_stop` guest compute. Host wait (`WaitFor*`, contended CS) parks **outside** the mutex so peers can `SetEvent` / `LeaveCriticalSection` / `ExitThread`.
 
 Default **guest** worker stack is **1 MiB** when `dwStackSize == 0` (Windows-like). Host OS threads for workers use an **8 MiB** stack so JIT/iced dispatch does not overflow secondary-thread defaults on macOS.
 
-True parallel guest data planes (two cores in JIT simultaneously) remain a future step; metadata is already MT-ready (`mem_gen` atomic, Interlocked host atomics, wake-all on `ExitProcess`).
+Concurrent guest data planes are intentional after the per-thread engine change; structural map/unmap/protect still serializes via WinAPI handlers (and Iced write-locks on the shared `GuestMemory`).
 
 ## What works
 
@@ -90,11 +90,12 @@ Suite: `scripts/run-micro-suite.sh` runs MT micros; `mt_stress` is skipped when 
 
 | Resource | Lock |
 | -------- | ---- |
-| CPU engine + WinAPI state | process `Mutex` pair after first `CreateThread` |
-| CS wait | host `Condvar` **outside** process locks |
-| Waitable objects | host mutex/cv on object; wait outside process locks |
-| Heap freelist | process WinAPI mutex (same as engine share) |
-| PageMap / VAD / arenas | under engine mutex (structural ops) |
+| WinAPI state (heap, objects, TLS, CS metadata) | `Arc<Mutex<WinApiState>>` — **dispatch only** |
+| Guest pure compute | **no** WinAPI mutex (per-thread `CpuEngine`) |
+| CS wait | host `Condvar` **outside** WinAPI mutex |
+| Waitable objects | host mutex/cv on object; wait outside WinAPI mutex |
+| Iced guest memory | `Arc<RwLock<GuestMemory>>` (write = map/protect/free) |
+| JIT guest memory | soft-translate + `mem_gen`; structural ops via WinAPI handlers |
 
 ## Verify
 

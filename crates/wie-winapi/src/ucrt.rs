@@ -113,7 +113,7 @@ pub fn dispatch_ucrt(
         // MSVC C++ mangled names (matched after to_ascii_lowercase).
         "?terminate@@yaxxz" => handle_terminate_cxx(engine),
         "??1type_info@@ueaa@xz" => handle_type_info_dtor(engine),
-        "_cxxthrowexception" => handle_cxx_throw_exception(engine),
+        "_cxxthrowexception" => handle_cxx_throw_exception(engine, state),
         _ => anyhow::bail!("unsupported UCRT export: {name}"),
     }
 }
@@ -871,16 +871,52 @@ fn handle_type_info_dtor(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHa
     ret(engine, this)
 }
 
-fn handle_cxx_throw_exception(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+/// `_CxxThrowException(pExceptionObject, pThrowInfo)` — MSVC C++ throw.
+///
+/// Builds the usual MSVC EH `EXCEPTION_RECORD` payload and enters the shared
+/// two-pass SEH dispatcher (host FuncInfo / LSDA search + register restore).
+fn handle_cxx_throw_exception(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
     let pexception_object = engine.read_rcx()?;
     let pthrow_info = engine.read_rdx()?;
-    // No C++ EH / SEH unwinding yet. Returning into the thrower used to hit
-    // `int3` and an opaque "unimplemented mnemonic Int3". Surface a stop with
-    // context instead — common trigger is CRT `operator new` after `malloc`
-    // returned NULL (process heap exhausted; raise `WIE_PROCESS_HEAP_MB`).
-    anyhow::bail!(
-        "msvcrt!_CxxThrowException (no C++ EH): pExceptionObject={pexception_object:#x} \
-         pThrowInfo={pthrow_info:#x}; often std::bad_alloc after process-heap OOM \
-         (default heap is large; try WIE_PROCESS_HEAP_MB=1024 if scans are huge)"
+    tracing::debug!(
+        pexception_object = format_args!("{pexception_object:#x}"),
+        pthrow_info = format_args!("{pthrow_info:#x}"),
+        "msvcrt!_CxxThrowException → SEH dispatch"
+    );
+    // Scratch EXCEPTION_RECORD below the current stack (host-side only; the
+    // dispatcher uses the throw payload + stack walk, not this buffer for control).
+    let rsp = engine.read_rsp()?;
+    let rec = rsp.saturating_sub(0x100);
+    let rip = engine.read_rip()?;
+    // ExceptionCode = 0xE06D7363 ('msc' | 0xE0000000)
+    engine.mem_write(rec, &0xE06D_7363_u32.to_le_bytes())?;
+    engine.mem_write(rec.saturating_add(4), &1_u32.to_le_bytes())?; // noncontinuable
+    engine.mem_write(rec.saturating_add(8), &[0u8; 8])?;
+    engine.mem_write(rec.saturating_add(16), &rip.to_le_bytes())?;
+    engine.mem_write(rec.saturating_add(24), &4_u32.to_le_bytes())?; // NumberParameters
+    // Parameters[0] = EH magic, [1] = object, [2] = ThrowInfo, [3] = image base (0)
+    engine.mem_write(rec.saturating_add(32), &0x1993_0520_u64.to_le_bytes())?;
+    engine.mem_write(rec.saturating_add(40), &pexception_object.to_le_bytes())?;
+    engine.mem_write(rec.saturating_add(48), &pthrow_info.to_le_bytes())?;
+    engine.mem_write(rec.saturating_add(56), &0_u64.to_le_bytes())?;
+    engine.write_rcx(rec)?;
+
+    crate::seh::dispatch_exception_with_payload(
+        engine,
+        state,
+        crate::seh::ThrowPayload {
+            exception_object: pexception_object,
+            throw_info: pthrow_info,
+        },
     )
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "msvcrt!_CxxThrowException: {e}; pExceptionObject={pexception_object:#x} \
+             pThrowInfo={pthrow_info:#x}; if this is std::bad_alloc after process-heap OOM, \
+             try WIE_PROCESS_HEAP_MB=1024"
+        )
+    })
 }
