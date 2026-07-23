@@ -87,6 +87,7 @@ pub fn dispatch_ucrt(
         "_set_app_type" | "__set_app_type" => handle_set_app_type(engine),
         "_set_invalid_parameter_handler" => handle_set_invalid_parameter_handler(engine),
         // Legacy msvcrt CRT startup / teardown.
+        "getenv" => handle_getenv(engine),
         "__getmainargs" => handle_getmainargs(engine),
         "_xcptfilter" => handle_xcpt_filter(engine),
         "_cexit" | "_c_exit" => handle_cexit(engine),
@@ -387,6 +388,13 @@ fn handle_memset(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerRes
 /// Legacy msvcrt `__getmainargs(argc*, argv**, env**, doWildcard, startupinfo*)`.
 ///
 /// Fills caller out-params from the CRT page prepared at session start.
+fn handle_getenv(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
+    // `getenv(const char* name)` → returns NULL (variable not found).
+    // The C++ runtime checks for debug/env flags during startup; returning
+    // NULL is safe — no deployment expects these to be set.
+    ret(engine, 0)
+}
+
 fn handle_getmainargs(engine: &mut dyn wie_cpu::CpuEngine) -> Result<WinApiHandlerResult> {
     let argc_ptr = engine.read_rcx()?;
     let argv_ptr = engine.read_rdx()?;
