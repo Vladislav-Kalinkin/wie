@@ -506,7 +506,10 @@ pub fn find_landing_pad(
     // Advance cursor past variable-length header
     let mut cursor = lsda_va + 3;
     // Skip LPStart value (present when encoding != 0xFF)
-    if lp_enc != 0xFF { cursor += 8; } // assume absptr 8 bytes
+    if lp_enc != 0xFF {
+        let lp_size = match lp_enc & 0x0f { 0x00 => 8, 0x02 | 0x03 => 2, 0x04 | 0x05 => 4, 0x06 | 0x07 => 8, _ => 0 };
+        cursor += lp_size;
+    }
     // Skip ttype offset (ULEB128, present when encoding != 0xFF)
     if ttype_enc != 0xFF {
         loop { let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1; if b[0] & 0x80 == 0 { break; } }
@@ -525,11 +528,15 @@ pub fn find_landing_pad(
     let cs_end = cursor + cs_len;
     
     // Walk call-site entries
+    let base_enc = cs_enc & 0x0f;
     while cursor < cs_end {
-        // Entry format: ULEB128 for 0x01, or 4-byte fixed for other encodings
-        let (cs_s, cs_l, lp_off, _aidx) = match cs_enc {
+        // Read entry fields: (start, length, landing_pad, action_index)
+        // Field format depends on the base encoding:
+        // 0x00=absptr(8), 0x01=ULEB128, 0x02/03=udata2/sdata2(2),
+        // 0x04/05=udata4/sdata4(4), 0x06/07=udata8/sdata8(8)
+        let (cs_s, cs_len_v, lp, aidx) = match base_enc {
             0x01 => {
-                // ULEB128 encoding: (start, length, pad, action_index)
+                // All ULEB128
                 let mut u = |c: &mut u64| -> Option<u64> {
                     let mut v = 0u64; let mut s = 0;
                     loop { let mut b = [0u8; 1]; read_mem(*c, &mut b).ok()?; *c += 1;
@@ -538,19 +545,42 @@ pub fn find_landing_pad(
                 };
                 (u(&mut cursor)?, u(&mut cursor)?, u(&mut cursor)?, u(&mut cursor)?)
             }
-            _ => {
-                let mut buf = [0u8; 16]; read_mem(cursor, &mut buf).ok()?; cursor += 16;
-                (u64::from(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])),
-                 u64::from(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]])),
-                 u64::from(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])),
-                 u64::from(u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]])))
+            0x00 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 => {
+                let sz: u64 = match base_enc { 0x00 | 0x06 | 0x07 => 8, 0x02 | 0x03 => 2, _ => 4 };
+                let mut r64 = |c: &mut u64, s: u64| -> Option<u64> {
+                    let mut buf = vec![0u8; s as usize];
+                    read_mem(*c, &mut buf).ok()?; *c += s;
+                    let mut v = 0u64;
+                    for i in 0..s as usize { v |= u64::from(buf[i]) << (i * 8); }
+                    if matches!(base_enc, 0x03 | 0x05 | 0x07) {
+                        let bits = s * 8; let sb = 1u64 << (bits - 1);
+                        if v & sb != 0 { v |= !((1u64 << bits) - 1); }
+                    }
+                    Some(v)
+                };
+                let s = r64(&mut cursor, sz)?;
+                let len = r64(&mut cursor, sz)?;
+                let pad = r64(&mut cursor, sz)?;
+                // action_index is always ULEB128
+                let a = {
+                    let mut v = 0u64; let mut shift = 0;
+                    loop { let mut b = [0u8; 1]; read_mem(cursor, &mut b).ok()?; cursor += 1;
+                           v |= u64::from(b[0] & 0x7f) << shift; if b[0] & 0x80 == 0 { break; } shift += 7; if shift > 56 { return None; } }
+                    v
+                };
+                (s, len, pad, a)
             }
+            _ => return None,
         };
-        if lp_off == 0 { continue; }
-        if control_pc < func_start + cs_s || control_pc >= func_start + cs_s + cs_l {
-            continue;
-        }
-        return Some((func_start + lp_off, _aidx));
+        
+        if lp == 0 { continue; }
+        // For absptr encoding, values are absolute addresses, not offsets.
+        // For all others, they're offsets from func_start.
+        let abs = base_enc == 0x00;
+        let (rstart, rend) = if abs { (cs_s, cs_s + cs_len_v) } else { (func_start + cs_s, func_start + cs_s + cs_len_v) };
+        if control_pc < rstart || control_pc >= rend { continue; }
+        let landing_va = if abs { lp } else { func_start + lp };
+        return Some((landing_va, aidx));
     }
     None
 }
