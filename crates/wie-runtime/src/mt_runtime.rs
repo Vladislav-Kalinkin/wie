@@ -236,6 +236,19 @@ fn worker_main(
             continue;
         }
 
+        // SEH / C++ EH continuation trampoline (primary path is session.rs; workers
+        // can hit it if a throw originated on that thread).
+        if hook.address == wie_winapi::seh_continue_trampoline_va() {
+            let mut st = lock(&shared_winapi);
+            st.threads.activate(tid);
+            if let Err(e) = wie_winapi::seh::continue_pending(&mut *engine, &mut st) {
+                tracing::warn!(tid, error = %e, "worker SEH continue failed");
+                finish_tid(&st, tid, 1);
+                return;
+            }
+            continue;
+        }
+
         let Some(resolved) = resolve_fake_api_at(hook.address, &config.soft_apis) else {
             let st = lock(&shared_winapi);
             finish_tid(&st, tid, 1);

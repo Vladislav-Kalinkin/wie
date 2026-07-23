@@ -1411,9 +1411,52 @@ impl RuntimeSession {
                         }
                     }
 
+                    // SEH / C++ EH continuation (UnwindMap actions, MSVC catch funclets).
+                    let seh_handled = if hook.address == wie_winapi::seh_continue_trampoline_va() {
+                        match wie_winapi::seh::continue_pending(engine, winapi_state) {
+                            Ok(result) => {
+                                charged_api = charged_api.saturating_add(1);
+                                events.push(EntryTraceEvent {
+                                    index,
+                                    library: "ntdll.dll".into(),
+                                    name: "SehContinue".into(),
+                                    fake_target_va: hook.address,
+                                    handled: true,
+                                    return_value: Some(result.return_value),
+                                    return_address: Some(result.return_address),
+                                });
+                                let err = winapi_state.last_error;
+                                if self.last_published_last_error != Some(err) {
+                                    let bytes = err.to_le_bytes();
+                                    if engine
+                                        .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
+                                        .is_ok()
+                                    {
+                                        self.last_published_last_error = Some(err);
+                                    }
+                                }
+                                quantum = Quantum::Continue;
+                                true
+                            }
+                            Err(error) => {
+                                break_term = Some(EntryTraceTermination::RuntimeStop(format!(
+                                    "failed to continue SEH sequence: {error}"
+                                )));
+                                quantum = Quantum::Break;
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
                     let resolve_t0 = self.profile_enabled.then(Instant::now);
-                    let resolved_opt = resolve_fake_api_at(hook.address, &soft_apis);
-                    if resolved_opt.is_none() {
+                    let resolved_opt = if seh_handled {
+                        None
+                    } else {
+                        resolve_fake_api_at(hook.address, &soft_apis)
+                    };
+                    if !seh_handled && resolved_opt.is_none() {
                         break_term = Some(EntryTraceTermination::RuntimeStop(format!(
                             "unresolved fake API at {:#018x}",
                             hook.address,
