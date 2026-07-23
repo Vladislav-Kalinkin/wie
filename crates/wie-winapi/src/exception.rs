@@ -212,4 +212,193 @@ pub fn parse_pdata(bytes: &[u8]) -> Vec<RuntimeFunction> {
     entries
 }
 
+// ── Unwind context ─────────────────────────────────────────────────────
+
+/// Simplified register context for stack unwinding.
+/// Uses the same GPR indices as the UWOP register encoding (0=RAX..15=R15).
+#[derive(Debug, Clone, Copy)]
+pub struct UnwindContext {
+    pub rip: u64,
+    pub rsp: u64,
+    pub gpr: [u64; 16],
+}
+
+impl UnwindContext {
+    /// Register index constants matching UWOP encoding.
+    pub const RBP: usize = 5;
+    pub const RSI: usize = 6;
+    pub const RDI: usize = 7;
+    pub const R12: usize = 12;
+    pub const R13: usize = 13;
+    pub const R14: usize = 14;
+    pub const R15: usize = 15;
+}
+
+/// Result of one unwind step.
+#[derive(Debug, Clone, Copy)]
+pub struct UnwindResult {
+    /// Context of the caller frame.
+    pub ctx: UnwindContext,
+    /// Handler RVA (guest address of the language-specific handler), if any.
+    pub handler_rva: Option<u32>,
+    /// Handler data pointer, if any (passed to the handler as argument).
+    pub handler_data: Option<u32>,
+}
+
+// ── Virtual unwinding ──────────────────────────────────────────────────
+
+/// Guest memory reader callback: `fn(guest_va, buffer) -> Result`.
+pub type MemRead = dyn Fn(u64, &mut [u8]) -> Result<(), ()>;
+
+/// Reverse one function's prologue.  Given a `ctx` with RIP inside a
+/// function, returns the caller's context and any registered handler.
+///
+/// # Arguments
+/// * `read_mem` — callback to read from guest memory.
+/// * `image_base` — base address of the module containing the function.
+/// * `entry` — the `RUNTIME_FUNCTION` entry for the function.
+/// * `ctx` — current register state.
+pub fn virtual_unwind(
+    read_mem: &MemRead,
+    image_base: u64,
+    entry: &RuntimeFunction,
+    mut ctx: UnwindContext,
+) -> Result<UnwindResult, ()> {
+    let unwind_rva = entry.unwind_data;
+    if unwind_rva == 0 {
+        // Leaf function: just pop the return address.
+        return unwind_leaf(read_mem, ctx);
+    }
+
+    let unwind_va = image_base.saturating_add(u64::from(unwind_rva));
+    let mut header_buf = [0_u8; 4];
+    read_mem(unwind_va, &mut header_buf)?;
+
+    let info = UnwindInfo::from_bytes(&header_buf, 0).ok_or(())?;
+    let code_count = usize::from(info.count_of_codes);
+    let codes_size = code_count * UnwindCode::SIZE;
+    let mut codes_buf = vec![0_u8; codes_size];
+    read_mem(unwind_va.saturating_add(4), &mut codes_buf)?;
+
+    // Helper: read a raw 2-byte slot at index `i` (not interpreted as UNWIND_CODE).
+    let raw_slot = |i: usize| -> Option<[u8; 2]> {
+        codes_buf.get(i * 2..i * 2 + 2).map(|b| [b[0], b[1]])
+    };
+    let codes: Vec<UnwindCode> = (0..code_count)
+        .filter_map(|i| UnwindCode::from_bytes(&codes_buf, i * 2))
+        .collect();
+
+    let mut rsp = ctx.rsp;
+    let fp_reg = usize::from(info.frame_register);
+    let fp_rsp = if fp_reg != 0 {
+        ctx.gpr[fp_reg].saturating_sub(u64::from(info.frame_offset) * 16)
+    } else {
+        rsp
+    };
+
+    // Process codes in forward order (stored in reverse prologue order;
+    // we process them backwards which undoes the prologue correctly).
+    let mut code_idx = 0;
+    while code_idx < codes.len() {
+        let code = &codes[code_idx];
+        match code.unwind_op {
+            uwop::PUSH_NONVOL => {
+                let reg = usize::from(code.op_info);
+                rsp = rsp.saturating_sub(8);
+                let mut val_buf = [0_u8; 8];
+                read_mem(rsp, &mut val_buf).ok();
+                ctx.gpr[reg] = u64::from_le_bytes(val_buf);
+                code_idx += 1;
+            }
+            uwop::ALLOC_LARGE => {
+                let size: u64 = if code.op_info == 0 {
+                    // Next raw slot is a 16-bit scaled value.
+                    let slot = raw_slot(code_idx + 1).unwrap_or([0, 0]);
+                    u64::from(u16::from_le_bytes(slot)) * 8
+                } else {
+                    // Next two raw slots form a 32-bit value.
+                    let a = raw_slot(code_idx + 1).unwrap_or([0, 0]);
+                    let b = raw_slot(code_idx + 2).unwrap_or([0, 0]);
+                    u64::from(u32::from_le_bytes([a[0], a[1], b[0], b[1]]))
+                };
+                rsp = rsp.saturating_add(size);
+                code_idx += if code.op_info == 0 { 2 } else { 3 };
+            }
+            uwop::ALLOC_SMALL => {
+                let size = u64::from(code.op_info) * 8 + 8;
+                rsp = rsp.saturating_add(size);
+                code_idx += 1;
+            }
+            uwop::SET_FPREG => {
+                code_idx += 1;
+            }
+            uwop::SAVE_NONVOL => {
+                let reg = usize::from(code.op_info);
+                let slot = raw_slot(code_idx + 1).unwrap_or([0, 0]);
+                let offset = u64::from(u16::from_le_bytes(slot)) * 8;
+                let va = fp_rsp.saturating_add(offset);
+                let mut val_buf = [0_u8; 8];
+                read_mem(va, &mut val_buf).ok();
+                ctx.gpr[reg] = u64::from_le_bytes(val_buf);
+                code_idx += 2;
+            }
+            uwop::SAVE_NONVOL_FAR => {
+                let reg = usize::from(code.op_info);
+                let a = raw_slot(code_idx + 1).unwrap_or([0, 0]);
+                let b = raw_slot(code_idx + 2).unwrap_or([0, 0]);
+                let offset = u64::from(u32::from_le_bytes([a[0], a[1], b[0], b[1]]));
+                let va = fp_rsp.saturating_add(offset);
+                let mut val_buf = [0_u8; 8];
+                read_mem(va, &mut val_buf).ok();
+                ctx.gpr[reg] = u64::from_le_bytes(val_buf);
+                code_idx += 3;
+            }
+            uwop::SAVE_XMM128 => {
+                code_idx += 2; // skip reg + next data slot
+            }
+            uwop::SAVE_XMM128_FAR => {
+                code_idx += 3; // skip reg + next two data slots
+            }
+            uwop::PUSH_MACHFRAME => {
+                let extra = if code.op_info == 0 { 24 } else { 32 };
+                rsp = rsp.saturating_add(extra);
+                code_idx += 1;
+            }
+            _ => {
+                code_idx += 1;
+            }
+        }
+    }
+
+    // Pop return address.
+    let mut rip_buf = [0_u8; 8];
+    read_mem(rsp, &mut rip_buf)?;
+    ctx.rip = u64::from_le_bytes(rip_buf);
+    rsp = rsp.saturating_add(8);
+    ctx.rsp = rsp;
+
+    // Extract handler info if present.
+    let (handler_rva, handler_data) = if info.flags & UnwindInfo::FLAG_EHANDLER != 0 {
+        let data_off = unwind_va.saturating_add(info.header_size() as u64);
+        let mut h_buf = [0_u8; 8];
+        read_mem(data_off, &mut h_buf)?;
+        let hrva = u32::from_le_bytes([h_buf[0], h_buf[1], h_buf[2], h_buf[3]]);
+        let hdata = u32::from_le_bytes([h_buf[4], h_buf[5], h_buf[6], h_buf[7]]);
+        (Some(hrva), Some(hdata))
+    } else {
+        (None, None)
+    };
+
+    Ok(UnwindResult { ctx, handler_rva, handler_data })
+}
+
+/// Unwind a leaf function (no unwind info).  Simply pops the return address.
+fn unwind_leaf(read_mem: &MemRead, mut ctx: UnwindContext) -> Result<UnwindResult, ()> {
+    let mut rip_buf = [0_u8; 8];
+    read_mem(ctx.rsp, &mut rip_buf)?;
+    ctx.rip = u64::from_le_bytes(rip_buf);
+    ctx.rsp = ctx.rsp.saturating_add(8);
+    Ok(UnwindResult { ctx, handler_rva: None, handler_data: None })
+}
+
 
