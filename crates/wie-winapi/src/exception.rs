@@ -186,7 +186,7 @@ pub fn lookup_function_entry<'a>(
         match entries.binary_search_by_key(&((control_pc - image_base) as u32), |e| e.begin_address)
         {
             Ok(i) => return Some(FunctionEntry { entry: &entries[i], image_base }),
-            Err(0) => continue, // before the first entry
+            Err(0) => continue, // unreachable: range check above prevents this
             Err(i) => {
                 let candidate = &entries[i - 1];
                 if (control_pc - image_base) < u64::from(candidate.end_address) {
@@ -288,13 +288,53 @@ pub fn virtual_unwind(
         .filter_map(|i| UnwindCode::from_bytes(&codes_buf, i * 2))
         .collect();
 
-    let mut rsp = ctx.rsp;
+    // Pre-compute the entry RSP (before any prologue operations) for
+    // SAVE_NONVOL offset resolution when no frame pointer is used.
+    // Without a frame pointer, the current ctx.rsp is somewhere inside
+    // the function's frame, not at the entry point.  We back-compute
+    // the entry RSP by summing all allocations and pushes.
+    let mut entry_rsp = ctx.rsp;
     let fp_reg = usize::from(info.frame_register);
+    if fp_reg == 0 {
+        let mut scan_idx = 0;
+        while scan_idx < codes.len() {
+            let c = &codes[scan_idx];
+            match c.unwind_op {
+                uwop::ALLOC_SMALL => {
+                    entry_rsp = entry_rsp.saturating_add(u64::from(c.op_info) * 8 + 8);
+                    scan_idx += 1;
+                }
+                uwop::ALLOC_LARGE => {
+                    let size: u64 = if c.op_info == 0 {
+                        let slot = raw_slot(scan_idx + 1).unwrap_or([0, 0]);
+                        u64::from(u16::from_le_bytes(slot)) * 8
+                    } else {
+                        let a = raw_slot(scan_idx + 1).unwrap_or([0, 0]);
+                        let b = raw_slot(scan_idx + 2).unwrap_or([0, 0]);
+                        u64::from(u32::from_le_bytes([a[0], a[1], b[0], b[1]]))
+                    };
+                    entry_rsp = entry_rsp.saturating_add(size);
+                    scan_idx += if c.op_info == 0 { 2 } else { 3 };
+                }
+                uwop::PUSH_NONVOL => {
+                    entry_rsp = entry_rsp.saturating_add(8);
+                    scan_idx += 1;
+                }
+                uwop::PUSH_MACHFRAME => {
+                    entry_rsp = entry_rsp.saturating_add(if c.op_info == 0 { 24 } else { 32 });
+                    scan_idx += 1;
+                }
+                _ => { scan_idx += 1; }
+            }
+        }
+    }
     let fp_rsp = if fp_reg != 0 {
         ctx.gpr[fp_reg].saturating_sub(u64::from(info.frame_offset) * 16)
     } else {
-        rsp
+        entry_rsp
     };
+
+    let mut rsp = ctx.rsp;
 
     // Process codes in forward order (stored in reverse prologue order;
     // we process them backwards which undoes the prologue correctly).
@@ -305,7 +345,7 @@ pub fn virtual_unwind(
             uwop::PUSH_NONVOL => {
                 let reg = usize::from(code.op_info);
                 let mut val_buf = [0_u8; 8];
-                read_mem(rsp, &mut val_buf).ok();
+                read_mem(rsp, &mut val_buf)?;
                 ctx.gpr[reg] = u64::from_le_bytes(val_buf);
                 rsp = rsp.saturating_add(8);
                 code_idx += 1;
@@ -338,7 +378,7 @@ pub fn virtual_unwind(
                 let offset = u64::from(u16::from_le_bytes(slot)) * 8;
                 let va = fp_rsp.saturating_add(offset);
                 let mut val_buf = [0_u8; 8];
-                read_mem(va, &mut val_buf).ok();
+                read_mem(va, &mut val_buf)?;
                 ctx.gpr[reg] = u64::from_le_bytes(val_buf);
                 code_idx += 2;
             }
@@ -349,7 +389,7 @@ pub fn virtual_unwind(
                 let offset = u64::from(u32::from_le_bytes([a[0], a[1], b[0], b[1]]));
                 let va = fp_rsp.saturating_add(offset);
                 let mut val_buf = [0_u8; 8];
-                read_mem(va, &mut val_buf).ok();
+                read_mem(va, &mut val_buf)?;
                 ctx.gpr[reg] = u64::from_le_bytes(val_buf);
                 code_idx += 3;
             }
@@ -377,8 +417,11 @@ pub fn virtual_unwind(
     rsp = rsp.saturating_add(8);
     ctx.rsp = rsp;
 
-    // Extract handler info if present.
-    let (handler_rva, handler_data) = if info.flags & UnwindInfo::FLAG_EHANDLER != 0 {
+    // Extract handler info if present.  Both EHANDLER and UHANDLER frames
+    // have handler data — UHANDLER is used for cleanup/termination functions
+    // (destructors without a catch).
+    let handler_flags = UnwindInfo::FLAG_EHANDLER | UnwindInfo::FLAG_UHANDLER;
+    let (handler_rva, handler_data) = if info.flags & handler_flags != 0 {
         let data_off = unwind_va.saturating_add(info.header_size() as u64);
         let mut h_buf = [0_u8; 8];
         read_mem(data_off, &mut h_buf)?;
@@ -388,6 +431,32 @@ pub fn virtual_unwind(
     } else {
         (None, None)
     };
+
+    // FLAG_CHAININFO: the unwind info is followed by another UNWIND_INFO
+    // for the parent function.  Follow the chain recursively.
+    if info.flags & UnwindInfo::FLAG_CHAININFO != 0 {
+        let chain_rva = u32::from_le_bytes([
+            codes_buf.get(codes_size).copied().unwrap_or(0),
+            codes_buf.get(codes_size + 1).copied().unwrap_or(0),
+            codes_buf.get(codes_size + 2).copied().unwrap_or(0),
+            codes_buf.get(codes_size + 3).copied().unwrap_or(0),
+        ]);
+        if chain_rva != 0 {
+            let chain_entry = RuntimeFunction {
+                begin_address: entry.begin_address,
+                end_address: entry.end_address,
+                unwind_data: chain_rva,
+            };
+            let chained = virtual_unwind(read_mem, image_base, &chain_entry, UnwindContext {
+                rip: ctx.rip, rsp, ..ctx
+            })?;
+            return Ok(UnwindResult {
+                ctx: chained.ctx,
+                handler_rva: handler_rva.or(chained.handler_rva),
+                handler_data: handler_data.or(chained.handler_data),
+            });
+        }
+    }
 
     Ok(UnwindResult { ctx, handler_rva, handler_data })
 }
