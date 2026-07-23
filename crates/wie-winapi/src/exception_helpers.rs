@@ -137,7 +137,7 @@ impl MemSim {
 
 /// Build an `UnwindContext` with the given RIP, RSP, and optionally set GPRs.
 pub fn unwind_ctx(rip: u64, rsp: u64) -> UnwindContext {
-    UnwindContext { rip, rsp, gpr: [0; 16] }
+    UnwindContext { rip, rsp, gpr: [0; 16], xmm: [0; 16] }
 }
 
 impl UnwindContext {

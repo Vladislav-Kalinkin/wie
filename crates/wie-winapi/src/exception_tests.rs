@@ -22,17 +22,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_sorted() {
+    fn parse_unsorted_input_keeps_order() {
+        // .pdata from linker is pre-sorted.  We don't re-sort.
         let mut raw = Vec::new();
         for &(b, e, u) in &[(0x2000u32, 0x2100u32, 0x3000u32), (0x1000u32, 0x1100u32, 0x4000u32)] {
             raw.extend_from_slice(&b.to_le_bytes());
             raw.extend_from_slice(&e.to_le_bytes());
             raw.extend_from_slice(&u.to_le_bytes());
         }
-        let e = parse_pdata(&raw);
-        assert_eq!(e.len(), 2);
-        assert_eq!(e[0].begin_address, 0x1000);
-        assert_eq!(e[1].begin_address, 0x2000);
+        let entries = parse_pdata(&raw);
+        assert_eq!(entries.len(), 2);
+        // In insertion order: (2000, 1000)
+        assert_eq!(entries[0].begin_address, 0x2000);
+        assert_eq!(entries[1].begin_address, 0x1000);
     }
 
     // ── Layer 1: function table lookup ──────────────────────────────────

@@ -6580,6 +6580,7 @@ fn handle_raise_exception(
         rip,
         rsp,
         gpr: tctx.gpr,
+        xmm: tctx.xmm,
     };
 
     // Guest memory reader for the unwinder.  Uses a raw pointer to avoid

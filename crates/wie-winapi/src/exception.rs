@@ -75,8 +75,6 @@ pub struct UnwindInfo {
 }
 
 impl UnwindInfo {
-    pub const SIZE: usize = 4;
-
     /// `EXCEPTION_EXECUTE_HANDLER`: this frame has a language-specific handler.
     pub const FLAG_EHANDLER: u8 = 1;
     /// `UNW_FLAG_NHANDLER`: no handler — unwind only.
@@ -208,7 +206,7 @@ pub fn parse_pdata(bytes: &[u8]) -> Vec<RuntimeFunction> {
             entries.push(e);
         }
     }
-    entries.sort_by_key(|e| e.begin_address);
+    // .pdata is sorted by the linker — already in begin_address order.
     entries
 }
 
@@ -221,6 +219,9 @@ pub struct UnwindContext {
     pub rip: u64,
     pub rsp: u64,
     pub gpr: [u64; 16],
+    /// Nonvolatile XMM registers (XMM6–XMM15).  Indices 0–15; only 6–15
+    /// are restored during unwinding.
+    pub xmm: [u128; 16],
 }
 
 impl UnwindContext {
@@ -394,10 +395,25 @@ pub fn virtual_unwind(
                 code_idx += 3;
             }
             uwop::SAVE_XMM128 => {
-                code_idx += 2; // skip reg + next data slot
+                let reg = usize::from(code.op_info);
+                let slot = raw_slot(code_idx + 1).unwrap_or([0, 0]);
+                let offset = u64::from(u16::from_le_bytes(slot)) * 16;
+                let va = fp_rsp.saturating_add(offset);
+                let mut val_buf = [0_u8; 16];
+                read_mem(va, &mut val_buf)?;
+                ctx.xmm[reg] = u128::from_le_bytes(val_buf);
+                code_idx += 2;
             }
             uwop::SAVE_XMM128_FAR => {
-                code_idx += 3; // skip reg + next two data slots
+                let reg = usize::from(code.op_info);
+                let a = raw_slot(code_idx + 1).unwrap_or([0, 0]);
+                let b = raw_slot(code_idx + 2).unwrap_or([0, 0]);
+                let offset = u64::from(u32::from_le_bytes([a[0], a[1], b[0], b[1]]));
+                let va = fp_rsp.saturating_add(offset);
+                let mut val_buf = [0_u8; 16];
+                read_mem(va, &mut val_buf)?;
+                ctx.xmm[reg] = u128::from_le_bytes(val_buf);
+                code_idx += 3;
             }
             uwop::PUSH_MACHFRAME => {
                 let extra = if code.op_info == 0 { 24 } else { 32 };
