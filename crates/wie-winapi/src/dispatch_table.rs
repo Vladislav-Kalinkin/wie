@@ -2052,6 +2052,19 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    // Mingw runtime DLLs (pthread, libstdc++).
+    if library.eq_ignore_ascii_case("libwinpthread-1.dll")
+        || library.eq_ignore_ascii_case("libwinpthread-1")
+        || library.starts_with("libwinpthread")
+    {
+        return crate::mingw_dispatch::dispatch_pthread(engine, name);
+    }
+    if library.eq_ignore_ascii_case("libstdc++-6.dll")
+        || library.eq_ignore_ascii_case("libstdc++-6")
+        || library.starts_with("libstdc++")
+    {
+        return crate::mingw_dispatch::dispatch_stdcpp(engine, state, name);
+    }
     bail!("unsupported WinAPI call: {library}!{name}");
 }
 

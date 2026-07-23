@@ -203,6 +203,10 @@ pub fn parse_pdata(bytes: &[u8]) -> Vec<RuntimeFunction> {
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         if let Some(e) = RuntimeFunction::from_bytes(bytes, i * RuntimeFunction::SIZE) {
+            // Skip null sentinel entries (padding at end of .pdata section).
+            if e.begin_address == 0 && e.end_address == 0 && e.unwind_data == 0 {
+                continue;
+            }
             entries.push(e);
         }
     }

@@ -5729,6 +5729,8 @@ pub fn dispatch_kernel32_extra(
         "duplicatehandle" => Ok(Some(handle_duplicate_handle(engine, state)?)),
         "getthreadpriority" => Ok(Some(handle_get_thread_priority(engine, state)?)),
         "raiseexception" => Ok(Some(handle_raise_exception(engine, state)?)),
+        "rtlcapturecontext" => Ok(Some(handle_rtl_capture_context(engine, state)?)),
+        "rtlunwindex" => Ok(Some(handle_rtl_unwind_ex(engine, state)?)),
         "findfirststreamw" => Ok(Some(handle_find_first_stream_w(engine, state)?)),
         "findnextstreamw" => Ok(Some(handle_find_next_stream_w(engine, state)?)),
         "deviceiocontrol" => Ok(Some(handle_device_io_control(engine, state)?)),
@@ -6566,7 +6568,7 @@ fn handle_get_thread_priority(
 /// Two-pass dispatch for the Itanium ABI (Mingw-w64 uses this via
 /// `__gxx_personality_seh0`).  Pass 1 searches for a handler; pass 2
 /// unwinds to it, running destructors along the way.
-fn handle_raise_exception(
+pub(crate) fn handle_raise_exception(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
@@ -6682,7 +6684,13 @@ fn handle_raise_exception(
         engine.write_rdx(ctx.gpr[5])?;   // EstablisherFrame = RBP
         engine.write_r8(ctx_ptr)?;
         engine.write_r9(disp_ctx_ptr)?;
-        engine.write_rsp(stack_frame.saturating_sub(32))?;
+        // Push a fake return address in the stop bitmap range so the
+        // personality can `ret` normally — run_until_stop will stop there.
+        let personality_ret_va = crate::fake_va::FAKE_API_BASE;
+        let call_rsp = stack_frame.saturating_sub(8);  // after-call RSP (return addr at [RSP])
+        engine.mem_write(call_rsp, &personality_ret_va.to_le_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write personality return address: {e}"))?;
+        engine.write_rsp(call_rsp)?;
         engine.write_rip(handler_va)?;
 
         engine.run_until_stop(handler_va, 0, 0, 100_000, 0, 0)
@@ -6703,16 +6711,28 @@ fn handle_raise_exception(
     let table_count = state.sync.function_tables.len();
     let total_entries: usize = state.sync.function_tables.values().map(|v| v.len()).sum();
     tracing::info!(tables = table_count, entries = total_entries, throw_rip = format_args!("{:#x}", throw_rip), "RaiseException dispatch");
+    // Log the .pdata range for diagnostic.
+    for (&base, entries) in &state.sync.function_tables {
+        if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
+            tracing::info!(image_base = format_args!("{:#x}", base), first = format_args!("{:#x}", first.begin_address), last_end = format_args!("{:#x}", last.end_address), "function table range");
+        }
+    }
 
     let mut handler_found: Option<(u64, u32, u64, crate::exception::RuntimeFunction, crate::exception::UnwindContext)> = None;
 
+    tracing::info!(pass = 1, throw_rip = format_args!("{:#x}", throw_rip), "starting search pass");
     for _frame in 0..64 {
         let entry = match crate::exception::lookup_function_entry(&state.sync, ctx.rip) {
             Some(e) => e,
             None => {
                 let mut rip_buf = [0u8; 8];
-                if read_mem(ctx.rsp, &mut rip_buf).is_err() { break; }
-                ctx.rip = u64::from_le_bytes(rip_buf);
+                if read_mem(ctx.rsp, &mut rip_buf).is_err() {
+                    tracing::warn!(pass = 1, frame = _frame, rip = format_args!("{:#x}", ctx.rip), rsp = format_args!("{:#x}", ctx.rsp), "blind unwind: failed to read return address");
+                    break;
+                }
+                let blind_rip = u64::from_le_bytes(rip_buf);
+                tracing::info!(pass = 1, frame = _frame, from_rip = format_args!("{:#x}", ctx.rip), to_rip = format_args!("{:#x}", blind_rip), rsp = format_args!("{:#x}", ctx.rsp), "blind unwind");
+                ctx.rip = blind_rip;
                 ctx.rsp = ctx.rsp.saturating_add(8);
                 continue;
             }
@@ -6720,11 +6740,13 @@ fn handle_raise_exception(
         let result = match crate::exception::virtual_unwind(&mut read_mem, entry.image_base, entry.entry, ctx) {
             Ok(r) => r, Err(_) => break,
         };
-        tracing::debug!(
+        tracing::info!(
             frame = _frame,
             rip = format_args!("{:#x}", ctx.rip),
+            caller_rip = format_args!("{:#x}", result.ctx.rip),
             has_handler = result.handler_rva.is_some(),
-            "unwind step"
+            handler = result.handler_rva.map_or(0, |h| h),
+            "search pass frame"
         );
         if let (Some(handler_rva), Some(handler_data)) = (result.handler_rva, result.handler_data) {
             let handler_va = entry.image_base.saturating_add(u64::from(handler_rva));
@@ -6752,20 +6774,34 @@ fn handle_raise_exception(
         gpr: tctx.gpr,
         xmm: tctx.xmm,
     };
+    tracing::info!(
+        pass = 2,
+        catch_rip = format_args!("{:#x}", catch_ctx.rip),
+        "starting unwind pass"
+    );
     for _frame in 0..64 {
+        tracing::info!(pass = 2, frame = _frame, rip = format_args!("{:#x}", ctx2.rip), "unwind step");
         if ctx2.rip == catch_ctx.rip {
-            // At the catching frame — call personality with unwind phase.
-            match call_personality(handler_va, &catch_ctx, 1, handler_data, image_base, &func_entry) {
-                Ok(URC_INSTALL_CONTEXT) => {
-                    // Personality modified the CONTEXT to point at the catch
-                    // block.  Read back the modified state and jump there.
-                    let saved_rsp = engine.read_rsp()?;
-                    let context_ptr = saved_rsp.saturating_sub(0x200);
+            // At the catching frame — call personality with unwind + handler flags.
+            // EXCEPTION_UNWINDING (1) | EXCEPTION_EXECUTE_HANDLER (2) = 3
+            // Without EXCEPTION_EXECUTE_HANDLER the personality won't install the landing pad.
+            let disposition = call_personality(handler_va, &catch_ctx, 3, handler_data, image_base, &func_entry);
+            tracing::info!(pass = 2, disposition = ?disposition, "personality returned at handler frame");
+            match disposition {
+                Ok(URC_INSTALL_CONTEXT) | Ok(URC_HANDLER_FOUND) => {
+                    // After call_personality returned, the engine's RSP
+                    // equals the `stack_frame` inside the closure
+                    // (= saved_rsp - 0x400).  Context was at stack_frame+0x100,
+                    // DispatcherContext at stack_frame+0x240.
+                    let rsp_after_return = engine.read_rsp()?;
+                    let ctx_ptr = rsp_after_return + 0x100;
                     let mut cbuf = [0u8; 256];
-                    engine.mem_read(context_ptr, &mut cbuf)
-                        .map_err(|e| anyhow::anyhow!("failed to read modified context: {e}"))?;
-                    let catch_rip = u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap());
-                    let catch_rsp = u64::from_le_bytes(cbuf[0x98..0xA0].try_into().unwrap());
+                    engine.mem_read(ctx_ptr, &mut cbuf)?;
+                    // The personality writes the landing pad address into
+                    // CONTEXT.Rip (offset 0xF8) and CONTEXT.Rsp (offset 0x98).
+                    let catch_rip = u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap_or([0; 8]));
+                    let catch_rsp = u64::from_le_bytes(cbuf[0x98..0xA0].try_into().unwrap_or([0; 8]));
+                    tracing::info!(catch_rip = format_args!("{:#x}", catch_rip), catch_rsp = format_args!("{:#x}", catch_rsp), "installing catch context");
                     if catch_rip == 0 { anyhow::bail!("personality returned null catch RIP"); }
                     engine.write_rip(catch_rip)?;
                     engine.write_rsp(catch_rsp)?;
@@ -6791,6 +6827,7 @@ fn handle_raise_exception(
         };
         if let (Some(handler_rva), Some(hdata)) = (result.handler_rva, result.handler_data) {
             let hva = entry.image_base.saturating_add(u64::from(handler_rva));
+            tracing::info!(pass = 2, frame = _frame, handler = format_args!("{:#x}", hva), "calling personality for cleanup");
             match call_personality(hva, &ctx2, 1, hdata, entry.image_base, entry.entry) {
                 Ok(URC_CONTINUE_UNWIND) => { /* destructor ran, continue */ }
                 Err(e) => anyhow::bail!("personality error during cleanup: {e}"),
@@ -6798,9 +6835,70 @@ fn handle_raise_exception(
             }
         }
         ctx2 = result.ctx;
+        tracing::info!(pass = 2, next_rip = format_args!("{:#x}", ctx2.rip), "unwound to caller");
     }
 
     anyhow::bail!("RaiseException: unwind pass failed to reach handler")
+}
+
+/// `RtlCaptureContext` — save current register context into a CONTEXT64.
+///
+/// RCX = pointer to CONTEXT64 structure in guest memory.
+fn handle_rtl_capture_context(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let ctx_ptr = engine.read_rcx()?;
+    if ctx_ptr == 0 {
+        let return_address = engine.return_from_win64_api(0)
+            .context("RtlCaptureContext: return failed")?;
+        return Ok(WinApiHandlerResult { return_address, return_value: 0 });
+    }
+
+    let tctx = engine.snapshot_thread_context();
+    use anyhow::Context;
+    // Write CONTEXT64 at ctx_ptr.
+    let mut cbuf = [0u8; 0x200];
+    // ContextFlags at +0x30
+    cbuf[0x30..0x34].copy_from_slice(&0x0010_001Fu32.to_le_bytes());
+    // GPRs at +0x78..+0xF8 (Rax..R15, then Rip at +0xF8)
+    for reg in 0..16 {
+        let off = 0x78 + reg * 8;
+        cbuf[off..off + 8].copy_from_slice(&tctx.gpr[reg].to_le_bytes());
+    }
+    cbuf[0xF8..0x100].copy_from_slice(&tctx.rip.to_le_bytes());
+    // Rflags at +0x44
+    cbuf[0x44..0x4C].copy_from_slice(&tctx.rflags.to_le_bytes());
+    // XMM registers at +0x100 (128-bit each, XMM0..XMM15)
+    for i in 0..16 {
+        let off = 0x100 + i * 16;
+        cbuf[off..off + 16].copy_from_slice(&tctx.xmm[i].to_le_bytes());
+    }
+    engine.mem_write(ctx_ptr, &cbuf)
+        .context("RtlCaptureContext: failed to write context")?;
+    let return_address = engine.return_from_win64_api(0)
+        .context("RtlCaptureContext: return failed")?;
+    Ok(WinApiHandlerResult { return_address, return_value: 0 })
+}
+
+/// `RtlUnwindEx` — forced stack unwinding.
+///
+/// Called by `__cxa_end_catch` during catch block cleanup.  WIE's
+/// `handle_raise_exception` already performed the full unwind, so
+/// this is a no-op stub — just return 0 (success).
+///
+/// RCX = TargetFrame (frame to unwind to, NULL = all)
+/// RDX = TargetIp    (landing pad after unwind)
+/// R8  = ExceptionRecord
+/// R9  = ReturnValue
+fn handle_rtl_unwind_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    use anyhow::Context;
+    let return_address = engine.return_from_win64_api(0)
+        .context("RtlUnwindEx: return failed")?;
+    Ok(WinApiHandlerResult { return_address, return_value: 0 })
 }
 
 /// `SetEvent`.
