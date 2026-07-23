@@ -6789,22 +6789,32 @@ pub(crate) fn handle_raise_exception(
             tracing::info!(pass = 2, disposition = ?disposition, "personality returned at handler frame");
             match disposition {
                 Ok(URC_INSTALL_CONTEXT) | Ok(URC_HANDLER_FOUND) => {
-                    // After call_personality returned, the engine's RSP
-                    // equals the `stack_frame` inside the closure
-                    // (= saved_rsp - 0x400).  Context was at stack_frame+0x100,
-                    // DispatcherContext at stack_frame+0x240.
-                    let rsp_after_return = engine.read_rsp()?;
-                    let ctx_ptr = rsp_after_return + 0x100;
+                    let rsp_after = engine.read_rsp()?;
+                    let ctx_ptr = rsp_after + 0x100;
+
                     let mut cbuf = [0u8; 256];
                     engine.mem_read(ctx_ptr, &mut cbuf)?;
-                    // The personality writes the landing pad address into
-                    // CONTEXT.Rip (offset 0xF8) and CONTEXT.Rsp (offset 0x98).
-                    let catch_rip = u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap_or([0; 8]));
-                    let catch_rsp = u64::from_le_bytes(cbuf[0x98..0xA0].try_into().unwrap_or([0; 8]));
-                    tracing::info!(catch_rip = format_args!("{:#x}", catch_rip), catch_rsp = format_args!("{:#x}", catch_rsp), "installing catch context");
-                    if catch_rip == 0 { anyhow::bail!("personality returned null catch RIP"); }
+                    let ctx_rip = u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap());
+                    let ctx_rsp = u64::from_le_bytes(cbuf[0x98..0xA0].try_into().unwrap());
+                    // Rcx at offset 0x80 — personality writes exception object ptr here
+                    let ctx_rcx = u64::from_le_bytes(cbuf[0x80..0x88].try_into().unwrap());
+
+                    let catch_rip = if ctx_rip != 0 { ctx_rip } else { catch_ctx.rip };
+                    let catch_rsp = if ctx_rsp != 0 { ctx_rsp } else { catch_ctx.rsp };
+                    if catch_rip == 0 {
+                        anyhow::bail!("personality returned null catch RIP");
+                    }
+                    tracing::info!(
+                        catch_rip = format_args!("{:#x}", catch_rip),
+                        catch_rsp = format_args!("{:#x}", catch_rsp),
+                        catch_rcx = format_args!("{:#x}", ctx_rcx),
+                        "installing catch context"
+                    );
                     engine.write_rip(catch_rip)?;
                     engine.write_rsp(catch_rsp)?;
+                    if ctx_rcx != 0 {
+                        engine.write_rcx(ctx_rcx)?;
+                    }
                     return Ok(WinApiHandlerResult { return_address: catch_rip, return_value: 0 });
                 }
                 Ok(URC_CONTINUE_UNWIND) => { /* done */ break; }

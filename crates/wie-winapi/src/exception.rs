@@ -105,11 +105,11 @@ impl UnwindInfo {
         (unpadded + 3) & !3 // round up to 4
     }
 
-    /// Total size including handler RVA + data if `FLAG_EHANDLER` is set.
+    /// Total size including handler RVA + data if any handler flag is set.
     #[inline]
     pub fn total_size(&self) -> usize {
         let base = self.header_size();
-        if self.flags & Self::FLAG_EHANDLER != 0 {
+        if self.flags & (Self::FLAG_EHANDLER | Self::FLAG_UHANDLER) != 0 {
             base + 8 // handler RVA (4) + handler data (4) per PE/COFF §5.2
         } else {
             base
