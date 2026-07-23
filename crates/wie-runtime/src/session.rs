@@ -1300,6 +1300,12 @@ impl RuntimeSession {
             {
                 let mut pair = self.process.lock_pair();
                 let (engine, winapi_state) = pair.both();
+                // Workers may have activated themselves while we ran pure guest
+                // code without the WinAPI lock. Reclaim primary identity before
+                // any dispatch that uses current_tid() (CS owner, TLS, waits).
+                if winapi_state.threads.active.tid != primary_tid {
+                    winapi_state.threads.activate(primary_tid);
+                }
 
                 let (hook, invalid_memory) = match hook_result {
                     Ok(result) => (result.code, result.invalid_memory),
@@ -1791,12 +1797,38 @@ impl RuntimeSession {
                         }
                         wie_winapi::HostParkReason::WaitObject { handle, timeout_ms } => {
                             // Detach waitable object, wait **outside** process locks
-                            // so workers can ExitThread / SetEvent.
+                            // so workers can ExitThread / SetEvent / CreateThread.
+                            let _ = self.process.drain_spawns();
+                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                                eprintln!(
+                                    "[mt] primary park WaitObject handle={handle:#x} timeout={timeout_ms:#x}"
+                                );
+                            }
                             let target = self.process.with_mut(|_, st| {
                                 wie_winapi::kernel32::resolve_wait_target(st, handle)
                             });
                             let result = match target {
-                                Some(t) => t.wait(timeout_ms),
+                                Some(t) => {
+                                    // Slice infinite waits: drain nested CreateThread
+                                    // from workers and observe process_dying.
+                                    if timeout_ms == wie_winapi::INFINITE {
+                                        loop {
+                                            let r = t.wait(50);
+                                            if r == wie_winapi::WAIT_OBJECT_0 {
+                                                break r;
+                                            }
+                                            let _ = self.process.drain_spawns();
+                                            let dying = self
+                                                .process
+                                                .with_winapi_ref(|st| st.sync.process_dying);
+                                            if dying {
+                                                break wie_winapi::WAIT_FAILED;
+                                            }
+                                        }
+                                    } else {
+                                        t.wait(timeout_ms)
+                                    }
+                                }
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
@@ -1808,6 +1840,10 @@ impl RuntimeSession {
                             charged_api = charged_api.saturating_add(1);
                         }
                         wie_winapi::HostParkReason::WaitMultiple => {
+                            let _ = self.process.drain_spawns();
+                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                                eprintln!("[mt] primary park WaitMultiple");
+                            }
                             let req = self
                                 .process
                                 .with_mut(|_, st| st.sync.multi_wait.remove(&primary_tid));
@@ -1817,11 +1853,31 @@ impl RuntimeSession {
                                         .process
                                         .with_mut(|_, st| st.sync.wait_targets(&req.handles));
                                     match targets {
-                                        Some(ts) => wie_winapi::wait_multiple(
-                                            &ts,
-                                            req.wait_all,
-                                            req.timeout_ms,
-                                        ),
+                                        Some(ts) => {
+                                            if req.timeout_ms == wie_winapi::INFINITE {
+                                                loop {
+                                                    let r = wie_winapi::wait_multiple(
+                                                        &ts, req.wait_all, 50,
+                                                    );
+                                                    if r != wie_winapi::WAIT_TIMEOUT {
+                                                        break r;
+                                                    }
+                                                    let _ = self.process.drain_spawns();
+                                                    let dying = self.process.with_winapi_ref(|st| {
+                                                        st.sync.process_dying
+                                                    });
+                                                    if dying {
+                                                        break wie_winapi::WAIT_FAILED;
+                                                    }
+                                                }
+                                            } else {
+                                                wie_winapi::wait_multiple(
+                                                    &ts,
+                                                    req.wait_all,
+                                                    req.timeout_ms,
+                                                )
+                                            }
+                                        }
                                         None => wie_winapi::WAIT_FAILED,
                                     }
                                 }

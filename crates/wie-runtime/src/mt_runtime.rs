@@ -103,6 +103,13 @@ impl ProcessResources {
         if spawns.is_empty() {
             return Ok(());
         }
+        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            eprintln!(
+                "[mt] drain_spawns count={} tids={:?}",
+                spawns.len(),
+                spawns.iter().map(|s| format!("{:#x}", s.tid)).collect::<Vec<_>>()
+            );
+        }
         let shared_winapi = Arc::clone(&self.shared_winapi);
         let config = Arc::new(self.config.clone());
         let shared_jit = self.shared_jit.clone();
@@ -165,6 +172,9 @@ fn worker_main(
     config: Arc<ProcessConfig>,
     tid: u32,
 ) {
+    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        eprintln!("[mt] worker_main start tid={tid:#x}");
+    }
     let layout = &config.layout;
     let budget = layout.instruction_budget;
     let fake_api_end = layout
@@ -178,6 +188,12 @@ fn worker_main(
         config.stop_bitmap.clone(),
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
+        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            eprintln!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
+        }
+        // Always mark finished so joiners do not hang forever.
+        let st = lock(&shared_winapi);
+        finish_tid(&st, tid, 1);
         return;
     }
 
@@ -240,6 +256,8 @@ fn worker_main(
         // can hit it if a throw originated on that thread).
         if hook.address == wie_winapi::seh_continue_trampoline_va() {
             let mut st = lock(&shared_winapi);
+            // Always re-activate: peer threads may have stolen `active` while we
+            // ran pure guest code without the WinAPI lock.
             st.threads.activate(tid);
             if let Err(e) = wie_winapi::seh::continue_pending(&mut *engine, &mut st) {
                 tracing::warn!(tid, error = %e, "worker SEH continue failed");
@@ -258,6 +276,7 @@ fn worker_main(
         let park_reason: Option<HostParkReason>;
         {
             let mut st = lock(&shared_winapi);
+            // Re-activate after pure guest run (primary/peers may have activated).
             st.threads.activate(tid);
             if st.sync.process_dying {
                 finish_tid(&st, tid, 1);

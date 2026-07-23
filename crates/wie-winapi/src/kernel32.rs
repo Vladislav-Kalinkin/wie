@@ -5403,6 +5403,13 @@ pub fn handle_resume_thread(
     let handle = engine.read_rcx()?;
     // Previous suspend count: 1 if we had it suspended, 0 if already running, -1 on error.
     if let Some(spawn) = state.sync.suspended_spawns.remove(&handle) {
+        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            eprintln!(
+                "[mt] ResumeThread handle={handle:#x} tid={:#x} pending→{}",
+                spawn.tid,
+                state.sync.pending_spawns.len() + 1,
+            );
+        }
         state.sync.pending_spawns.push(spawn);
         state.last_error = 0;
         return ret_u64(engine, 1, "ResumeThread");
@@ -6265,6 +6272,15 @@ pub fn create_guest_thread(
         drop(engine.mem_write(tid_out, &tid.to_le_bytes()));
     }
 
+    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        eprintln!(
+            "[mt] CreateThread tid={tid:#x} handle={handle:#x} start={start:#x} param={param:#x} flags={flags:#x} suspended={} pending={} active_tid={:#x}",
+            (flags & CREATE_SUSPENDED) != 0,
+            state.sync.pending_spawns.len(),
+            state.threads.current_tid(),
+        );
+    }
+
     state.last_error = 0;
     Ok(handle)
 }
@@ -6346,6 +6362,22 @@ fn handle_wait_for_single_object(
     let handle = engine.read_rcx()?;
     let timeout_raw = engine.read_rdx()?;
     let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
+
+    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        let kind = match state.sync.object(handle) {
+            Some(crate::KernelObject::Thread(t)) => {
+                format!("Thread(tid={:#x},fin={})", t.tid, t.is_finished())
+            }
+            Some(crate::KernelObject::Event(e)) => format!("Event(manual={})", e.manual_reset),
+            Some(crate::KernelObject::Semaphore(_)) => "Sem".into(),
+            None => "INVALID".into(),
+        };
+        eprintln!(
+            "[mt] WaitForSingleObject handle={handle:#x} timeout={timeout_ms:#x} kind={kind} active={:#x} pending={}",
+            state.threads.current_tid(),
+            state.sync.pending_spawns.len(),
+        );
+    }
 
     // Fast path: already signaled — no park.
     match state.sync.object(handle) {

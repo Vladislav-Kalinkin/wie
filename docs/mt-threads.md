@@ -19,6 +19,8 @@
 
 **Lock scope (critical):** the WinAPI mutex is held only for **activate / dispatch / state mutate**, **not** across pure `run_until_stop` guest compute. Host wait (`WaitFor*`, contended CS) parks **outside** the mutex so peers can `SetEvent` / `LeaveCriticalSection` / `ExitThread`.
 
+**Active-TID rule:** `ThreadState.active` is process-global. After pure guest compute (no WinAPI lock), a peer may have activated itself. **Every** dispatch path must `activate(own_tid)` again under the WinAPI lock before any handler that uses `current_tid()` (CS owner, TLS, waits). Missing re-activate on the primary thread caused false CS ownership and deadlocks under `7za -mmt2` (workers steal `active` while primary runs pure guest code).
+
 Default **guest** worker stack is **1 MiB** when `dwStackSize == 0` (Windows-like). Host OS threads for workers use an **8 MiB** stack so JIT/iced dispatch does not overflow secondary-thread defaults on macOS.
 
 Concurrent guest data planes are intentional after the per-thread engine change; structural map/unmap/protect still serializes via WinAPI handlers (and Iced write-locks on the shared `GuestMemory`).
@@ -66,6 +68,7 @@ Concurrent guest data planes are intentional after the per-thread engine change;
 | ---- | ---- | ------- |
 | `WIE_MT=0\|1` | Kill-switch: `0` makes `CreateThread` fail (`ERROR_NOT_SUPPORTED`) | enabled (unset ≠ 0) |
 | `WIE_MT_MAX_THREADS` | Cap on worker threads (`CreateThread`) | `64` |
+| `WIE_MT_DEBUG=1` | Stderr traces: CreateThread / ResumeThread / Wait / drain_spawns / worker start | off |
 | `WIE_MPROTECT` | Dual host mprotect (SPC remains oracle). Safe under current process-lock serialize; set `0` if diagnosing mprotect races later | on |
 | `WIE_GUEST_HEAP` | In-guest heap accel; keep off or locked under MT (default off) | off |
 
@@ -112,7 +115,8 @@ WIE_MT=0 ./scripts/run-micro-suite.sh   # skips mt_stress; CreateThread micros f
 
 | Symptom | Action |
 | ------- | ------ |
-| Hang on `WaitForSingleObject` | Check peer never signals; `ExitProcess` should wake via dying protocol |
-| Hang on CS Enter | Owner never Leave; dying wakes all CS queues |
+| Hang on `WaitForSingleObject` | Check peer never signals; `ExitProcess` should wake via dying protocol. Infinite primary waits are sliced (50 ms) so nested `CreateThread` can `drain_spawns` and `process_dying` is observed |
+| Hang on CS Enter | Owner never Leave; dying wakes all CS queues. If multi-thread only: confirm primary re-activates TID before dispatch (see Active-TID rule) |
+| Hang after “1 file, N bytes” on `7za -mmt*` | Historically active-TID race (fixed): primary Enter/Leave CS with worker TID. Set `WIE_MT_DEBUG=1` for CreateThread / Wait / drain traces on stderr |
 | `CreateThread` returns NULL | `WIE_MT=0` or hit `WIE_MT_MAX_THREADS` |
 | Stress flaky under iced | Raise timeout; engine is serialized so should be deterministic |
