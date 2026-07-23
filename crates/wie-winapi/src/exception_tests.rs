@@ -130,4 +130,26 @@ mod tests {
         assert_eq!(r.ctx.rip, 0x401000, "caller RIP");
         assert!(r.handler_rva.is_none());
     }
+
+    #[test]
+    fn handler_flag_returns_handler_rva() {
+        let mut mem = MemSim::new();
+        mem.map(0x1000, 16);
+        mem.write_u64(0x1000, 0x401000);
+        let info = UnwindInfo {
+            version: 1, flags: UnwindInfo::FLAG_EHANDLER,
+            size_of_prolog: 0, count_of_codes: 0,
+            frame_register: 0, frame_offset: 0,
+        };
+        let codes: [(u8, UnwindCode); 0] = [];
+        let xdata = encode_unwind(&info, &codes);
+        mem.map(0x6000, xdata.len() + 8);
+        mem.write_bytes(0x6000, &xdata);
+        mem.write_u64(0x6000 + info.header_size() as u64, 0x3000); // handler_rva=0x3000
+
+        let entry = runtime_function(0x1000, 0x1100, 0x6000);
+        let ctx = unwind_ctx(0x401050, 0x1000);
+        let r = virtual_unwind(&mut mem.reader(), 0, &entry, ctx).expect("unwind");
+        assert_eq!(r.handler_rva, Some(0x3000));
+    }
 }

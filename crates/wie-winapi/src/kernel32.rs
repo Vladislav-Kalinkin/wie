@@ -6561,164 +6561,246 @@ fn handle_get_thread_priority(
     })
 }
 
-/// `RaiseException` — start SEH exception processing.
+/// `RaiseException` — start exception processing.
 ///
-/// Single-pass SEH dispatch: walks the handler chain via RtlVirtualUnwind,
-/// calls each frame's personality function (e.g. __gxx_personality_seh0),
-/// and transfers control to the catch block when found.
+/// Two-pass dispatch for the Itanium ABI (Mingw-w64 uses this via
+/// `__gxx_personality_seh0`).  Pass 1 searches for a handler; pass 2
+/// unwinds to it, running destructors along the way.
 fn handle_raise_exception(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
+    // Itanium ABI disposition codes (Mingw-w64 personality return values).
+    const URC_CONTINUE_UNWIND: u32 = 0;
+    const URC_HANDLER_FOUND: u32 = 1;
+    const URC_INSTALL_CONTEXT: u32 = 2;
+
     let exception_record_ptr = engine.read_rcx()?;
 
-    // Snapshot current guest register state into an UnwindContext.
+    // Snapshot current guest state.  RIP is inside the RaiseException stub.
+    // The throw site is the caller — read the return address from [RSP].
     let tctx = engine.snapshot_thread_context();
-    let rip = tctx.rip;
     let rsp = engine.read_rsp()?;
-    let mut ctx = crate::exception::UnwindContext {
-        rip,
-        rsp,
-        gpr: tctx.gpr,
-        xmm: tctx.xmm,
-    };
+    let mut ra_buf = [0_u8; 8];
+    engine
+        .mem_read(rsp, &mut ra_buf)
+        .map_err(|e| anyhow::anyhow!("RaiseException: failed to read return address from stack: {e}"))?;
+    let throw_rip = u64::from_le_bytes(ra_buf);
+    let throw_rsp = rsp.saturating_add(8);
 
-    // Guest memory reader for the unwinder.  Uses a raw pointer to avoid
-    // conflicting with other mutable borrows of `engine` in the dispatch loop.
     let engine_ptr: *mut dyn wie_cpu::CpuEngine = engine;
     let mut read_mem = |va: u64, buf: &mut [u8]| {
         #[expect(unsafe_code)]
         unsafe { (*engine_ptr).mem_read(va, buf).map_err(|_| ()) }
     };
 
-    // Walk frames looking for a handler.
-    let max_frames = 64; // safety limit
-    for _frame in 0..max_frames {
+    // Helper: call the personality function with proper SEH ABI.
+    // SEH ABI (__gxx_personality_seh0 on Mingw-w64):
+    //   RCX = EXCEPTION_RECORD*
+    //   RDX = EstablisherFrame
+    //   R8  = CONTEXT*
+    //   R9  = DISPATCHER_CONTEXT*
+    // DISPATCHER_CONTEXT.HandlerData must point to the LSDA/gcc_except_table
+    // for the personality to find catch handlers.
+    let mut call_personality = |handler_va: u64,
+                                ctx: &crate::exception::UnwindContext,
+                                flags: u32,
+                                handler_data: u32,
+                                image_base: u64,
+                                func_entry: &crate::exception::RuntimeFunction|
+     -> Result<u32> {
+        // Write EXCEPTION_RECORD.ExceptionFlags = flags (0 = search, 1 = unwind).
+        engine.mem_write(exception_record_ptr.saturating_add(4), &flags.to_le_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write exception flags: {e}"))?;
+
+        let saved_rsp = engine.read_rsp()?;
+        let stack_frame = saved_rsp.saturating_sub(0x400);
+        let exc_rec_ptr  = stack_frame;
+        let ctx_ptr      = stack_frame.saturating_add(0x100);
+        let func_entry_ptr = stack_frame.saturating_add(0x200);
+        let disp_ctx_ptr = stack_frame.saturating_add(0x240);
+
+        // 1. Copy EXCEPTION_RECORD to guest stack.
+        let mut exc_buf = vec![0u8; 0x100];
+        engine.mem_read(exception_record_ptr, &mut exc_buf)
+            .map_err(|e| anyhow::anyhow!("failed to read exception record: {e}"))?;
+        engine.mem_write(exc_rec_ptr, &exc_buf)
+            .map_err(|e| anyhow::anyhow!("failed to write exception record: {e}"))?;
+
+        // 2. Write CONTEXT64 at ctx_ptr (real Windows offsets).
+        let mut cbuf = [0u8; 0x200];
+        cbuf[0..4].copy_from_slice(&0x0010_001Fu32.to_le_bytes()); // CONTEXT_ALL
+        let off = |r: usize| -> usize {
+            // GPR base at 0x78 in CONTEXT64.
+            0x78 + r * 8
+        };
+        cbuf[off(0)..off(0)+8].copy_from_slice(&ctx.gpr[0].to_le_bytes());   // Rax
+        cbuf[off(3)..off(3)+8].copy_from_slice(&ctx.gpr[3].to_le_bytes());   // Rbx
+        cbuf[off(4)..off(4)+8].copy_from_slice(&ctx.rsp.to_le_bytes());       // Rsp
+        cbuf[off(5)..off(5)+8].copy_from_slice(&ctx.gpr[5].to_le_bytes());   // Rbp
+        cbuf[off(6)..off(6)+8].copy_from_slice(&ctx.gpr[6].to_le_bytes());   // Rsi
+        cbuf[off(7)..off(7)+8].copy_from_slice(&ctx.gpr[7].to_le_bytes());   // Rdi
+        for r in 8..16 {
+            cbuf[off(r)..off(r)+8].copy_from_slice(&ctx.gpr[r].to_le_bytes());
+        }
+        // Rip at offset 0xF8
+        cbuf[0xF8..0x100].copy_from_slice(&ctx.rip.to_le_bytes());
+        engine.mem_write(ctx_ptr, &cbuf)
+            .map_err(|e| anyhow::anyhow!("failed to write context: {e}"))?;
+
+        // 3. Write RUNTIME_FUNCTION at func_entry_ptr in guest memory.
+        engine.mem_write(func_entry_ptr, &func_entry.begin_address.to_le_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write func_entry: {e}"))?;
+        engine.mem_write(func_entry_ptr.saturating_add(4), &func_entry.end_address.to_le_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write func_entry: {e}"))?;
+        engine.mem_write(func_entry_ptr.saturating_add(8), &func_entry.unwind_data.to_le_bytes())
+            .map_err(|e| anyhow::anyhow!("failed to write func_entry: {e}"))?;
+
+        // 4. Write DISPATCHER_CONTEXT at disp_ctx_ptr.
+        let mut dcbuf = [0u8; 0x40];
+        // +0x00: ControlPc = ctx.rip
+        dcbuf[0x00..0x08].copy_from_slice(&ctx.rip.to_le_bytes());
+        // +0x08: ImageBase
+        dcbuf[0x08..0x10].copy_from_slice(&image_base.to_le_bytes());
+        // +0x10: FunctionEntry (guest pointer)
+        dcbuf[0x10..0x18].copy_from_slice(&func_entry_ptr.to_le_bytes());
+        // +0x18: EstablisherFrame
+        dcbuf[0x18..0x20].copy_from_slice(&ctx.gpr[5].to_le_bytes()); // RBP
+        // +0x20: TargetIp (filled by personality)
+        // +0x28: ContextRecord
+        dcbuf[0x28..0x30].copy_from_slice(&ctx_ptr.to_le_bytes());
+        // +0x30: LanguageHandler
+        dcbuf[0x30..0x38].copy_from_slice(&handler_va.to_le_bytes());
+        // +0x38: HandlerData = LSDA pointer
+        let hdata_va = image_base.saturating_add(u64::from(handler_data));
+        dcbuf[0x38..0x40].copy_from_slice(&hdata_va.to_le_bytes());
+        engine.mem_write(disp_ctx_ptr, &dcbuf)
+            .map_err(|e| anyhow::anyhow!("failed to write dispatcher context: {e}"))?;
+
+        // 5. Set registers for SEH ABI call.
+        engine.write_rcx(exc_rec_ptr)?;
+        engine.write_rdx(ctx.gpr[5])?;   // EstablisherFrame = RBP
+        engine.write_r8(ctx_ptr)?;
+        engine.write_r9(disp_ctx_ptr)?;
+        engine.write_rsp(stack_frame.saturating_sub(32))?;
+        engine.write_rip(handler_va)?;
+
+        engine.run_until_stop(handler_va, 0, 0, 100_000, 0, 0)
+            .map_err(|e| anyhow::anyhow!("personality function failed: {e}"))?;
+        engine.read_rax().map(|v| v as u32)
+            .map_err(|e| anyhow::anyhow!("failed to read personality disposition: {e}"))
+    };
+
+    // ── Pass 1: search for a handler ──────────────────────────────────
+    let mut ctx = crate::exception::UnwindContext {
+        rip: throw_rip,
+        rsp: throw_rsp,
+        gpr: tctx.gpr,
+        xmm: tctx.xmm,
+    };
+
+    // Diagnostic: report table coverage.
+    let table_count = state.sync.function_tables.len();
+    let total_entries: usize = state.sync.function_tables.values().map(|v| v.len()).sum();
+    tracing::info!(tables = table_count, entries = total_entries, throw_rip = format_args!("{:#x}", throw_rip), "RaiseException dispatch");
+
+    let mut handler_found: Option<(u64, u32, u64, crate::exception::RuntimeFunction, crate::exception::UnwindContext)> = None;
+
+    for _frame in 0..64 {
         let entry = match crate::exception::lookup_function_entry(&state.sync, ctx.rip) {
             Some(e) => e,
             None => {
-                // Leaf function or no table — unwind blindly.
-                let mut rip_buf = [0_u8; 8];
-                if read_mem(ctx.rsp, &mut rip_buf).is_err() {
-                    break;
-                }
+                let mut rip_buf = [0u8; 8];
+                if read_mem(ctx.rsp, &mut rip_buf).is_err() { break; }
                 ctx.rip = u64::from_le_bytes(rip_buf);
                 ctx.rsp = ctx.rsp.saturating_add(8);
                 continue;
             }
         };
-
-        let result = match crate::exception::virtual_unwind(
-            &mut read_mem, entry.image_base, entry.entry, ctx,
-        ) {
-            Ok(r) => r,
-            Err(_) => break,
+        let result = match crate::exception::virtual_unwind(&mut read_mem, entry.image_base, entry.entry, ctx) {
+            Ok(r) => r, Err(_) => break,
         };
-
-        if let (Some(handler_rva), Some(_handler_data)) = (result.handler_rva, result.handler_data) {
-            // Call the personality function as guest code.
+        tracing::debug!(
+            frame = _frame,
+            rip = format_args!("{:#x}", ctx.rip),
+            has_handler = result.handler_rva.is_some(),
+            "unwind step"
+        );
+        if let (Some(handler_rva), Some(handler_data)) = (result.handler_rva, result.handler_data) {
             let handler_va = entry.image_base.saturating_add(u64::from(handler_rva));
-
-            // Save current guest state.
-            let saved_rip = engine.read_rip()?;
-            let saved_rsp = engine.read_rsp()?;
-
-            // Set up arguments for personality(EXCEPTION_POINTERS*).
-            // EXCEPTION_POINTERS = { ExceptionRecord*, ContextRecord* }.
-            // We pass the exception record pointer and a pointer to a
-            // minimal CONTEXT we write to guest stack.
-            let stack_frame = saved_rsp.saturating_sub(0x100); // make room
-            let context_ptr = stack_frame;
-            let except_ptrs_ptr = stack_frame.saturating_add(0x80);
-
-            // Write a minimal CONTEXT64 at context_ptr.
-            // We only need Rip, Rsp, and nonvolatile GPRs for the handler.
-            let mut ctx_buf = [0_u8; 256];
-            // ContextFlags = 0x10001F (CONTEXT_ALL)
-            ctx_buf[0..4].copy_from_slice(&0x0010_001F_u32.to_le_bytes());
-            // Rip at offset 0xF8
-            ctx_buf[0xF8..0x100].copy_from_slice(&ctx.rip.to_le_bytes());
-            // Rsp at offset 0x98
-            ctx_buf[0x98..0xA0].copy_from_slice(&ctx.rsp.to_le_bytes());
-            // Write nonvolatile GPRs (Rbx offset 0xA8, Rbp 0xB0, etc.)
-            // Simplified: just write the key ones
-            ctx_buf[0xA8..0xB0].copy_from_slice(&ctx.gpr[3].to_le_bytes()); // Rbx
-            ctx_buf[0xB0..0xB8].copy_from_slice(&ctx.gpr[5].to_le_bytes()); // Rbp
-
-            engine.mem_write(context_ptr, &ctx_buf).ok();
-            // EXCEPTION_POINTERS at except_ptrs_ptr
-            engine.mem_write(except_ptrs_ptr, &exception_record_ptr.to_le_bytes()).ok();
-            engine
-                .mem_write(
-                    except_ptrs_ptr.saturating_add(8),
-                    &context_ptr.to_le_bytes(),
-                )
-                .ok();
-
-            // Set up the guest call: RCX = EXCEPTION_POINTERS*, RIP = handler.
-            engine.write_rcx(except_ptrs_ptr)?;
-            engine.write_rsp(stack_frame.saturating_sub(32))?; // shadow space
-            engine.write_rip(handler_va)?;
-
-            // Run the personality function (limited budget — it should return quickly).
-            let hook = engine.run_until_stop(
-                handler_va, 0, 0, 100_000,
-                0, 0, // hook range unused
-            );
-
-            // Restore saved RIP/RSP (the personality function may have changed them).
-            let disposition = engine.read_rax()? as u32;
-
-            match hook {
-                Ok(_) => {
-                    // Personality returned.  Check disposition.
-                    // ExceptionContinueSearch (1) = not handled, keep unwinding.
-                    // ExceptionCollidedUnwind (3) = handler found on search pass.
-                    if disposition == 1 {
-                        // Continue searching — advance to caller frame.
-                        ctx = result.ctx;
-                        continue;
-                    }
-                    if disposition == 3 {
-                        // Handler found!  The personality modified the CONTEXT
-                        // to point at the catch block.  Restore guest state from
-                        // the modified CONTEXT.
-                        let mut final_ctx = [0_u8; 256];
-                        if engine.mem_read(context_ptr, &mut final_ctx).is_ok() {
-                            let catch_rip = u64::from_le_bytes(
-                                final_ctx[0xF8..0x100].try_into().unwrap_or([0; 8]),
-                            );
-                            let catch_rsp = u64::from_le_bytes(
-                                final_ctx[0x98..0xA0].try_into().unwrap_or([0; 8]),
-                            );
-                            if catch_rip != 0 {
-                                engine.write_rip(catch_rip)?;
-                                engine.write_rsp(catch_rsp)?;
-                                // Return with a fake return address — the catch
-                                // block expects to have been "called" by the
-                                // personality function.  We set RIP directly
-                                // so no return_from_win64_api needed.
-                                return Ok(WinApiHandlerResult {
-                                    return_address: saved_rip, // won't be used
-                                    return_value: 0,
-                                });
-                            }
-                        }
-                        break; // failed to read back context
-                    }
-                    // Other dispositions — abort unwinding.
+            match call_personality(handler_va, &ctx, 0, handler_data, entry.image_base, entry.entry) {
+                Ok(URC_HANDLER_FOUND) => {
+                    handler_found = Some((handler_va, handler_data, entry.image_base, *entry.entry, ctx));
                     break;
                 }
-                Err(_) => break, // personality function crashed
+                Ok(URC_CONTINUE_UNWIND) => { /* keep searching */ }
+                Err(e) => { anyhow::bail!("personality error during search: {e}"); }
+                _ => { break; }
             }
         }
-
-        // Advance to the caller frame.
         ctx = result.ctx;
     }
 
-    // No handler found — terminate with a fatal error.
-    anyhow::bail!("RaiseException: no handler found (unhandled C++ exception)")
+    let Some((handler_va, handler_data, image_base, func_entry, catch_ctx)) = handler_found else {
+        anyhow::bail!("RaiseException: no handler found (throw_rip={:#x})", throw_rip);
+    };
+
+    // ── Pass 2: unwind to the handler (run destructors) ───────────────
+    let mut ctx2 = crate::exception::UnwindContext {
+        rip: throw_rip,
+        rsp: throw_rsp,
+        gpr: tctx.gpr,
+        xmm: tctx.xmm,
+    };
+    for _frame in 0..64 {
+        if ctx2.rip == catch_ctx.rip {
+            // At the catching frame — call personality with unwind phase.
+            match call_personality(handler_va, &catch_ctx, 1, handler_data, image_base, &func_entry) {
+                Ok(URC_INSTALL_CONTEXT) => {
+                    // Personality modified the CONTEXT to point at the catch
+                    // block.  Read back the modified state and jump there.
+                    let saved_rsp = engine.read_rsp()?;
+                    let context_ptr = saved_rsp.saturating_sub(0x200);
+                    let mut cbuf = [0u8; 256];
+                    engine.mem_read(context_ptr, &mut cbuf)
+                        .map_err(|e| anyhow::anyhow!("failed to read modified context: {e}"))?;
+                    let catch_rip = u64::from_le_bytes(cbuf[0xF8..0x100].try_into().unwrap());
+                    let catch_rsp = u64::from_le_bytes(cbuf[0x98..0xA0].try_into().unwrap());
+                    if catch_rip == 0 { anyhow::bail!("personality returned null catch RIP"); }
+                    engine.write_rip(catch_rip)?;
+                    engine.write_rsp(catch_rsp)?;
+                    return Ok(WinApiHandlerResult { return_address: catch_rip, return_value: 0 });
+                }
+                Ok(URC_CONTINUE_UNWIND) => { /* done */ break; }
+                Err(e) => anyhow::bail!("personality error during unwind: {e}"),
+                _ => break,
+            }
+        }
+
+        let entry = match crate::exception::lookup_function_entry(&state.sync, ctx2.rip) {
+            Some(e) => e, None => {
+                let mut rip_buf = [0u8; 8];
+                if read_mem(ctx2.rsp, &mut rip_buf).is_err() { break; }
+                ctx2.rip = u64::from_le_bytes(rip_buf);
+                ctx2.rsp = ctx2.rsp.saturating_add(8);
+                continue;
+            }
+        };
+        let result = match crate::exception::virtual_unwind(&mut read_mem, entry.image_base, entry.entry, ctx2) {
+            Ok(r) => r, Err(_) => break,
+        };
+        if let (Some(handler_rva), Some(hdata)) = (result.handler_rva, result.handler_data) {
+            let hva = entry.image_base.saturating_add(u64::from(handler_rva));
+            match call_personality(hva, &ctx2, 1, hdata, entry.image_base, entry.entry) {
+                Ok(URC_CONTINUE_UNWIND) => { /* destructor ran, continue */ }
+                Err(e) => anyhow::bail!("personality error during cleanup: {e}"),
+                _ => { /* ignore other codes during unwind */ }
+            }
+        }
+        ctx2 = result.ctx;
+    }
+
+    anyhow::bail!("RaiseException: unwind pass failed to reach handler")
 }
 
 /// `SetEvent`.
