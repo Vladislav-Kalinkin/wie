@@ -5726,6 +5726,9 @@ pub fn dispatch_kernel32_extra(
         "waitformultipleobjects" => Ok(Some(handle_wait_for_multiple_objects(engine, state)?)),
         "movefilewithprogressw" => Ok(Some(handle_move_file_with_progress_w(engine, state)?)),
         "createhardlinkw" => Ok(Some(handle_create_hard_link_w(engine, state)?)),
+        "duplicatehandle" => Ok(Some(handle_duplicate_handle(engine, state)?)),
+        "getthreadpriority" => Ok(Some(handle_get_thread_priority(engine, state)?)),
+        "raiseexception" => Ok(Some(handle_raise_exception(engine, state)?)),
         "findfirststreamw" => Ok(Some(handle_find_first_stream_w(engine, state)?)),
         "findnextstreamw" => Ok(Some(handle_find_next_stream_w(engine, state)?)),
         "deviceiocontrol" => Ok(Some(handle_device_io_control(engine, state)?)),
@@ -6427,6 +6430,85 @@ fn handle_create_event(
         return_address,
         return_value: handle,
     })
+}
+
+/// `DuplicateHandle` — duplicate a kernel handle (often a pseudohandle
+/// like `GetCurrentProcess()` or `GetCurrentThread()`) into a real handle
+/// usable by another process or for access modification.
+fn handle_duplicate_handle(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    // RCX = hSourceProcessHandle (GetCurrentProcess pseudo-handle or real)
+    // RDX = hSourceHandle      (handle to duplicate)
+    // R8  = hTargetProcessHandle
+    // R9  = lpTargetHandle     (guest pointer to receive the duplicated handle)
+    // [RSP+0x28] = dwDesiredAccess
+    // [RSP+0x30] = bInheritHandle
+    // [RSP+0x38] = dwOptions
+    let _source_proc = engine.read_rcx()?;
+    let source_handle = engine.read_rdx()?;
+    let _target_proc = engine.read_r8()?;
+    let target_handle_ptr = engine.read_r9()?;
+
+    // Map pseudohandles to their kernel objects. Windows uses:
+    //   (HANDLE)-1 = GetCurrentProcess
+    //   (HANDLE)-2 = GetCurrentThread
+    let source_obj = if source_handle == u64::MAX {
+        // Current process pseudohandle: there is no explicit kernel object.
+        // The target pseudo-handle is just the raw value — accept it.
+        None
+    } else if source_handle == u64::MAX - 1 {
+        // Current thread pseudohandle: similarly, just pass it through.
+        None
+    } else {
+        // Real kernel handle: look up the object.
+        state.sync.objects.get(&source_handle).cloned()
+    };
+
+    let new_handle = if let Some(obj) = source_obj {
+        // Real kernel object: register a duplicate handle.
+        let handle = state.sync.next_handle;
+        state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+        state.sync.objects.insert(handle, obj);
+        handle
+    } else {
+        // Pseudohandle: pass the same pseudohandle value through.
+        // C++ CRT startup duplicates GetCurrentProcess/Thread this way.
+        source_handle
+    };
+
+    // Write the duplicated handle into guest memory.
+    engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?; // TRUE
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// `GetThreadPriority` → THREAD_PRIORITY_NORMAL (0).
+fn handle_get_thread_priority(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    // RCX = hThread — ignored; single-threaded emulation.
+    let return_address = engine.return_from_win64_api(0)?; // THREAD_PRIORITY_NORMAL
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// `RaiseException` — start SEH exception processing.
+///
+/// No SEH dispatcher yet (see docs/cpp-exceptions.md Phase 4).
+fn handle_raise_exception(
+    _engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    anyhow::bail!("RaiseException: SEH dispatcher not yet implemented")
 }
 
 /// `SetEvent`.
