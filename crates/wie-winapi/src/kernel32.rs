@@ -6,6 +6,7 @@ use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
     write_utf16_units as write_guest_utf16_units,
 };
+use crate::dll_loader;
 use crate::{FindHandle, FlsSlot, GlobalAtomRecord, OpenGuestFile, ResourceRecord, WinApiState};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -156,7 +157,6 @@ const FAKE_ADVAPI32_MODULE: u64 = 0x0000_0000_6100_4000;
 const FAKE_SHELL32_MODULE: u64 = 0x0000_0000_6100_5000;
 const FAKE_COMDLG32_MODULE: u64 = 0x0000_0000_6100_6000;
 const FAKE_WINMM_MODULE: u64 = 0x0000_0000_6100_7000;
-const FAKE_GENERIC_MODULE: u64 = 0x0000_0000_610f_0000;
 
 const INVALID_FILE_ATTRIBUTES: u64 = 0xffff_ffff;
 const FILE_ATTRIBUTE_DIRECTORY: u64 = 0x0000_0010;
@@ -890,15 +890,87 @@ fn resolve_loaded_module_handle(name: &str, main_image_base: u64, state: &WinApi
     }
 }
 
-/// Resolve or synthesize a module handle for `LoadLibrary*` (prototype always “loads”).
-fn load_module_handle(name: &str, main_image_base: u64, state: &WinApiState) -> u64 {
-    let loaded = resolve_loaded_module_handle(name, main_image_base, state);
-    if loaded != 0 {
-        loaded
-    } else if name.trim().is_empty() {
-        0
+/// Resolve a DLL by name: first check loaded and fake modules, then try to load from disk.
+fn resolve_or_load_dll(
+    name: &str,
+    engine: &mut dyn wie_cpu::CpuEngine,
+    environment: crate::WinApiEnvironment,
+    state: &mut WinApiState,
+) -> u64 {
+    let clean = name.trim().trim_matches('"');
+    if clean.is_empty() {
+        state.last_error = ERROR_MOD_NOT_FOUND;
+        return 0;
+    }
+
+    // 1. Check if it's the main module.
+    if is_main_module_name(state, name) {
+        return environment.image_base;
+    }
+
+    // 2. Check fake/well-known modules.
+    let fake_handle = resolve_loaded_module_handle(name, environment.image_base, state);
+    if fake_handle != 0 {
+        return fake_handle;
+    }
+
+    // 3. Check already-loaded real modules. Bump refcount per LoadLibrary contract.
+    let norm = normalize_module_name(name);
+    if let Some(module) = state.loaded_modules.get_mut(&norm) {
+        module.ref_count = module.ref_count.saturating_add(1);
+        return module.handle;
+    }
+
+    // 4. Try to load from disk (requires import_resolver).
+    let mut resolver_opt = state.import_resolver.take();
+    let Some(ref mut resolver) = resolver_opt else {
+        state.last_error = ERROR_MOD_NOT_FOUND;
+        return 0;
+    };
+
+    // Resolve DLL path via search order.
+    let host_path = crate::dll_loader::resolve_dll_path(name, &state.main_module_path, &state.volumes);
+    let Some(ref host) = host_path else {
+        state.import_resolver = resolver_opt;
+        state.last_error = ERROR_MOD_NOT_FOUND;
+        return 0;
+    };
+
+    // Build a guest-style path from the host path for the module descriptor.
+    let guest_path = resolve_windows_dll_path(name, &state.main_module_path);
+
+    match crate::dll_loader::load_dll(engine, state, host, &guest_path, resolver) {
+        Ok(result) => {
+            state.import_resolver = resolver_opt;
+            // Recursively load dependencies. If any dependency fails to
+            // load, the parent load also fails (Windows LoadLibrary contract).
+            for dep in &result.dependencies {
+                if resolve_or_load_dll(dep, engine, environment, state) == 0 {
+                    state.last_error = ERROR_MOD_NOT_FOUND;
+                    return 0;
+                }
+            }
+            result.module.handle
+        }
+        Err(e) => {
+            state.import_resolver = resolver_opt;
+            tracing::warn!("failed to load DLL {}: {e}", name);
+            state.last_error = ERROR_MOD_NOT_FOUND;
+            0
+        }
+    }
+}
+
+/// Build a guest Windows-style path for a DLL name relative to the main module directory.
+fn resolve_windows_dll_path(name: &str, main_module_path: &str) -> String {
+    if name.contains('\\') || name.contains('/') || name.contains(':') {
+        return name.to_owned();
+    }
+    if let Some(parent) = std::path::Path::new(main_module_path).parent() {
+        let dir = parent.to_string_lossy().replace('/', "\\");
+        format!("{}\\{name}", dir)
     } else {
-        FAKE_GENERIC_MODULE
+        format!("C:\\App\\{name}")
     }
 }
 
@@ -2441,9 +2513,7 @@ pub fn handle_heap_size(
     })
 }
 
-/// Handles `KERNEL32.dll!LoadLibraryA`.
-///
-/// Microsoft Learn: empty / NULL name fails with `ERROR_MOD_NOT_FOUND`.
+/// Handles `KERNEL32.dll!LoadLibraryA` — real DLL loading.
 pub fn handle_load_library_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -2458,7 +2528,7 @@ pub fn handle_load_library_a(
         0
     } else {
         let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
-        let handle = load_module_handle(&library_name, environment.image_base, state);
+        let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.last_error = ERROR_MOD_NOT_FOUND;
         } else {
@@ -2477,7 +2547,7 @@ pub fn handle_load_library_a(
     })
 }
 
-/// Handles `KERNEL32.dll!LoadLibraryW`.
+/// Handles `KERNEL32.dll!LoadLibraryW` — real DLL loading.
 pub fn handle_load_library_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
@@ -2492,7 +2562,7 @@ pub fn handle_load_library_w(
         0
     } else {
         let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
-        let handle = load_module_handle(&library_name, environment.image_base, state);
+        let handle = resolve_or_load_dll(&library_name, engine, environment, state);
         if handle == 0 {
             state.last_error = ERROR_MOD_NOT_FOUND;
         } else {
@@ -2520,12 +2590,50 @@ pub fn handle_free_library(
         .read_rcx()
         .context("failed to read RCX for FreeLibrary")?;
 
-    // Return TRUE if handle is non-zero (valid-looking module handle).
-    let return_value = u64::from(module_handle != 0);
-    state.last_error = if module_handle == 0 {
-        ERROR_INVALID_HANDLE
-    } else {
+    let return_value = if module_handle == 0 {
+        state.last_error = ERROR_INVALID_HANDLE;
         0
+    } else if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
+        // Real loaded module — decrement refcount.
+        let name = match state
+            .loaded_modules
+            .iter()
+            .find(|(_, m)| m.handle == module_handle)
+            .map(|(n, _)| n.clone())
+        {
+            Some(n) => n,
+            None => {
+                state.last_error = ERROR_INVALID_HANDLE;
+                let return_address = engine.return_from_win64_api(0)?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: 0,
+                });
+            }
+        };
+
+        if let Some(module) = state.loaded_modules.get_mut(&name) {
+            if module.ref_count > 0 {
+                module.ref_count -= 1;
+            }
+            if module.ref_count == 0 {
+                // Unmap from guest memory via virtual_protect (PAGE_NOACCESS).
+                let _unused = engine.virtual_protect(
+                    module.image_base,
+                    module.image_size,
+                    wie_cpu::protect::PAGE_NOACCESS,
+                );
+                // Evict GetProcAddress cache entries for this module.
+                state.get_proc_address_cache.retain(|_, entry| entry.module_handle != module_handle);
+                state.loaded_modules.remove(&name);
+            }
+        }
+        state.last_error = 0;
+        1
+    } else {
+        // Fake module handle — always succeed (legacy behavior).
+        state.last_error = 0;
+        1
     };
 
     let return_address = engine
@@ -2556,23 +2664,72 @@ pub fn handle_get_proc_address(
 
     // Microsoft Learn: if `lpProcName` is an ordinal, the high bits are zero
     // (MAKEINTRESOURCE). We treat small pointers as ordinals.
-    let proc_name = if proc_name_ptr <= 0xffff {
-        format!("ORDINAL {proc_name_ptr:#x}")
+    let (proc_name, is_ordinal) = if proc_name_ptr <= 0xffff {
+        (format!("ORDINAL {proc_name_ptr:#x}"), true)
     } else {
-        read_guest_ansi_lossy(engine, proc_name_ptr, 256)
-            .context("failed to read GetProcAddress proc name")?
+        (
+            read_guest_ansi_lossy(engine, proc_name_ptr, 256)
+                .context("failed to read GetProcAddress proc name")?,
+            false,
+        )
     };
 
     let name_key = proc_name.to_ascii_lowercase();
 
-    let return_value = if module_handle == 0 {
-        state.last_error = ERROR_MOD_NOT_FOUND;
-        0
-    } else if let Some(cached) = state.get_proc_address_cache.get_mut(&name_key) {
+    // Check cache first.
+    if let Some(cached) = state.get_proc_address_cache.get_mut(&name_key) {
         cached.hit_count = cached.hit_count.saturating_add(1);
         state.last_error = 0;
-        cached.address
-    } else if let Some(address) = crate::dynamic_apis::resolve_get_proc_address(&proc_name) {
+        let return_address = engine.return_from_win64_api(cached.address)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: cached.address,
+        });
+    }
+
+    // For real loaded module handles, search the export table.
+    if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
+        if let Some(module) = state
+            .loaded_modules
+            .values()
+            .find(|m| m.handle == module_handle)
+        {
+            let va = if is_ordinal {
+                let ordinal = proc_name_ptr as u16;
+                module.get_export_va_by_ordinal(ordinal)
+            } else {
+                module.get_export_va(&proc_name)
+            };
+
+            if let Some(address) = va {
+                // Cache and return.
+                state.get_proc_address_cache.insert(
+                    name_key,
+                    crate::GetProcAddressCacheEntry {
+                        name: proc_name.clone().into(),
+                        module_handle,
+                        address,
+                        hit_count: 1,
+                    },
+                );
+                state.last_error = 0;
+                let return_address = engine.return_from_win64_api(address)?;
+                return Ok(WinApiHandlerResult {
+                    return_address,
+                    return_value: address,
+                });
+            }
+        }
+        state.last_error = ERROR_PROC_NOT_FOUND;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    // Fall back to existing fake-API resolution for fake module handles.
+    if let Some(address) = crate::dynamic_apis::resolve_get_proc_address(&proc_name) {
         state.get_proc_address_cache.insert(
             name_key,
             crate::GetProcAddressCacheEntry {
@@ -2583,20 +2740,18 @@ pub fn handle_get_proc_address(
             },
         );
         state.last_error = 0;
-        address
-    } else {
-        // Docs: return NULL, set last error — do not fail the API dispatch.
-        state.last_error = ERROR_PROC_NOT_FOUND;
-        0
-    };
+        let return_address = engine.return_from_win64_api(address)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: address,
+        });
+    }
 
-    let return_address = engine
-        .return_from_win64_api(return_value)
-        .context("failed to return from GetProcAddress")?;
-
+    state.last_error = ERROR_PROC_NOT_FOUND;
+    let return_address = engine.return_from_win64_api(0)?;
     Ok(WinApiHandlerResult {
         return_address,
-        return_value,
+        return_value: 0,
     })
 }
 
@@ -2880,11 +3035,11 @@ pub fn handle_find_close(
     })
 }
 
-/// Handles `KERNEL32.dll!LoadLibraryExA`.
+/// Handles `KERNEL32.dll!LoadLibraryExA` — real DLL loading.
 pub fn handle_load_library_ex_a(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let library_name_ptr = engine
         .read_rcx()
@@ -2899,7 +3054,7 @@ pub fn handle_load_library_ex_a(
         .context("failed to read R8 for LoadLibraryExA")?;
 
     let library_name = read_ansi_string_from_cpu(engine, library_name_ptr, 260)?;
-    let return_value = load_module_handle(&library_name, environment.image_base, state);
+    let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
     let return_address = engine
         .return_from_win64_api(return_value)
@@ -2911,11 +3066,11 @@ pub fn handle_load_library_ex_a(
     })
 }
 
-/// Handles `KERNEL32.dll!LoadLibraryExW`.
+/// Handles `KERNEL32.dll!LoadLibraryExW` — real DLL loading.
 pub fn handle_load_library_ex_w(
     engine: &mut dyn wie_cpu::CpuEngine,
     environment: crate::WinApiEnvironment,
-    state: &WinApiState,
+    state: &mut WinApiState,
 ) -> Result<WinApiHandlerResult> {
     let library_name_ptr = engine
         .read_rcx()
@@ -2930,7 +3085,7 @@ pub fn handle_load_library_ex_w(
         .context("failed to read R8 for LoadLibraryExW")?;
 
     let library_name = read_wide_string_from_cpu(engine, library_name_ptr, 260)?;
-    let return_value = load_module_handle(&library_name, environment.image_base, state);
+    let return_value = resolve_or_load_dll(&library_name, engine, environment, state);
 
     let return_address = engine
         .return_from_win64_api(return_value)

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod dll_loader;
 pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;
@@ -81,7 +82,6 @@ pub struct WinApiEnvironment {
     pub process_heap_handle: u64,
 }
 
-#[derive(Debug, Clone)]
 pub struct WinApiState {
     /// Process heap: segregated freelist + bump (see [`GuestHeap`]).
     pub heap: GuestHeap,
@@ -328,6 +328,199 @@ pub struct WinApiState {
 
     /// In-progress SEH / C++ EH continuation (UnwindMap + catch funclets).
     pub seh_pending: Option<seh::SehPending>,
+
+    /// Import resolver for dynamic DLL loading.
+    ///
+    /// Set once at session init by the runtime (`wie-runtime::session`).
+    /// Resolves `(library, name, iat_slot_va)` → fake API VA for import patching.
+    /// `None` means dynamic loading is unavailable (falls back to fake handles).
+    pub import_resolver: Option<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
+
+    /// Dynamically loaded DLL modules (real, not fake stubs).
+    /// Keyed by normalized (lowercase) module name without extension.
+    pub loaded_modules: HashMap<String, dll_loader::LoadedModule>,
+
+    /// Next real loaded module handle (monotonically increasing, each step by 0x1000).
+    pub next_module_handle: u64,
+}
+
+// Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
+impl std::fmt::Debug for WinApiState {
+    #[expect(clippy::todo, reason = "exhaustive field listing")]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinApiState")
+            .field("heap", &self.heap)
+            .field("next_fls_index", &self.next_fls_index)
+            .field("fls_slots", &self.fls_slots)
+            .field("last_error", &self.last_error)
+            .field("next_registry_key_handle", &self.next_registry_key_handle)
+            .field("registry_keys", &self.registry_keys)
+            .field("next_find_handle", &self.next_find_handle)
+            .field("find_handles", &self.find_handles)
+            .field("executable_file_size", &self.executable_file_size)
+            .field("executable_file_bytes", &self.executable_file_bytes)
+            .field("main_module_file_name", &self.main_module_file_name)
+            .field("main_module_path", &self.main_module_path)
+            .field("threads", &self.threads)
+            .field("sync", &self.sync)
+            .field("bottle_root", &self.bottle_root)
+            .field("volumes", &self.volumes)
+            .field("executable_file_cursor", &self.executable_file_cursor)
+            .field("host_file_mounts", &self.host_file_mounts)
+            .field("virtual_files", &self.virtual_files)
+            .field("open_files", &self.open_files)
+            .field("next_file_handle", &self.next_file_handle)
+            .field("next_resource_handle", &self.next_resource_handle)
+            .field("resources", &self.resources)
+            .field("current_directory_wide", &self.current_directory_wide)
+            .field("window_long_ptr_values", &self.window_long_ptr_values)
+            .field("image_list_counts", &self.image_list_counts)
+            .field("image_list_background_colors", &self.image_list_background_colors)
+            .field("window_visible", &self.window_visible)
+            .field("window_enabled", &self.window_enabled)
+            .field("active_window_handle", &self.active_window_handle)
+            .field("foreground_window_handle", &self.foreground_window_handle)
+            .field("focus_window_handle", &self.focus_window_handle)
+            .field("capture_window_handle", &self.capture_window_handle)
+            .field("cursor_handle", &self.cursor_handle)
+            .field("window_title", &self.window_title)
+            .field("window_x", &self.window_x)
+            .field("window_y", &self.window_y)
+            .field("window_width", &self.window_width)
+            .field("window_height", &self.window_height)
+            .field("window_invalidated", &self.window_invalidated)
+            .field("tick_count", &self.tick_count)
+            .field("keyboard_state", &self.keyboard_state)
+            .field("next_timer_id", &self.next_timer_id)
+            .field("timers", &self.timers)
+            .field("next_global_atom", &self.next_global_atom)
+            .field("global_atoms", &self.global_atoms)
+            .field("next_windows_hook_handle", &self.next_windows_hook_handle)
+            .field("windows_hooks", &self.windows_hooks)
+            .field("d3d9_current_vertex_shader", &self.d3d9_current_vertex_shader)
+            .field("d3d9_current_fvf", &self.d3d9_current_fvf)
+            .field("d3d9_render_states", &self.d3d9_render_states)
+            .field("d3d9_texture_stage_states", &self.d3d9_texture_stage_states)
+            .field("d3d9_sampler_states", &self.d3d9_sampler_states)
+            .field("menu_item_states", &self.menu_item_states)
+            .field("menu_item_check_states", &self.menu_item_check_states)
+            .field("message_queue", &self.message_queue)
+            .field("next_message_time", &self.next_message_time)
+            .field("d3d9_device_object_address", &self.d3d9_device_object_address)
+            .field("d3d9_device_ref_count", &self.d3d9_device_ref_count)
+            .field("d3d9_object_address", &self.d3d9_object_address)
+            .field("d3d9_ref_count", &self.d3d9_ref_count)
+            .field("message_queue_idle_policy", &self.message_queue_idle_policy)
+            .field("next_window_class_atom", &self.next_window_class_atom)
+            .field("window_classes", &self.window_classes)
+            .field("next_window_handle", &self.next_window_handle)
+            .field("windows", &self.windows)
+            .field("get_proc_address_cache", &self.get_proc_address_cache)
+            .field("file_dialog_policy", &self.file_dialog_policy)
+            .field("last_file_dialog_path", &self.last_file_dialog_path)
+            .field("comm_dlg_extended_error", &self.comm_dlg_extended_error)
+            .field("next_menu_handle", &self.next_menu_handle)
+            .field("guest_io", &self.guest_io)
+            .field("guest_file_data_next", &self.guest_file_data_next)
+            .field("guest_fls_table_va", &self.guest_fls_table_va)
+            .field("stdin_bytes", &self.stdin_bytes)
+            .field("stdin_cursor", &self.stdin_cursor)
+            .field("stdin_mode", &self.stdin_mode)
+            .field("seh_pending", &self.seh_pending)
+            .field("import_resolver", &"<closure>")
+            .field("loaded_modules", &self.loaded_modules)
+            .field("next_module_handle", &self.next_module_handle)
+            .finish()
+    }
+}
+
+// Manual Clone impl: Box<dyn FnMut + Send> does not implement Clone.
+impl Clone for WinApiState {
+    fn clone(&self) -> Self {
+        Self {
+            heap: self.heap.clone(),
+            next_fls_index: self.next_fls_index,
+            fls_slots: self.fls_slots.clone(),
+            last_error: self.last_error,
+            next_registry_key_handle: self.next_registry_key_handle,
+            registry_keys: self.registry_keys.clone(),
+            next_find_handle: self.next_find_handle,
+            find_handles: self.find_handles.clone(),
+            executable_file_size: self.executable_file_size,
+            executable_file_bytes: self.executable_file_bytes.clone(),
+            main_module_file_name: self.main_module_file_name.clone(),
+            main_module_path: self.main_module_path.clone(),
+            threads: self.threads.clone(),
+            sync: self.sync.clone(),
+            bottle_root: self.bottle_root.clone(),
+            volumes: self.volumes.clone(),
+            executable_file_cursor: self.executable_file_cursor,
+            host_file_mounts: self.host_file_mounts.clone(),
+            virtual_files: self.virtual_files.clone(),
+            open_files: self.open_files.clone(),
+            next_file_handle: self.next_file_handle,
+            next_resource_handle: self.next_resource_handle,
+            resources: self.resources.clone(),
+            current_directory_wide: self.current_directory_wide.clone(),
+            window_long_ptr_values: self.window_long_ptr_values.clone(),
+            image_list_counts: self.image_list_counts.clone(),
+            image_list_background_colors: self.image_list_background_colors.clone(),
+            window_visible: self.window_visible,
+            window_enabled: self.window_enabled,
+            active_window_handle: self.active_window_handle,
+            foreground_window_handle: self.foreground_window_handle,
+            focus_window_handle: self.focus_window_handle,
+            capture_window_handle: self.capture_window_handle,
+            cursor_handle: self.cursor_handle,
+            window_title: self.window_title.clone(),
+            window_x: self.window_x,
+            window_y: self.window_y,
+            window_width: self.window_width,
+            window_height: self.window_height,
+            window_invalidated: self.window_invalidated,
+            tick_count: self.tick_count,
+            keyboard_state: self.keyboard_state,
+            next_timer_id: self.next_timer_id,
+            timers: self.timers.clone(),
+            next_global_atom: self.next_global_atom,
+            global_atoms: self.global_atoms.clone(),
+            next_windows_hook_handle: self.next_windows_hook_handle,
+            windows_hooks: self.windows_hooks.clone(),
+            d3d9_current_vertex_shader: self.d3d9_current_vertex_shader,
+            d3d9_current_fvf: self.d3d9_current_fvf,
+            d3d9_render_states: self.d3d9_render_states.clone(),
+            d3d9_texture_stage_states: self.d3d9_texture_stage_states.clone(),
+            d3d9_sampler_states: self.d3d9_sampler_states.clone(),
+            menu_item_states: self.menu_item_states.clone(),
+            menu_item_check_states: self.menu_item_check_states.clone(),
+            message_queue: self.message_queue.clone(),
+            next_message_time: self.next_message_time,
+            d3d9_device_object_address: self.d3d9_device_object_address,
+            d3d9_device_ref_count: self.d3d9_device_ref_count,
+            d3d9_object_address: self.d3d9_object_address,
+            d3d9_ref_count: self.d3d9_ref_count,
+            message_queue_idle_policy: self.message_queue_idle_policy,
+            next_window_class_atom: self.next_window_class_atom,
+            window_classes: self.window_classes.clone(),
+            next_window_handle: self.next_window_handle,
+            windows: self.windows.clone(),
+            get_proc_address_cache: self.get_proc_address_cache.clone(),
+            file_dialog_policy: self.file_dialog_policy.clone(),
+            last_file_dialog_path: self.last_file_dialog_path.clone(),
+            comm_dlg_extended_error: self.comm_dlg_extended_error,
+            next_menu_handle: self.next_menu_handle,
+            guest_io: self.guest_io.clone(),
+            guest_file_data_next: self.guest_file_data_next,
+            guest_fls_table_va: self.guest_fls_table_va,
+            stdin_bytes: self.stdin_bytes.clone(),
+            stdin_cursor: self.stdin_cursor,
+            stdin_mode: self.stdin_mode,
+            seh_pending: self.seh_pending.clone(),
+            import_resolver: None, // Box<dyn FnMut + Send> is not Clone
+            loaded_modules: self.loaded_modules.clone(),
+            next_module_handle: self.next_module_handle,
+        }
+    }
 }
 
 /// Source policy for console `ReadFile(STD_INPUT_HANDLE)`.
@@ -902,6 +1095,9 @@ mod tests {
             stdin_cursor: 0,
             stdin_mode: GuestStdinMode::InjectOnly,
             seh_pending: None,
+            import_resolver: None,
+            loaded_modules: HashMap::new(),
+            next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
         }
     }
 

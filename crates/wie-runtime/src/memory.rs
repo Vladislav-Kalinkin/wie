@@ -324,6 +324,9 @@ pub(crate) fn default_winapi_state(
         // Session bootstrap overwrites: empty inject ⇒ LiveHost.
         stdin_mode: wie_winapi::GuestStdinMode::InjectOnly,
         seh_pending: None,
+        import_resolver: None,
+        loaded_modules: std::collections::HashMap::new(),
+        next_module_handle: wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
     })
 }
 

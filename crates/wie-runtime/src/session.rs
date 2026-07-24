@@ -1088,6 +1088,16 @@ impl RuntimeSession {
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
 
+        // Set the import resolver for dynamic DLL loading.
+        {
+            let mut soft = soft_apis.clone();
+            winapi_state.import_resolver = Some(Box::new(move |lib, name, slot| {
+                let (va, _entry) = crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(va)
+            }));
+        }
+
         let mut session = Self::from_init(SessionInit {
             engine,
             environment,
