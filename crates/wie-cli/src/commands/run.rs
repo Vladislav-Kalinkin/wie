@@ -60,15 +60,50 @@ pub(crate) fn run_micro(
         summary.run.termination
     );
 
-    for event in &summary.run.events {
+    // Full event dumps are useful for micros (small max-api). Real tools like
+    // 7za generate tens of thousands of stops — printing them all drowns guest
+    // console output and makes it look like "logs only appear at the end".
+    // `WIE_API_TRACE=1` forces a full dump; otherwise show head+tail only.
+    const HEAD: usize = 32;
+    const TAIL: usize = 32;
+    let events = &summary.run.events;
+    let force_full = std::env::var_os("WIE_API_TRACE").is_some();
+    if force_full || events.len() <= HEAD + TAIL {
+        for event in events {
+            println!(
+                "  [{:>4}] {}!{} handled={} ret={:?}",
+                event.index,
+                event.library.as_ref(),
+                event.name.as_ref(),
+                event.handled,
+                event.return_value
+            );
+        }
+    } else {
+        for event in events.iter().take(HEAD) {
+            println!(
+                "  [{:>4}] {}!{} handled={} ret={:?}",
+                event.index,
+                event.library.as_ref(),
+                event.name.as_ref(),
+                event.handled,
+                event.return_value
+            );
+        }
+        let omitted = events.len().saturating_sub(HEAD + TAIL);
         println!(
-            "  [{:>4}] {}!{} handled={} ret={:?}",
-            event.index,
-            event.library.as_ref(),
-            event.name.as_ref(),
-            event.handled,
-            event.return_value
+            "  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …"
         );
+        for event in events.iter().skip(events.len().saturating_sub(TAIL)) {
+            println!(
+                "  [{:>4}] {}!{} handled={} ret={:?}",
+                event.index,
+                event.library.as_ref(),
+                event.name.as_ref(),
+                event.handled,
+                event.return_value
+            );
+        }
     }
 
     if let Some(profile) = &summary.profile {

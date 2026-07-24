@@ -5758,6 +5758,8 @@ const DEFAULT_WORKER_STACK: usize = 0x10_0000;
 /// Guest VA region for worker stacks (distinct from primary stack at 0x2000_0000).
 const WORKER_STACK_REGION_BASE: u64 = 0x0000_0000_2200_0000;
 const WORKER_STACK_STRIDE: u64 = 0x0000_0000_0020_0000;
+/// Windows x64 CALL/thread entry frame: 0x20 home space + 0x8 return address.
+const THREAD_ENTRY_HOME_AND_RET: usize = 0x28;
 
 const CREATE_SUSPENDED: u32 = 0x4;
 const MEM_COMMIT: u32 = 0x1000;
@@ -6237,10 +6239,18 @@ pub fn create_guest_thread(
 
     let stack_top = stack_base.saturating_add(u64::try_from(stack_size).unwrap_or(0));
     let aligned_top = stack_top & !0xF_u64;
-    // At ThreadProc entry: [RSP]=retaddr, RSP%16==8 (as after CALL).
+    // Windows x64 thread entry / CALL ABI:
+    //   [RSP+0x00]       = return address
+    //   [RSP+0x08..0x28) = caller home space (32 bytes) — callees may store rbx/rdi there
+    //                      via `mov [rsp+0x40], reg` after `sub rsp, 0x28`
+    //   RSP % 16 == 8
     // Retaddr 0 → worker loop treats RIP=0 as natural exit (exit code from RAX).
-    let entry_rsp = aligned_top.saturating_sub(8);
-    drop(engine.mem_write(entry_rsp, &0_u64.to_le_bytes()));
+    // Without the home space, prologues that spill into it fault just past stack_top
+    // (seen as worker invalid_memory at stack_top+0x10 on 7za LZMA2 thread procs).
+    let entry_rsp = aligned_top.saturating_sub(u64::try_from(THREAD_ENTRY_HOME_AND_RET).unwrap_or(0x28));
+    // Zero home space + retaddr slot so stale data cannot look like live pointers.
+    let entry_frame = [0_u8; THREAD_ENTRY_HOME_AND_RET];
+    drop(engine.mem_write(entry_rsp, &entry_frame));
 
     let tid = state.threads.alloc_worker();
     let mut ctx = wie_cpu::ThreadContext::new();

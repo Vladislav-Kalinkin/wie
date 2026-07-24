@@ -228,7 +228,7 @@ fn worker_main(
         }
 
         // Guest compute / iced / JIT: no shared WinAPI mutex.
-        let hook = match engine.run_until_stop(
+        let run = match engine.run_until_stop(
             begin,
             0,
             0,
@@ -236,17 +236,56 @@ fn worker_main(
             layout.fake_api_base,
             fake_api_end,
         ) {
-            Ok(r) if r.code.hit => r.code,
-            Ok(_) => {
-                std::thread::yield_now();
-                continue;
-            }
-            Err(_) => {
+            Ok(r) => r,
+            Err(e) => {
+                if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                    eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
+                }
                 let st = lock(&shared_winapi);
                 finish_tid(&st, tid, 1);
                 return;
             }
         };
+
+        // ThreadProc that `ret`s to the planted 0 return address: RIP becomes 0,
+        // or the next fetch faults at VA 0. Both mean normal exit (code in RAX).
+        let rip_now = engine.read_rip().unwrap_or(0);
+        if rip_now == 0
+            || (run.invalid_memory.hit && run.invalid_memory.address == 0)
+        {
+            let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
+            }
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, code);
+            return;
+        }
+
+        // Invalid guest access must not soft-yield forever (same RIP retried).
+        // Primary session path treats this as a hard stop; workers must too.
+        if run.invalid_memory.hit {
+            let rsp = engine.read_rsp().unwrap_or(0);
+            let inv = run.invalid_memory;
+            eprintln!(
+                "[mt] worker tid={tid:#x} invalid_memory type={} addr={:#x} size={} \
+                 value={:#x} rip={rip_now:#x} rsp={rsp:#x} begin={begin:#x}",
+                inv.access_type,
+                inv.address,
+                inv.size,
+                inv.value.cast_unsigned()
+            );
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, 1);
+            return;
+        }
+
+        if !run.code.hit {
+            // Pure-compute quantum exhausted — yield so peers can run.
+            std::thread::yield_now();
+            continue;
+        }
+        let hook = run.code;
 
         if hook.address == layout.callback_return_trampoline_va {
             continue;

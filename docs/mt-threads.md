@@ -118,5 +118,6 @@ WIE_MT=0 ./scripts/run-micro-suite.sh   # skips mt_stress; CreateThread micros f
 | Hang on `WaitForSingleObject` | Check peer never signals; `ExitProcess` should wake via dying protocol. Infinite primary waits are sliced (50 ms) so nested `CreateThread` can `drain_spawns` and `process_dying` is observed |
 | Hang on CS Enter | Owner never Leave; dying wakes all CS queues. If multi-thread only: confirm primary re-activates TID before dispatch (see Active-TID rule) |
 | Hang after “1 file, N bytes” on `7za -mmt*` | Historically active-TID race (fixed): primary Enter/Leave CS with worker TID. Set `WIE_MT_DEBUG=1` for CreateThread / Wait / drain traces on stderr |
+| Hang / spin on larger `7za a -mmt*` (worker at 100% CPU, archive stuck ~32 B) | Thread entry stack lacked Win64 **home space** (callees write `[rsp+0x40]` after `sub rsp,0x28` past stack top). Also iced lacked `XADD`/`LOCK XADD` (cold path before JIT hotness). Workers that hit invalid mem used to yield forever on the same RIP — now finish. |
 | `CreateThread` returns NULL | `WIE_MT=0` or hit `WIE_MT_MAX_THREADS` |
 | Stress flaky under iced | Raise timeout; engine is serialized so should be deterministic |

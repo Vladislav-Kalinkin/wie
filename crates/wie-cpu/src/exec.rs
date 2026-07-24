@@ -293,6 +293,7 @@ fn execute_one(
         | Mnemonic::Setnp) => exec_setcc(mem, regs, instr, cond_from_setcc(m, regs)),
 
         Mnemonic::Xchg => exec_xchg(mem, regs, instr),
+        Mnemonic::Xadd => exec_xadd(mem, regs, instr),
         Mnemonic::Cmpxchg => exec_cmpxchg(mem, regs, instr),
         Mnemonic::Bswap => exec_bswap(regs, instr),
         Mnemonic::Bt => exec_bit(mem, regs, instr, BitOp::Bt),
@@ -2226,6 +2227,67 @@ fn exec_xchg(
     write_op(mem, regs, instr, 0, b)?;
     write_op(mem, regs, instr, 1, a)?;
     Ok(())
+}
+
+/// `XADD r/m, r` — temp = dest; dest = dest + src; src = temp. Flags as ADD.
+///
+/// With `LOCK` and a memory destination, uses host atomics via soft-translate when
+/// the span is aligned and mappable (needed for 7za LZMA2 worker counters).
+fn exec_xadd(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let size = op_size_bytes(instr, 0)?;
+    let mask = regs::size_mask(size);
+    let src = read_op(mem, regs, instr, 1)? & mask;
+
+    // Atomic path: LOCK + memory dest (InterlockedIncrement-style RMW).
+    if instr.has_lock_prefix() && instr.op0_kind() == OpKind::Memory {
+        let addr = effective_address(regs, instr)?;
+        if let Some(old) = atomic_fetch_add(mem, addr, size, src) {
+            let old_m = old & mask;
+            let sum = old_m.wrapping_add(src) & mask;
+            // Operand 1 is always a register — write original dest value.
+            write_op(mem, regs, instr, 1, old_m)?;
+            regs::set_add_flags(regs, old_m, src, sum, size);
+            return Ok(());
+        }
+    }
+
+    let dest = read_op(mem, regs, instr, 0)? & mask;
+    let sum = dest.wrapping_add(src) & mask;
+    write_op(mem, regs, instr, 0, sum)?;
+    write_op(mem, regs, instr, 1, dest)?;
+    regs::set_add_flags(regs, dest, src, sum, size);
+    Ok(())
+}
+
+/// Host-atomic `fetch_add` for guest memory when soft-translate allows.
+/// Returns the previous value, or `None` to fall back to non-atomic RMW.
+fn atomic_fetch_add(mem: &GuestMemory, addr: u64, size: usize, addend: u64) -> Option<u64> {
+    use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+    match size {
+        4 if addr.is_multiple_of(4) => {
+            let host = mem.host_span(addr, 4, true)?;
+            // SAFETY: host_span checked SPC+arena; alignment preserved by soft-translate.
+            #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+            let atom = unsafe { &*(host.cast::<AtomicI32>()) };
+            let add = i32::from_le_bytes((addend as u32).to_le_bytes());
+            let old = atom.fetch_add(add, Ordering::SeqCst);
+            Some(u64::from(old as u32))
+        }
+        8 if addr.is_multiple_of(8) => {
+            let host = mem.host_span(addr, 8, true)?;
+            #[expect(unsafe_code, clippy::cast_ptr_alignment)]
+            let atom = unsafe { &*(host.cast::<AtomicI64>()) };
+            let add = i64::from_le_bytes(addend.to_le_bytes());
+            let old = atom.fetch_add(add, Ordering::SeqCst);
+            Some(u64::from_le_bytes(old.to_le_bytes()))
+        }
+        // 8/16-bit lock xadd: rare; fall back to non-atomic.
+        _ => None,
+    }
 }
 
 /// `CMPXCHG r/m, r` — compare ACC with dest; if equal write src→dest and ZF=1, else dest→ACC and ZF=0.
