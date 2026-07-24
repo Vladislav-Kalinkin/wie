@@ -5403,6 +5403,13 @@ pub fn handle_resume_thread(
     let handle = engine.read_rcx()?;
     // Previous suspend count: 1 if we had it suspended, 0 if already running, -1 on error.
     if let Some(spawn) = state.sync.suspended_spawns.remove(&handle) {
+        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            let pending_after = state.sync.pending_spawns.len().saturating_add(1);
+            eprintln!(
+                "[mt] ResumeThread handle={handle:#x} tid={:#x} pending→{pending_after}",
+                spawn.tid,
+            );
+        }
         state.sync.pending_spawns.push(spawn);
         state.last_error = 0;
         return ret_u64(engine, 1, "ResumeThread");
@@ -5726,6 +5733,11 @@ pub fn dispatch_kernel32_extra(
         "waitformultipleobjects" => Ok(Some(handle_wait_for_multiple_objects(engine, state)?)),
         "movefilewithprogressw" => Ok(Some(handle_move_file_with_progress_w(engine, state)?)),
         "createhardlinkw" => Ok(Some(handle_create_hard_link_w(engine, state)?)),
+        "duplicatehandle" => Ok(Some(handle_duplicate_handle(engine, state)?)),
+        "getthreadpriority" => Ok(Some(handle_get_thread_priority(engine, state)?)),
+        "raiseexception" => Ok(Some(handle_raise_exception(engine, state)?)),
+        "rtlcapturecontext" => Ok(Some(handle_rtl_capture_context(engine, state)?)),
+        "rtlunwindex" => Ok(Some(handle_rtl_unwind_ex(engine, state)?)),
         "findfirststreamw" => Ok(Some(handle_find_first_stream_w(engine, state)?)),
         "findnextstreamw" => Ok(Some(handle_find_next_stream_w(engine, state)?)),
         "deviceiocontrol" => Ok(Some(handle_device_io_control(engine, state)?)),
@@ -5746,6 +5758,8 @@ const DEFAULT_WORKER_STACK: usize = 0x10_0000;
 /// Guest VA region for worker stacks (distinct from primary stack at 0x2000_0000).
 const WORKER_STACK_REGION_BASE: u64 = 0x0000_0000_2200_0000;
 const WORKER_STACK_STRIDE: u64 = 0x0000_0000_0020_0000;
+/// Windows x64 CALL/thread entry frame: 0x20 home space + 0x8 return address.
+const THREAD_ENTRY_HOME_AND_RET: usize = 0x28;
 
 const CREATE_SUSPENDED: u32 = 0x4;
 const MEM_COMMIT: u32 = 0x1000;
@@ -6225,10 +6239,18 @@ pub fn create_guest_thread(
 
     let stack_top = stack_base.saturating_add(u64::try_from(stack_size).unwrap_or(0));
     let aligned_top = stack_top & !0xF_u64;
-    // At ThreadProc entry: [RSP]=retaddr, RSP%16==8 (as after CALL).
+    // Windows x64 thread entry / CALL ABI:
+    //   [RSP+0x00]       = return address
+    //   [RSP+0x08..0x28) = caller home space (32 bytes) — callees may store rbx/rdi there
+    //                      via `mov [rsp+0x40], reg` after `sub rsp, 0x28`
+    //   RSP % 16 == 8
     // Retaddr 0 → worker loop treats RIP=0 as natural exit (exit code from RAX).
-    let entry_rsp = aligned_top.saturating_sub(8);
-    drop(engine.mem_write(entry_rsp, &0_u64.to_le_bytes()));
+    // Without the home space, prologues that spill into it fault just past stack_top
+    // (seen as worker invalid_memory at stack_top+0x10 on 7za LZMA2 thread procs).
+    let entry_rsp = aligned_top.saturating_sub(u64::try_from(THREAD_ENTRY_HOME_AND_RET).unwrap_or(0x28));
+    // Zero home space + retaddr slot so stale data cannot look like live pointers.
+    let entry_frame = [0_u8; THREAD_ENTRY_HOME_AND_RET];
+    drop(engine.mem_write(entry_rsp, &entry_frame));
 
     let tid = state.threads.alloc_worker();
     let mut ctx = wie_cpu::ThreadContext::new();
@@ -6258,6 +6280,15 @@ pub fn create_guest_thread(
 
     if tid_out != 0 {
         drop(engine.mem_write(tid_out, &tid.to_le_bytes()));
+    }
+
+    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        eprintln!(
+            "[mt] CreateThread tid={tid:#x} handle={handle:#x} start={start:#x} param={param:#x} flags={flags:#x} suspended={} pending={} active_tid={:#x}",
+            (flags & CREATE_SUSPENDED) != 0,
+            state.sync.pending_spawns.len(),
+            state.threads.current_tid(),
+        );
     }
 
     state.last_error = 0;
@@ -6341,6 +6372,22 @@ fn handle_wait_for_single_object(
     let handle = engine.read_rcx()?;
     let timeout_raw = engine.read_rdx()?;
     let timeout_ms = u32::try_from(timeout_raw & u64::from(u32::MAX)).unwrap_or(0);
+
+    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        let kind = match state.sync.object(handle) {
+            Some(crate::KernelObject::Thread(t)) => {
+                format!("Thread(tid={:#x},fin={})", t.tid, t.is_finished())
+            }
+            Some(crate::KernelObject::Event(e)) => format!("Event(manual={})", e.manual_reset),
+            Some(crate::KernelObject::Semaphore(_)) => "Sem".into(),
+            None => "INVALID".into(),
+        };
+        eprintln!(
+            "[mt] WaitForSingleObject handle={handle:#x} timeout={timeout_ms:#x} kind={kind} active={:#x} pending={}",
+            state.threads.current_tid(),
+            state.sync.pending_spawns.len(),
+        );
+    }
 
     // Fast path: already signaled — no park.
     match state.sync.object(handle) {
@@ -6427,6 +6474,230 @@ fn handle_create_event(
         return_address,
         return_value: handle,
     })
+}
+
+/// `DuplicateHandle` — duplicate a kernel handle.
+///
+/// Pseudohandles (`GetCurrentProcess`, `GetCurrentThread`) are resolved to
+/// real kernel object handles.  Unknown handles are rejected with
+/// `ERROR_INVALID_HANDLE`.  `DUPLICATE_CLOSE_SOURCE` closes the source after
+/// duplication.
+fn handle_duplicate_handle(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    // RCX = hSourceProcessHandle
+    // RDX = hSourceHandle
+    // R8  = hTargetProcessHandle
+    // R9  = lpTargetHandle (guest pointer for the duplicated handle)
+    // [RSP+0x28] = dwDesiredAccess
+    // [RSP+0x30] = bInheritHandle
+    // [RSP+0x38] = dwOptions
+    let _source_proc = engine.read_rcx()?;
+    let source_handle = engine.read_rdx()?;
+    let _target_proc = engine.read_r8()?;
+    let target_handle_ptr = engine.read_r9()?;
+
+    // Read dwOptions from the guest stack to honour DUPLICATE_CLOSE_SOURCE.
+    let rsp = engine.read_rsp()?;
+    let mut opt_bytes = [0_u8; 4];
+    let close_source = if engine
+        .mem_read(rsp.wrapping_add(0x38), &mut opt_bytes)
+        .is_ok()
+    {
+        let opts = u32::from_le_bytes(opt_bytes);
+        (opts & 0x1) != 0 // DUPLICATE_CLOSE_SOURCE = 0x1
+    } else {
+        false
+    };
+
+    // Resolve pseudohandles to real kernel objects.
+    // Windows: (HANDLE)-1 = GetCurrentProcess, (HANDLE)-2 = GetCurrentThread.
+    // Both are resolved to a ThreadObject for the calling thread.  WIE does
+    // not model process kernel objects — all handles map to threads.
+    let tid = if source_handle == u64::MAX || source_handle == u64::MAX - 1 {
+        // Pseudohandle → resolve the current TID.  For GetCurrentProcess we
+        // use the primary TID since there is no process object.
+        state.threads.current_tid()
+    } else {
+        // Real kernel handle — skip resolution, lookup directly below.
+        let obj = state.sync.objects.get(&source_handle).cloned();
+        if let Some(obj) = obj {
+            let new_handle = state.sync.next_handle;
+            state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+            state.sync.objects.insert(new_handle, obj.clone());
+            if close_source {
+                state.sync.objects.remove(&source_handle);
+            }
+            engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
+            state.last_error = 0;
+            let return_address = engine.return_from_win64_api(1)?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 1,
+            });
+        }
+        state.last_error = ERROR_INVALID_HANDLE;
+        let return_address = engine.return_from_win64_api(0)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    };
+
+    // Pseudohandle path: find or create the ThreadObject for `tid`.
+    let source_obj = state
+        .sync
+        .objects
+        .values()
+        .find_map(|obj| match obj {
+            crate::KernelObject::Thread(t) if t.tid == tid => Some(obj.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            let (_, th) = state
+                .sync
+                .register_thread(tid, wie_cpu::ThreadContext::default());
+            crate::KernelObject::Thread(th)
+        });
+
+    let new_handle = state.sync.next_handle;
+    state.sync.next_handle = state.sync.next_handle.wrapping_add(4);
+    state.sync.objects.insert(new_handle, source_obj);
+
+    // Honour DUPLICATE_CLOSE_SOURCE: close the source handle after duplication.
+    if close_source && source_handle != u64::MAX && source_handle != u64::MAX - 1 {
+        state.sync.objects.remove(&source_handle);
+    }
+
+    engine.mem_write(target_handle_ptr, &new_handle.to_le_bytes())?;
+    state.last_error = 0;
+    let return_address = engine.return_from_win64_api(1)?; // TRUE
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 1,
+    })
+}
+
+/// `GetThreadPriority` → THREAD_PRIORITY_NORMAL (0).
+///
+/// No priority model — all guest threads run at the same host priority.
+/// Validates the handle: returns `THREAD_PRIORITY_ERROR_RETURN` with
+/// `ERROR_INVALID_HANDLE` for garbage values.
+fn handle_get_thread_priority(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let h_thread = engine.read_rcx()?;
+
+    // Pseudohandle CURRENT_THREAD (-2), or a real kernel handle.
+    let valid = h_thread == u64::MAX - 1 || state.sync.objects.contains_key(&h_thread);
+
+    if !valid {
+        state.last_error = ERROR_INVALID_HANDLE;
+        // THREAD_PRIORITY_ERROR_RETURN = MAXLONG (0x7FFFFFFF)
+        let return_address = engine.return_from_win64_api(0x7FFF_FFFF)?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0x7FFF_FFFF,
+        });
+    }
+
+    let return_address = engine.return_from_win64_api(0)?; // THREAD_PRIORITY_NORMAL
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// `RaiseException` — start exception processing (two-pass SEH dispatch).
+pub(crate) fn handle_raise_exception(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    crate::seh::dispatch_exception(engine, state)
+}
+
+fn handle_rtl_capture_context(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    _state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    use anyhow::Context;
+
+    let ctx_ptr = engine.read_rcx()?;
+    if ctx_ptr == 0 {
+        let return_address = engine
+            .return_from_win64_api(0)
+            .context("RtlCaptureContext: return failed")?;
+        return Ok(WinApiHandlerResult {
+            return_address,
+            return_value: 0,
+        });
+    }
+
+    let tctx = engine.snapshot_thread_context();
+    // Write CONTEXT64 at ctx_ptr (subset of the Win64 CONTEXT layout).
+    let mut cbuf = [0u8; 0x200];
+    // ContextFlags at +0x30
+    if let Some(slot) = cbuf.get_mut(0x30..0x34) {
+        slot.copy_from_slice(&0x0010_001Fu32.to_le_bytes());
+    }
+    // GPRs at +0x78..+0xF8 (Rax..R15), Rip at +0xF8
+    for reg in 0_usize..16 {
+        let off = 0x78_usize.saturating_add(reg.saturating_mul(8));
+        if let (Some(slot), Some(val)) =
+            (cbuf.get_mut(off..off.saturating_add(8)), tctx.gpr.get(reg))
+        {
+            slot.copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    if let Some(slot) = cbuf.get_mut(0xF8..0x100) {
+        slot.copy_from_slice(&tctx.rip.to_le_bytes());
+    }
+    // Rflags at +0x44
+    if let Some(slot) = cbuf.get_mut(0x44..0x4C) {
+        slot.copy_from_slice(&tctx.rflags.to_le_bytes());
+    }
+    // XMM0..XMM15 at +0x100
+    for i in 0_usize..16 {
+        let off = 0x100_usize.saturating_add(i.saturating_mul(16));
+        if let (Some(slot), Some(val)) =
+            (cbuf.get_mut(off..off.saturating_add(16)), tctx.xmm.get(i))
+        {
+            slot.copy_from_slice(&val.to_le_bytes());
+        }
+    }
+    engine
+        .mem_write(ctx_ptr, &cbuf)
+        .context("RtlCaptureContext: failed to write context")?;
+    let return_address = engine
+        .return_from_win64_api(0)
+        .context("RtlCaptureContext: return failed")?;
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
+}
+
+/// `RtlUnwindEx` — forced stack unwinding.
+///
+/// RCX = TargetFrame (establisher RSP to stop at; NULL = no frame target)
+/// RDX = TargetIp    (landing pad after unwind; NULL = keep frame RIP)
+/// R8  = ExceptionRecord (ignored for now)
+/// R9  = ReturnValue → RAX after unwind
+fn handle_rtl_unwind_ex(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    state: &mut WinApiState,
+) -> Result<WinApiHandlerResult> {
+    let target_frame = engine.read_rcx()?;
+    let target_ip = engine.read_rdx()?;
+    let return_value = engine.read_r9()?;
+    let target_frame_rsp = if target_frame == 0 {
+        None
+    } else {
+        Some(target_frame)
+    };
+    crate::seh::forced_unwind_to(engine, state, target_ip, target_frame_rsp, return_value)
 }
 
 /// `SetEvent`.

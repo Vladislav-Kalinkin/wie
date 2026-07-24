@@ -18,6 +18,8 @@ mod guest_memory;
 mod guest_string;
 pub mod idle;
 pub mod kernel32;
+pub mod mingw_dispatch;
+pub mod seh;
 pub mod ole32;
 pub mod oleaut32;
 pub mod shell32;
@@ -28,6 +30,8 @@ pub mod user32;
 pub mod uxtheme;
 pub mod vfs;
 pub mod winmm;
+pub mod exception;
+pub mod msvc_eh;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
 pub use sync_obj::{
     CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, MultiWaitRequest, PendingSpawn,
@@ -35,11 +39,17 @@ pub use sync_obj::{
     wait_multiple,
 };
 pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
+pub use exception::{RuntimeFunction, lookup_function_entry};
+#[cfg(test)]
+mod exception_tests;
+#[cfg(test)]
+mod exception_helpers;
 // HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
     COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
-    SPECIAL_CALLBACK_RETURN, callback_return_trampoline_va, decode as decode_fake_va, encode_alias,
-    encode_com, encode_export, encode_unresolved,
+    SPECIAL_CALLBACK_RETURN, SPECIAL_SEH_CONTINUE, callback_return_trampoline_va,
+    decode as decode_fake_va, encode_alias, encode_com, encode_export, encode_unresolved,
+    seh_continue_trampoline_va,
 };
 pub use guest_heap::GuestHeap;
 pub use idle::{IdleContext, IdlePolicy};
@@ -315,6 +325,9 @@ pub struct WinApiState {
 
     /// How console stdin is sourced when the buffer is empty.
     pub stdin_mode: GuestStdinMode,
+
+    /// In-progress SEH / C++ EH continuation (UnwindMap + catch funclets).
+    pub seh_pending: Option<seh::SehPending>,
 }
 
 /// Source policy for console `ReadFile(STD_INPUT_HANDLE)`.
@@ -888,6 +901,7 @@ mod tests {
             stdin_bytes: Vec::new(),
             stdin_cursor: 0,
             stdin_mode: GuestStdinMode::InjectOnly,
+            seh_pending: None,
         }
     }
 

@@ -45,6 +45,9 @@ pub const SOFT_UNRESOLVED_BASE: u16 = 0x8000;
 /// `kind=Special` payload: USER32 guest WndProc return trampoline.
 pub const SPECIAL_CALLBACK_RETURN: u16 = 0;
 
+/// `kind=Special` payload: SEH / C++ EH cleanup + catch-funclet continuation.
+pub const SPECIAL_SEH_CONTINUE: u16 = 1;
+
 /// COM iface id: `IDirect3D9`.
 pub const COM_IFACE_IDIRECT3D9: u8 = 0;
 /// COM iface id: `IDirect3DDevice9`.
@@ -107,6 +110,12 @@ pub const fn encode_special(id: u16) -> u64 {
 #[must_use]
 pub const fn callback_return_trampoline_va() -> u64 {
     encode_special(SPECIAL_CALLBACK_RETURN)
+}
+
+/// SEH continuation trampoline VA (UnwindMap actions / MSVC catch funclets).
+#[must_use]
+pub const fn seh_continue_trampoline_va() -> u64 {
+    encode_special(SPECIAL_SEH_CONTINUE)
 }
 
 /// Decode a guest VA into a [`FakeVa`], if it lies in the fake-API window.

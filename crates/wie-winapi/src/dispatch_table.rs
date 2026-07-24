@@ -1513,6 +1513,8 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
     }
     if library.eq_ignore_ascii_case("oleaut32.dll") {
         let n = name.to_ascii_lowercase();
+        // Ordinals: 2 Alloc, 4 AllocLen, 6 Free, 7 StringLen, 8 Init,
+        // 9 Clear, 10 Copy (Wine/Windows OLEAUT32).
         return matches!(
             n.as_str(),
             "sysallocstring"
@@ -1520,14 +1522,18 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
                 | "sysfreestring"
                 | "sysstringlen"
                 | "sysstringbyteslen"
+                | "variantinit"
                 | "variantclear"
                 | "variantcopy"
                 | "ordinal 2"
                 | "ordinal 4"
                 | "ordinal 6"
                 | "ordinal 7"
+                | "ordinal 8"
                 | "ordinal 9"
                 | "ordinal 10"
+                | "ordinal 11"
+                | "ordinal 149"
         );
     }
     if library.eq_ignore_ascii_case("KERNEL32.dll") {
@@ -2051,6 +2057,19 @@ pub fn dispatch_winapi(
         && let Some(r) = crate::oleaut32::dispatch_oleaut32(engine, state, name)?
     {
         return Ok(r);
+    }
+    // Mingw runtime DLLs (pthread, libstdc++).
+    if library.eq_ignore_ascii_case("libwinpthread-1.dll")
+        || library.eq_ignore_ascii_case("libwinpthread-1")
+        || library.starts_with("libwinpthread")
+    {
+        return crate::mingw_dispatch::dispatch_pthread(engine, name);
+    }
+    if library.eq_ignore_ascii_case("libstdc++-6.dll")
+        || library.eq_ignore_ascii_case("libstdc++-6")
+        || library.starts_with("libstdc++")
+    {
+        return crate::mingw_dispatch::dispatch_stdcpp(engine, state, name);
     }
     bail!("unsupported WinAPI call: {library}!{name}");
 }

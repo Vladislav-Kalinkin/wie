@@ -256,11 +256,10 @@ Small and medium create/list/extract (README universal example, including ~140�
 
 **Still open / caveats**
 
-| Topic                          | Notes                                                                                                                                                           |
-| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Dictionary switch form         | Prefer **`-md64k`** (compact). **`-md=64k`** / **`-m0=…`** (equals form) can still hit `_CxxThrowException` during method setup (not scan OOM).                 |
-| Multi‑GiB tree via `--drive-d` | Not claimed end-to-end yet. Raise `--max-api` and optionally `WIE_PROCESS_HEAP_MB`; use `WIE_RUNTIME_PROFILE=1` / `WIE_JIT_CHAIN=0` / `WIE_CPU=iced` to bisect. |
-| C++ EH                         | `_CxxThrowException` is not implemented; any real C++ throw still aborts with an explicit message.                                                              |
+| Topic                          | Notes                                                                                                                                                                                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Multi‑GiB tree via `--drive-d` | Not claimed end-to-end yet. Raise `--max-api` and optionally `WIE_PROCESS_HEAP_MB`; use `WIE_RUNTIME_PROFILE=1` / `WIE_JIT_CHAIN=0` / `WIE_CPU=iced` to bisect.                                                                                                                |
+| C++ EH                         | MSVC `_CxxThrowException` → host FuncInfo (exact IP→state, ThrowInfo type match, `dispCatchObj`, UnwindMap guest actions, catch **funclet CALL** + RAX continuation). `-md=64k` prints error and **exits cleanly** (no host fault). Mingw LSDA / `cpp_*` micros still partial. |
 
 **Example stress command** (local only; not CI):
 

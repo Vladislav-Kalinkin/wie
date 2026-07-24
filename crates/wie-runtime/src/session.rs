@@ -1041,6 +1041,32 @@ impl RuntimeSession {
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
 
+        // Register the primary thread kernel object so DuplicateHandle
+        // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
+        {
+            let ctx = wie_cpu::ThreadContext::default();
+            let _ = winapi_state.sync.register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
+        }
+
+        // Register .pdata function table for C++ exception handling.
+        // RtlLookupFunctionEntry needs this to find unwind info by RIP.
+        if let Some(pdata) = pe_map_plan.sections.iter().find(|s| s.name.starts_with(".pdata")) {
+            let off = usize::try_from(pdata.pointer_to_raw_data).unwrap_or(0);
+            let sz = usize::try_from(pdata.size_of_raw_data).unwrap_or(0);
+            if off > 0
+                && sz > 0
+                && let Some(raw) = pe_bytes.get(off..off.saturating_add(sz))
+            {
+                let entries = wie_winapi::exception::parse_pdata(raw);
+                if !entries.is_empty() {
+                    winapi_state
+                        .sync
+                        .function_tables
+                        .insert(image_summary.image_base, entries);
+                }
+            }
+        }
+
         winapi_state.message_queue_idle_policy = idle_policy;
         winapi_state.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
             table_va: guest_io_config.table_va,
@@ -1233,38 +1259,52 @@ impl RuntimeSession {
             let mut quantum = Quantum::Continue;
             let mut break_term: Option<EntryTraceTermination> = None;
 
+            // Activate primary under WinAPI lock only — pure guest run must not
+            // hold `shared_winapi` so worker quanta can overlap (per-thread engines).
             {
-                let mut pair = self.process.lock_pair();
-                let (engine, winapi_state) = pair.both();
-
-                // Ensure primary TLS/TID active when shared with workers.
-                if winapi_state.threads.active.tid != primary_tid {
-                    // Per-thread engines: primary regs are in `engine`, no context restore needed.
-                    winapi_state.threads.activate(primary_tid);
+                let mut st = self
+                    .process
+                    .shared_winapi
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                if st.threads.active.tid != primary_tid {
+                    st.threads.activate(primary_tid);
                 }
+            }
 
+            let begin = {
+                let engine = &mut *self.process.engine;
                 let current_rip = engine
                     .read_rip()
                     .context("failed to read RIP before runtime step")?;
-
-                let begin = if current_rip == 0 {
+                if current_rip == 0 {
                     self.entry_point_va
                 } else {
                     current_rip
-                };
+                }
+            };
 
-                let emu_t0 = self.profile_enabled.then(Instant::now);
-                let hook_result = engine.run_until_stop(
-                    begin,
-                    0,
-                    0,
-                    instruction_budget,
-                    layout.fake_api_base,
-                    fake_api_end,
-                );
-                if let Some(t0) = emu_t0 {
-                    self.profile.emu_ns =
-                        self.profile.emu_ns.saturating_add(t0.elapsed().as_nanos());
+            let emu_t0 = self.profile_enabled.then(Instant::now);
+            let hook_result = self.process.engine.run_until_stop(
+                begin,
+                0,
+                0,
+                instruction_budget,
+                layout.fake_api_base,
+                fake_api_end,
+            );
+            if let Some(t0) = emu_t0 {
+                self.profile.emu_ns = self.profile.emu_ns.saturating_add(t0.elapsed().as_nanos());
+            }
+
+            {
+                let mut pair = self.process.lock_pair();
+                let (engine, winapi_state) = pair.both();
+                // Workers may have activated themselves while we ran pure guest
+                // code without the WinAPI lock. Reclaim primary identity before
+                // any dispatch that uses current_tid() (CS owner, TLS, waits).
+                if winapi_state.threads.active.tid != primary_tid {
+                    winapi_state.threads.activate(primary_tid);
                 }
 
                 let (hook, invalid_memory) = match hook_result {
@@ -1377,9 +1417,52 @@ impl RuntimeSession {
                         }
                     }
 
+                    // SEH / C++ EH continuation (UnwindMap actions, MSVC catch funclets).
+                    let seh_handled = if hook.address == wie_winapi::seh_continue_trampoline_va() {
+                        match wie_winapi::seh::continue_pending(engine, winapi_state) {
+                            Ok(result) => {
+                                charged_api = charged_api.saturating_add(1);
+                                events.push(EntryTraceEvent {
+                                    index,
+                                    library: "ntdll.dll".into(),
+                                    name: "SehContinue".into(),
+                                    fake_target_va: hook.address,
+                                    handled: true,
+                                    return_value: Some(result.return_value),
+                                    return_address: Some(result.return_address),
+                                });
+                                let err = winapi_state.last_error;
+                                if self.last_published_last_error != Some(err) {
+                                    let bytes = err.to_le_bytes();
+                                    if engine
+                                        .mem_write(crate::guest_stubs::TEB_LAST_ERROR_VA, &bytes)
+                                        .is_ok()
+                                    {
+                                        self.last_published_last_error = Some(err);
+                                    }
+                                }
+                                quantum = Quantum::Continue;
+                                true
+                            }
+                            Err(error) => {
+                                break_term = Some(EntryTraceTermination::RuntimeStop(format!(
+                                    "failed to continue SEH sequence: {error}"
+                                )));
+                                quantum = Quantum::Break;
+                                true
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
                     let resolve_t0 = self.profile_enabled.then(Instant::now);
-                    let resolved_opt = resolve_fake_api_at(hook.address, &soft_apis);
-                    if resolved_opt.is_none() {
+                    let resolved_opt = if seh_handled {
+                        None
+                    } else {
+                        resolve_fake_api_at(hook.address, &soft_apis)
+                    };
+                    if !seh_handled && resolved_opt.is_none() {
                         break_term = Some(EntryTraceTermination::RuntimeStop(format!(
                             "unresolved fake API at {:#018x}",
                             hook.address,
@@ -1714,12 +1797,38 @@ impl RuntimeSession {
                         }
                         wie_winapi::HostParkReason::WaitObject { handle, timeout_ms } => {
                             // Detach waitable object, wait **outside** process locks
-                            // so workers can ExitThread / SetEvent.
+                            // so workers can ExitThread / SetEvent / CreateThread.
+                            let _ = self.process.drain_spawns();
+                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                                eprintln!(
+                                    "[mt] primary park WaitObject handle={handle:#x} timeout={timeout_ms:#x}"
+                                );
+                            }
                             let target = self.process.with_mut(|_, st| {
                                 wie_winapi::kernel32::resolve_wait_target(st, handle)
                             });
                             let result = match target {
-                                Some(t) => t.wait(timeout_ms),
+                                Some(t) => {
+                                    // Slice infinite waits: drain nested CreateThread
+                                    // from workers and observe process_dying.
+                                    if timeout_ms == wie_winapi::INFINITE {
+                                        loop {
+                                            let r = t.wait(50);
+                                            if r == wie_winapi::WAIT_OBJECT_0 {
+                                                break r;
+                                            }
+                                            let _ = self.process.drain_spawns();
+                                            let dying = self
+                                                .process
+                                                .with_winapi_ref(|st| st.sync.process_dying);
+                                            if dying {
+                                                break wie_winapi::WAIT_FAILED;
+                                            }
+                                        }
+                                    } else {
+                                        t.wait(timeout_ms)
+                                    }
+                                }
                                 None => wie_winapi::WAIT_FAILED,
                             };
                             self.process.with_mut(|eng, st| {
@@ -1731,6 +1840,10 @@ impl RuntimeSession {
                             charged_api = charged_api.saturating_add(1);
                         }
                         wie_winapi::HostParkReason::WaitMultiple => {
+                            let _ = self.process.drain_spawns();
+                            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                                eprintln!("[mt] primary park WaitMultiple");
+                            }
                             let req = self
                                 .process
                                 .with_mut(|_, st| st.sync.multi_wait.remove(&primary_tid));
@@ -1740,11 +1853,31 @@ impl RuntimeSession {
                                         .process
                                         .with_mut(|_, st| st.sync.wait_targets(&req.handles));
                                     match targets {
-                                        Some(ts) => wie_winapi::wait_multiple(
-                                            &ts,
-                                            req.wait_all,
-                                            req.timeout_ms,
-                                        ),
+                                        Some(ts) => {
+                                            if req.timeout_ms == wie_winapi::INFINITE {
+                                                loop {
+                                                    let r = wie_winapi::wait_multiple(
+                                                        &ts, req.wait_all, 50,
+                                                    );
+                                                    if r != wie_winapi::WAIT_TIMEOUT {
+                                                        break r;
+                                                    }
+                                                    let _ = self.process.drain_spawns();
+                                                    let dying = self.process.with_winapi_ref(|st| {
+                                                        st.sync.process_dying
+                                                    });
+                                                    if dying {
+                                                        break wie_winapi::WAIT_FAILED;
+                                                    }
+                                                }
+                                            } else {
+                                                wie_winapi::wait_multiple(
+                                                    &ts,
+                                                    req.wait_all,
+                                                    req.timeout_ms,
+                                                )
+                                            }
+                                        }
                                         None => wie_winapi::WAIT_FAILED,
                                     }
                                 }

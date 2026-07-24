@@ -103,6 +103,13 @@ impl ProcessResources {
         if spawns.is_empty() {
             return Ok(());
         }
+        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            eprintln!(
+                "[mt] drain_spawns count={} tids={:?}",
+                spawns.len(),
+                spawns.iter().map(|s| format!("{:#x}", s.tid)).collect::<Vec<_>>()
+            );
+        }
         let shared_winapi = Arc::clone(&self.shared_winapi);
         let config = Arc::new(self.config.clone());
         let shared_jit = self.shared_jit.clone();
@@ -165,6 +172,9 @@ fn worker_main(
     config: Arc<ProcessConfig>,
     tid: u32,
 ) {
+    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+        eprintln!("[mt] worker_main start tid={tid:#x}");
+    }
     let layout = &config.layout;
     let budget = layout.instruction_budget;
     let fake_api_end = layout
@@ -178,6 +188,12 @@ fn worker_main(
         config.stop_bitmap.clone(),
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
+        if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            eprintln!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
+        }
+        // Always mark finished so joiners do not hang forever.
+        let st = lock(&shared_winapi);
+        finish_tid(&st, tid, 1);
         return;
     }
 
@@ -192,50 +208,120 @@ fn worker_main(
     }
 
     loop {
-        let park_reason: Option<HostParkReason>;
+        // Activate + liveness under WinAPI lock only — do **not** hold the lock
+        // across pure guest execution (per-thread engines need concurrent quanta).
         {
             let mut st = lock(&shared_winapi);
             st.threads.activate(tid);
+            if st.sync.process_dying {
+                finish_tid(&st, tid, 1);
+                return;
+            }
+        }
 
+        let begin = engine.read_rip().unwrap_or(0);
+        if begin == 0 {
+            let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, code);
+            return;
+        }
+
+        // Guest compute / iced / JIT: no shared WinAPI mutex.
+        let run = match engine.run_until_stop(
+            begin,
+            0,
+            0,
+            budget,
+            layout.fake_api_base,
+            fake_api_end,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                    eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
+                }
+                let st = lock(&shared_winapi);
+                finish_tid(&st, tid, 1);
+                return;
+            }
+        };
+
+        // ThreadProc that `ret`s to the planted 0 return address: RIP becomes 0,
+        // or the next fetch faults at VA 0. Both mean normal exit (code in RAX).
+        let rip_now = engine.read_rip().unwrap_or(0);
+        if rip_now == 0
+            || (run.invalid_memory.hit && run.invalid_memory.address == 0)
+        {
+            let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
+            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
+            }
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, code);
+            return;
+        }
+
+        // Invalid guest access must not soft-yield forever (same RIP retried).
+        // Primary session path treats this as a hard stop; workers must too.
+        if run.invalid_memory.hit {
+            let rsp = engine.read_rsp().unwrap_or(0);
+            let inv = run.invalid_memory;
+            eprintln!(
+                "[mt] worker tid={tid:#x} invalid_memory type={} addr={:#x} size={} \
+                 value={:#x} rip={rip_now:#x} rsp={rsp:#x} begin={begin:#x}",
+                inv.access_type,
+                inv.address,
+                inv.size,
+                inv.value.cast_unsigned()
+            );
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, 1);
+            return;
+        }
+
+        if !run.code.hit {
+            // Pure-compute quantum exhausted — yield so peers can run.
+            std::thread::yield_now();
+            continue;
+        }
+        let hook = run.code;
+
+        if hook.address == layout.callback_return_trampoline_va {
+            continue;
+        }
+
+        // SEH / C++ EH continuation trampoline (primary path is session.rs; workers
+        // can hit it if a throw originated on that thread).
+        if hook.address == wie_winapi::seh_continue_trampoline_va() {
+            let mut st = lock(&shared_winapi);
+            // Always re-activate: peer threads may have stolen `active` while we
+            // ran pure guest code without the WinAPI lock.
+            st.threads.activate(tid);
+            if let Err(e) = wie_winapi::seh::continue_pending(&mut *engine, &mut st) {
+                tracing::warn!(tid, error = %e, "worker SEH continue failed");
+                finish_tid(&st, tid, 1);
+                return;
+            }
+            continue;
+        }
+
+        let Some(resolved) = resolve_fake_api_at(hook.address, &config.soft_apis) else {
+            let st = lock(&shared_winapi);
+            finish_tid(&st, tid, 1);
+            return;
+        };
+
+        let park_reason: Option<HostParkReason>;
+        {
+            let mut st = lock(&shared_winapi);
+            // Re-activate after pure guest run (primary/peers may have activated).
+            st.threads.activate(tid);
             if st.sync.process_dying {
                 finish_tid(&st, tid, 1);
                 return;
             }
 
-            let begin = engine.read_rip().unwrap_or(0);
-            if begin == 0 {
-                let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
-                finish_tid(&st, tid, code);
-                return;
-            }
-
-            let hook = match engine.run_until_stop(
-                begin,
-                0,
-                0,
-                budget,
-                layout.fake_api_base,
-                fake_api_end,
-            ) {
-                Ok(r) if r.code.hit => r.code,
-                Ok(_) => {
-                    std::thread::yield_now();
-                    continue;
-                }
-                Err(_) => {
-                    finish_tid(&st, tid, 1);
-                    return;
-                }
-            };
-
-            if hook.address == layout.callback_return_trampoline_va {
-                continue;
-            }
-
-            let Some(resolved) = resolve_fake_api_at(hook.address, &config.soft_apis) else {
-                finish_tid(&st, tid, 1);
-                return;
-            };
             if resolved.traits.exit_process() {
                 st.sync.process_dying = true;
                 let code = u32::try_from(engine.read_rcx().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
@@ -270,7 +356,7 @@ fn worker_main(
                     }
                 }
             }
-        } // drop WinAPI lock
+        } // drop WinAPI lock before host park
 
         if let Some(reason) = park_reason {
             handle_park(&mut engine, &shared_winapi, tid, reason);

@@ -15,13 +15,15 @@
 | CPU engine | Shared after first `CreateThread` (`ProcessResources`) |
 | Memory generation | `AtomicU64` acquire/release (`GuestMemory::generation`) |
 
-**1:1 host thread ↔ guest thread.** Guest execution is **serialized** on one shared `CpuEngine` (process mutex). Host wait (`WaitFor*`, contended CS, `Sleep`) **drops** the engine lock so other guest threads can run. This preserves single-thread speed until the first `CreateThread` (local engine, no mutex).
+**1:1 host thread ↔ guest thread.** Each guest thread owns a **`CpuEngine`** (JIT: shared `Arc<JitShared>` compile cache; Iced: shared `Arc<RwLock<GuestMemory>>`). WinAPI / kernel objects / heap sit behind **`Arc<Mutex<WinApiState>>`**.
 
-Thread switch always **saves** the previous guest CPU context before restoring the next (`activate_thread`); otherwise a worker that wins the process lock between primary quanta would clobber unsaved primary registers.
+**Lock scope (critical):** the WinAPI mutex is held only for **activate / dispatch / state mutate**, **not** across pure `run_until_stop` guest compute. Host wait (`WaitFor*`, contended CS) parks **outside** the mutex so peers can `SetEvent` / `LeaveCriticalSection` / `ExitThread`.
+
+**Active-TID rule:** `ThreadState.active` is process-global. After pure guest compute (no WinAPI lock), a peer may have activated itself. **Every** dispatch path must `activate(own_tid)` again under the WinAPI lock before any handler that uses `current_tid()` (CS owner, TLS, waits). Missing re-activate on the primary thread caused false CS ownership and deadlocks under `7za -mmt2` (workers steal `active` while primary runs pure guest code).
 
 Default **guest** worker stack is **1 MiB** when `dwStackSize == 0` (Windows-like). Host OS threads for workers use an **8 MiB** stack so JIT/iced dispatch does not overflow secondary-thread defaults on macOS.
 
-True parallel guest data planes (two cores in JIT simultaneously) remain a future step; metadata is already MT-ready (`mem_gen` atomic, Interlocked host atomics, wake-all on `ExitProcess`).
+Concurrent guest data planes are intentional after the per-thread engine change; structural map/unmap/protect still serializes via WinAPI handlers (and Iced write-locks on the shared `GuestMemory`).
 
 ## What works
 
@@ -66,6 +68,7 @@ True parallel guest data planes (two cores in JIT simultaneously) remain a futur
 | ---- | ---- | ------- |
 | `WIE_MT=0\|1` | Kill-switch: `0` makes `CreateThread` fail (`ERROR_NOT_SUPPORTED`) | enabled (unset ≠ 0) |
 | `WIE_MT_MAX_THREADS` | Cap on worker threads (`CreateThread`) | `64` |
+| `WIE_MT_DEBUG=1` | Stderr traces: CreateThread / ResumeThread / Wait / drain_spawns / worker start | off |
 | `WIE_MPROTECT` | Dual host mprotect (SPC remains oracle). Safe under current process-lock serialize; set `0` if diagnosing mprotect races later | on |
 | `WIE_GUEST_HEAP` | In-guest heap accel; keep off or locked under MT (default off) | off |
 
@@ -90,11 +93,12 @@ Suite: `scripts/run-micro-suite.sh` runs MT micros; `mt_stress` is skipped when 
 
 | Resource | Lock |
 | -------- | ---- |
-| CPU engine + WinAPI state | process `Mutex` pair after first `CreateThread` |
-| CS wait | host `Condvar` **outside** process locks |
-| Waitable objects | host mutex/cv on object; wait outside process locks |
-| Heap freelist | process WinAPI mutex (same as engine share) |
-| PageMap / VAD / arenas | under engine mutex (structural ops) |
+| WinAPI state (heap, objects, TLS, CS metadata) | `Arc<Mutex<WinApiState>>` — **dispatch only** |
+| Guest pure compute | **no** WinAPI mutex (per-thread `CpuEngine`) |
+| CS wait | host `Condvar` **outside** WinAPI mutex |
+| Waitable objects | host mutex/cv on object; wait outside WinAPI mutex |
+| Iced guest memory | `Arc<RwLock<GuestMemory>>` (write = map/protect/free) |
+| JIT guest memory | soft-translate + `mem_gen`; structural ops via WinAPI handlers |
 
 ## Verify
 
@@ -111,7 +115,9 @@ WIE_MT=0 ./scripts/run-micro-suite.sh   # skips mt_stress; CreateThread micros f
 
 | Symptom | Action |
 | ------- | ------ |
-| Hang on `WaitForSingleObject` | Check peer never signals; `ExitProcess` should wake via dying protocol |
-| Hang on CS Enter | Owner never Leave; dying wakes all CS queues |
+| Hang on `WaitForSingleObject` | Check peer never signals; `ExitProcess` should wake via dying protocol. Infinite primary waits are sliced (50 ms) so nested `CreateThread` can `drain_spawns` and `process_dying` is observed |
+| Hang on CS Enter | Owner never Leave; dying wakes all CS queues. If multi-thread only: confirm primary re-activates TID before dispatch (see Active-TID rule) |
+| Hang after “1 file, N bytes” on `7za -mmt*` | Historically active-TID race (fixed): primary Enter/Leave CS with worker TID. Set `WIE_MT_DEBUG=1` for CreateThread / Wait / drain traces on stderr |
+| Hang / spin on larger `7za a -mmt*` (worker at 100% CPU, archive stuck ~32 B) | Thread entry stack lacked Win64 **home space** (callees write `[rsp+0x40]` after `sub rsp,0x28` past stack top). Also iced lacked `XADD`/`LOCK XADD` (cold path before JIT hotness). Workers that hit invalid mem used to yield forever on the same RIP — now finish. |
 | `CreateThread` returns NULL | `WIE_MT=0` or hit `WIE_MT_MAX_THREADS` |
 | Stress flaky under iced | Raise timeout; engine is serialized so should be deterministic |

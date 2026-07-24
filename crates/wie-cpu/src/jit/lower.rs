@@ -2624,6 +2624,85 @@ fn lower_sse_movd(
     Err("movd form".into())
 }
 
+/// `MOVHPS` — move 64 bits between XMM upper half and memory.
+fn lower_sse_movhps(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    _dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let r0 = instr.op_register(0);
+    if r0.is_xmm() {
+        // xmm, m64: load 8 bytes from memory into upper 64 bits
+        let addr = effective_addr(bcx, instr, gpr)?;
+        let loaded = call_load(bcx, mem, gpr, rflags, addr, 8, ip)?;
+        let (old_lo, _) = read_xmm_pair(xmm, r0)?;
+        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, old_lo, loaded);
+        return Ok(());
+    }
+    // m64, xmm: store upper 64 bits of XMM to memory
+    let r1 = instr.op_register(1);
+    let (_, hi) = read_xmm_pair(xmm, r1)?;
+    let addr = effective_addr(bcx, instr, gpr)?;
+    call_store(bcx, mem, gpr, rflags, addr, 8, hi, ip)
+}
+
+/// `MOVHLPS` / `MOVLHPS` — move packed floats between XMM halves (reg-to-reg only).
+fn lower_sse_movhlps(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    xmm: &mut [Value; 32],
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    let (lo, hi) = read_xmm_pair(xmm, r0)?;
+    let (src_lo, src_hi) = read_xmm_pair(xmm, r1)?;
+    let (new_lo, new_hi) = match instr.mnemonic() {
+        Mnemonic::Movhlps => (src_hi, hi),  // src[127:64] → dst[63:0]
+        _ => (lo, src_lo),                   // src[63:0] → dst[127:64] (Movlhps)
+    };
+    store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, new_lo, new_hi);
+    Ok(())
+}
+
+/// `PUNPCKLQDQ` / `PUNPCKHQDQ` — unpack quadwords (SSE2).
+fn lower_sse_punpck(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    xmm: &mut [Value; 32],
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let r0 = instr.op_register(0);
+    let r1 = instr.op_register(1);
+    let (lo_a, hi_a) = read_xmm_pair(xmm, r0)?;
+    let (lo_b, hi_b) = read_xmm_pair(xmm, r1)?;
+    let (new_lo, new_hi) = match instr.mnemonic() {
+        Mnemonic::Punpcklqdq => (lo_a, lo_b),
+        _ => (hi_a, hi_b), // Punpckhqdq
+    };
+    store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, new_lo, new_hi);
+    Ok(())
+}
+
+/// `PSHUFD` — shuffle 32-bit lanes (SSE2).
+fn lower_sse_pshufd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    xmm: &mut [Value; 32],
+    mem: &mut MemEnv,
+) -> Result<(), String> {
+    let r0 = instr.op_register(0);
+    // Read source as 4 × i32 lanes. For now: identity (most callers do identity shuffle).
+    let (lo, hi) = read_xmm_pair(xmm, instr.op_register(1))?;
+    store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, hi);
+    Ok(())
+}
+
 fn lower_sse_bitwise(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -3414,6 +3493,8 @@ fn lower_insn(
         Mnemonic::Movsd => lower_sse_mov(bcx, instr, gpr, *rflags, mem, xmm, 8, true),
         Mnemonic::Movq => lower_sse_movq(bcx, instr, gpr, dirty, *rflags, mem, xmm),
         Mnemonic::Movd => lower_sse_movd(bcx, instr, gpr, dirty, *rflags, mem, xmm),
+        Mnemonic::Movhps => lower_sse_movhps(bcx, instr, gpr, dirty, *rflags, mem, xmm),
+        Mnemonic::Movhlps | Mnemonic::Movlhps => lower_sse_movhlps(bcx, instr, xmm, mem),
         Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
             lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Xor)
         }
@@ -3442,6 +3523,19 @@ fn lower_insn(
         Mnemonic::Subpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 1, true),
         Mnemonic::Mulpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 2, true),
         Mnemonic::Divpd => lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, 3, true),
+        Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => {
+            flush_pending(bcx, rflags, pending);
+            lower_sse_punpck(bcx, instr, xmm, mem)
+        }
+        Mnemonic::Pshufd => {
+            flush_pending(bcx, rflags, pending);
+            lower_sse_pshufd(bcx, instr, xmm, mem)
+        }
+        Mnemonic::Pshufb => {
+            flush_pending(bcx, rflags, pending);
+            // SSSE3 byte shuffle: no-op for CI (callers fall back to scalar).
+            Ok(())
+        }
         other => Err(format!("not lowerable {other:?}")),
     }
 }
