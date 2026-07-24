@@ -1045,12 +1045,18 @@ impl RuntimeSession {
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {
             let ctx = wie_cpu::ThreadContext::default();
-            let _ = winapi_state.sync.register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
+            let _ = winapi_state
+                .sync
+                .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
         }
 
         // Register .pdata function table for C++ exception handling.
         // RtlLookupFunctionEntry needs this to find unwind info by RIP.
-        if let Some(pdata) = pe_map_plan.sections.iter().find(|s| s.name.starts_with(".pdata")) {
+        if let Some(pdata) = pe_map_plan
+            .sections
+            .iter()
+            .find(|s| s.name.starts_with(".pdata"))
+        {
             let off = usize::try_from(pdata.pointer_to_raw_data).unwrap_or(0);
             let sz = usize::try_from(pdata.size_of_raw_data).unwrap_or(0);
             if off > 0
@@ -1087,6 +1093,21 @@ impl RuntimeSession {
         winapi_state
             .heap
             .attach_guest_control(guest_heap_cfg.ctrl_va);
+
+        // Set the import resolver for dynamic DLL loading.
+        {
+            let mut soft = soft_apis.clone();
+            winapi_state.import_resolver = Some(Box::new(move |lib, name, slot| {
+                let (va, _entry) = crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                Ok(va)
+            }));
+        }
+
+        // Store the host directory for DLL search fallback.
+        if let Some(parent) = path.parent() {
+            winapi_state.main_module_host_dir = Some(parent.to_owned());
+        }
 
         let mut session = Self::from_init(SessionInit {
             engine,
@@ -1857,15 +1878,18 @@ impl RuntimeSession {
                                             if req.timeout_ms == wie_winapi::INFINITE {
                                                 loop {
                                                     let r = wie_winapi::wait_multiple(
-                                                        &ts, req.wait_all, 50,
+                                                        &ts,
+                                                        req.wait_all,
+                                                        50,
                                                     );
                                                     if r != wie_winapi::WAIT_TIMEOUT {
                                                         break r;
                                                     }
                                                     let _ = self.process.drain_spawns();
-                                                    let dying = self.process.with_winapi_ref(|st| {
-                                                        st.sync.process_dying
-                                                    });
+                                                    let dying =
+                                                        self.process.with_winapi_ref(|st| {
+                                                            st.sync.process_dying
+                                                        });
                                                     if dying {
                                                         break wie_winapi::WAIT_FAILED;
                                                     }

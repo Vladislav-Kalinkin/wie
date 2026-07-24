@@ -19,7 +19,9 @@ mod tests {
     // ── Layer 1: .pdata parsing ────────────────────────────────────────
 
     #[test]
-    fn parse_empty() { assert!(parse_pdata(&[]).is_empty()); }
+    fn parse_empty() {
+        assert!(parse_pdata(&[]).is_empty());
+    }
 
     #[test]
     fn parse_one() {
@@ -36,7 +38,10 @@ mod tests {
     fn parse_unsorted_input_keeps_order() {
         // .pdata from linker is pre-sorted.  We don't re-sort.
         let mut raw = Vec::new();
-        for &(b, e, u) in &[(0x2000u32, 0x2100u32, 0x3000u32), (0x1000u32, 0x1100u32, 0x4000u32)] {
+        for &(b, e, u) in &[
+            (0x2000u32, 0x2100u32, 0x3000u32),
+            (0x1000u32, 0x1100u32, 0x4000u32),
+        ] {
             raw.extend_from_slice(&b.to_le_bytes());
             raw.extend_from_slice(&e.to_le_bytes());
             raw.extend_from_slice(&u.to_le_bytes());
@@ -53,7 +58,11 @@ mod tests {
     #[test]
     fn lookup_hit() {
         let mut s = crate::sync_obj::SyncState::new();
-        let b = register_table(&mut s, 0x14000_0000, vec![runtime_function(0x1000, 0x1100, 0x2000)]);
+        let b = register_table(
+            &mut s,
+            0x14000_0000,
+            vec![runtime_function(0x1000, 0x1100, 0x2000)],
+        );
         let f = lookup_function_entry(&s, b + 0x1080).expect("hit");
         assert_eq!(f.entry.begin_address, 0x1000);
     }
@@ -61,10 +70,14 @@ mod tests {
     #[test]
     fn lookup_bsearch() {
         let mut s = crate::sync_obj::SyncState::new();
-        let b = register_table(&mut s, 0x14000_0000, vec![
-            runtime_function(0x1000, 0x1100, 0x2000),
-            runtime_function(0x2000, 0x2500, 0x3000),
-        ]);
+        let b = register_table(
+            &mut s,
+            0x14000_0000,
+            vec![
+                runtime_function(0x1000, 0x1100, 0x2000),
+                runtime_function(0x2000, 0x2500, 0x3000),
+            ],
+        );
         let f = lookup_function_entry(&s, b + 0x2100).expect("hit");
         assert_eq!(f.entry.begin_address, 0x2000);
     }
@@ -72,7 +85,11 @@ mod tests {
     #[test]
     fn lookup_miss() {
         let mut s = crate::sync_obj::SyncState::new();
-        let b = register_table(&mut s, 0x14000_0000, vec![runtime_function(0x1000, 0x1100, 0x2000)]);
+        let b = register_table(
+            &mut s,
+            0x14000_0000,
+            vec![runtime_function(0x1000, 0x1100, 0x2000)],
+        );
         assert!(lookup_function_entry(&s, b + 0x0500).is_none());
     }
 
@@ -148,9 +165,12 @@ mod tests {
         mem.map(0x1000, 16);
         mem.write_u64(0x1000, 0x401000);
         let info = UnwindInfo {
-            version: 1, flags: UnwindInfo::FLAG_EHANDLER,
-            size_of_prolog: 0, count_of_codes: 0,
-            frame_register: 0, frame_offset: 0,
+            version: 1,
+            flags: UnwindInfo::FLAG_EHANDLER,
+            size_of_prolog: 0,
+            count_of_codes: 0,
+            frame_register: 0,
+            frame_offset: 0,
         };
         let codes: [(u8, UnwindCode); 0] = [];
         let xdata = encode_unwind(&info, &codes);
@@ -158,7 +178,10 @@ mod tests {
         mem.write_bytes(0x6000, &xdata);
         // handler_rva at +0, language_data at +4
         mem.write_bytes(0x6000 + info.header_size() as u64, &0x3000u32.to_le_bytes());
-        mem.write_bytes(0x6000 + info.header_size() as u64 + 4, &0x4000u32.to_le_bytes());
+        mem.write_bytes(
+            0x6000 + info.header_size() as u64 + 4,
+            &0x4000u32.to_le_bytes(),
+        );
 
         let entry = runtime_function(0x1000, 0x1100, 0x6000);
         let ctx = unwind_ctx(0x401050, 0x1000);

@@ -869,11 +869,13 @@ name = "wie-winapi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "goblin",
  "libc",
  "serde",
  "thiserror",
  "tracing",
  "wie-cpu",
+ "wie-pe",
 ]
 
 [[package]]

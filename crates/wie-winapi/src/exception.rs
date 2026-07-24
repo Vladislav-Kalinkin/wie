@@ -197,21 +197,39 @@ pub fn lookup_function_entry(
         let first_va = entries[0].begin_va(image_base);
         let last_va = entries.last()?.end_va(image_base);
         if control_pc < first_va || control_pc >= last_va {
-            tracing::debug!(control_pc = format_args!("{:#x}", control_pc), first_va = format_args!("{:#x}", first_va), last_va = format_args!("{:#x}", last_va), "lookup: out of range");
+            tracing::debug!(
+                control_pc = format_args!("{:#x}", control_pc),
+                first_va = format_args!("{:#x}", first_va),
+                last_va = format_args!("{:#x}", last_va),
+                "lookup: out of range"
+            );
             continue;
         }
         let key = (control_pc - image_base) as u32;
         match entries.binary_search_by_key(&key, |e| e.begin_address) {
-            Ok(i) => return Some(FunctionEntry { entry: &entries[i], image_base }),
+            Ok(i) => {
+                return Some(FunctionEntry {
+                    entry: &entries[i],
+                    image_base,
+                });
+            }
             Err(0) => {
                 tracing::debug!(key, "lookup: before first entry");
             }
             Err(i) => {
                 let candidate = &entries[i - 1];
                 let match_rva = control_pc - image_base;
-                tracing::debug!(key, candidate_begin = candidate.begin_address, candidate_end = candidate.end_address, "lookup: binary search miss, checking candidate");
+                tracing::debug!(
+                    key,
+                    candidate_begin = candidate.begin_address,
+                    candidate_end = candidate.end_address,
+                    "lookup: binary search miss, checking candidate"
+                );
                 if match_rva < u64::from(candidate.end_address) {
-                    return Some(FunctionEntry { entry: candidate, image_base });
+                    return Some(FunctionEntry {
+                        entry: candidate,
+                        image_base,
+                    });
                 }
             }
         }
@@ -380,9 +398,8 @@ pub fn virtual_unwind(
     read_mem(unwind_va.saturating_add(4), &mut codes_buf)?;
 
     // Helper: read a raw 2-byte slot at index `i` (not interpreted as UNWIND_CODE).
-    let raw_slot = |i: usize| -> Option<[u8; 2]> {
-        codes_buf.get(i * 2..i * 2 + 2).map(|b| [b[0], b[1]])
-    };
+    let raw_slot =
+        |i: usize| -> Option<[u8; 2]> { codes_buf.get(i * 2..i * 2 + 2).map(|b| [b[0], b[1]]) };
     let codes: Vec<UnwindCode> = (0..code_count)
         .filter_map(|i| UnwindCode::from_bytes(&codes_buf, i * 2))
         .collect();
@@ -423,7 +440,9 @@ pub fn virtual_unwind(
                     entry_rsp = entry_rsp.saturating_add(if c.op_info == 0 { 24 } else { 32 });
                     scan_idx += 1;
                 }
-                _ => { scan_idx += 1; }
+                _ => {
+                    scan_idx += 1;
+                }
             }
         }
     }
@@ -546,9 +565,16 @@ pub fn virtual_unwind(
                 end_address: entry.end_address,
                 unwind_data: chain_rva,
             };
-            let chained = virtual_unwind(read_mem, image_base, &chain_entry, UnwindContext {
-                rip: ctx.rip, rsp, ..ctx
-            })?;
+            let chained = virtual_unwind(
+                read_mem,
+                image_base,
+                &chain_entry,
+                UnwindContext {
+                    rip: ctx.rip,
+                    rsp,
+                    ..ctx
+                },
+            )?;
             // Chain entry may also have EHANDLER/UHANDLER flags;
             // prefer its handler data over any data we'd read here.
             return Ok(UnwindResult {
@@ -742,15 +768,8 @@ pub fn find_landing_pad(
     _func_end: u64,
     control_pc: u64,
 ) -> Option<(u64, u64)> {
-    find_landing_pad_ex(
-        read_mem,
-        lsda_va,
-        image_base,
-        func_start,
-        control_pc,
-        None,
-    )
-    .map(|m| (m.landing_pad, m.action_index))
+    find_landing_pad_ex(read_mem, lsda_va, image_base, func_start, control_pc, None)
+        .map(|m| (m.landing_pad, m.action_index))
 }
 
 /// Extended LSDA match with optional thrown-typeinfo filtering and switch value.
@@ -773,13 +792,7 @@ pub fn find_landing_pad_ex(
     if lp_enc != dw_eh_pe::OMIT {
         let (raw, storage) = read_encoded_value(read_mem, &mut cursor, lp_enc)?;
         lp_base = apply_encoding(
-            read_mem,
-            lp_enc,
-            raw,
-            storage,
-            image_base,
-            func_start,
-            image_base,
+            read_mem, lp_enc, raw, storage, image_base, func_start, image_base,
         )?;
         if lp_base == 0 {
             lp_base = func_start;
@@ -878,9 +891,16 @@ pub fn find_landing_pad_ex(
         }
 
         // Walk action records (1-based byte offset into action table).
-        if let Some(sw) =
-            match_action(read_mem, action_table, aidx, ttype_base, ttype_enc, image_base, func_start, thrown_typeinfo)
-        {
+        if let Some(sw) = match_action(
+            read_mem,
+            action_table,
+            aidx,
+            ttype_base,
+            ttype_enc,
+            image_base,
+            func_start,
+            thrown_typeinfo,
+        ) {
             return Some(LandingPadMatch {
                 landing_pad: landing_va,
                 action_index: aidx,
@@ -912,13 +932,7 @@ pub fn find_cleanup_landing_pad(
     if lp_enc != dw_eh_pe::OMIT {
         let (raw, storage) = read_encoded_value(read_mem, &mut cursor, lp_enc)?;
         lp_base = apply_encoding(
-            read_mem,
-            lp_enc,
-            raw,
-            storage,
-            image_base,
-            func_start,
-            image_base,
+            read_mem, lp_enc, raw, storage, image_base, func_start, image_base,
         )?;
         if lp_base == 0 {
             lp_base = func_start;
@@ -1103,12 +1117,7 @@ fn resolve_ttype(
     let (raw, storage) = read_encoded_value(read_mem, &mut cursor, ttype_enc & 0x0f)?;
     // Re-apply with full encoding (pcrel/indirect use storage = slot).
     apply_encoding(
-        read_mem,
-        ttype_enc,
-        raw,
-        storage,
-        image_base,
-        func_start,
+        read_mem, ttype_enc, raw, storage, image_base, func_start,
         image_base, // datarel base ≈ image base on PE
     )
 }
@@ -1126,5 +1135,3 @@ fn unwind_leaf(read_mem: &mut MemRead<'_>, mut ctx: UnwindContext) -> Result<Unw
         exception_data_va: None,
     })
 }
-
-

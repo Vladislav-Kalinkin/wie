@@ -2663,8 +2663,8 @@ fn lower_sse_movhlps(
     let (lo, hi) = read_xmm_pair(xmm, r0)?;
     let (src_lo, src_hi) = read_xmm_pair(xmm, r1)?;
     let (new_lo, new_hi) = match instr.mnemonic() {
-        Mnemonic::Movhlps => (src_hi, hi),  // src[127:64] → dst[63:0]
-        _ => (lo, src_lo),                   // src[63:0] → dst[127:64] (Movlhps)
+        Mnemonic::Movhlps => (src_hi, hi), // src[127:64] → dst[63:0]
+        _ => (lo, src_lo),                 // src[63:0] → dst[127:64] (Movlhps)
     };
     store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, new_lo, new_hi);
     Ok(())

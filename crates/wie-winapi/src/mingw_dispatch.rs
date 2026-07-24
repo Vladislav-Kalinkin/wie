@@ -13,9 +13,13 @@ pub fn dispatch_pthread(
     name: &str,
 ) -> Result<WinApiHandlerResult> {
     let _ = name; // unused — all pthread stubs return success
-    let return_address = engine.return_from_win64_api(0)
+    let return_address = engine
+        .return_from_win64_api(0)
         .context("failed to return from pthread function")?;
-    Ok(WinApiHandlerResult { return_address, return_value: 0 })
+    Ok(WinApiHandlerResult {
+        return_address,
+        return_value: 0,
+    })
 }
 
 /// Dispatch `libstdc++-6.dll` exports (C++ runtime).
@@ -30,28 +34,42 @@ pub fn dispatch_stdcpp(
         "__cxa_allocate_exception" => {
             let size = engine.read_rcx()?;
             let addr = state.heap.alloc_coherent(engine, size.max(1));
-            let return_address = engine.return_from_win64_api(addr)
+            let return_address = engine
+                .return_from_win64_api(addr)
                 .context("failed to return from __cxa_allocate_exception")?;
-            Ok(WinApiHandlerResult { return_address, return_value: addr })
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: addr,
+            })
         }
         // __cxa_free_exception(ptr) → guest heap free
         "__cxa_free_exception" => {
             let ptr = engine.read_rcx()?;
-            if ptr != 0 { state.heap.free_coherent(engine, ptr); }
-            let return_address = engine.return_from_win64_api(0)
+            if ptr != 0 {
+                state.heap.free_coherent(engine, ptr);
+            }
+            let return_address = engine
+                .return_from_win64_api(0)
                 .context("failed to return from __cxa_free_exception")?;
-            Ok(WinApiHandlerResult { return_address, return_value: 0 })
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
         }
         // __cxa_begin_catch / __cxa_end_catch → no-ops inside the catch block
         "__cxa_begin_catch" | "__cxa_end_catch" => {
-            let return_address = engine.return_from_win64_api(0)
+            let return_address = engine
+                .return_from_win64_api(0)
                 .context("failed to return from __cxa_{begin,end}_catch")?;
-            Ok(WinApiHandlerResult { return_address, return_value: 0 })
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
         }
         // __cxa_throw(obj, typeinfo, destructor) — must NOT return.
         // Build an EXCEPTION_RECORD and dispatch via handle_raise_exception.
         "__cxa_throw" => {
-            let exc_obj = engine.read_rcx()?;    // save before clobbering
+            let exc_obj = engine.read_rcx()?; // save before clobbering
             let typeinfo = engine.read_rdx()?;
             let _destructor = engine.read_r8()?;
             // Construct EXCEPTION_RECORD at a scratch area on the guest stack.
@@ -89,9 +107,13 @@ pub fn dispatch_stdcpp(
         }
         // Generic fallback: stub (return success).
         _ => {
-            let return_address = engine.return_from_win64_api(0)
+            let return_address = engine
+                .return_from_win64_api(0)
                 .context("failed to return from libstdc++ function")?;
-            Ok(WinApiHandlerResult { return_address, return_value: 0 })
+            Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            })
         }
     }
 }

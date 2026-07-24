@@ -681,11 +681,11 @@ fn read_import_thunks(
     Ok(())
 }
 
-fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Result<usize> {
+pub fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Result<usize> {
     rva_to_file_offset_u64(pe, u64::from(rva))
 }
 
-fn rva_to_file_offset_u64(pe: &PE<'_>, rva: u64) -> Result<usize> {
+pub fn rva_to_file_offset_u64(pe: &PE<'_>, rva: u64) -> Result<usize> {
     for section in &pe.sections {
         let section_rva = u64::from(section.virtual_address);
         let virtual_size = u64::from(section.virtual_size);

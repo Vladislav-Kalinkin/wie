@@ -134,18 +134,86 @@ $(OUT)/vfs_roundtrip.exe: vfs_roundtrip/main.c | $(OUT)
 MINGW_CXX ?= x86_64-w64-mingw32-g++
 CPPFLAGS   := -static -O2
 
-cpp_exes: $(OUT)/cpp_throw.exe $(OUT)/cpp_dtor.exe $(OUT)/cpp_multi_catch.exe
+cpp_exes: $(OUT)/cpp_throw.exe $(OUT)/cpp_dtor.exe $(OUT)/cpp_multi_catch.exe $(OUT)/cpp_types.exe $(OUT)/cpp_threads.exe
 
-$(OUT)/cpp_throw.exe: cpp_throw/main.cpp | $(OUT)
+$(OUT)/cpp_throw.exe: cpp_exceptions/cpp_throw/main.cpp | $(OUT)
 	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
 	@echo "built $@"
 
-$(OUT)/cpp_dtor.exe: cpp_dtor/main.cpp | $(OUT)
+$(OUT)/cpp_dtor.exe: cpp_exceptions/cpp_dtor/main.cpp | $(OUT)
 	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
 	@echo "built $@"
 
-$(OUT)/cpp_multi_catch.exe: cpp_multi_catch/main.cpp | $(OUT)
+$(OUT)/cpp_multi_catch.exe: cpp_exceptions/cpp_multi_catch/main.cpp | $(OUT)
 	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+	@echo "built $@"
+
+$(OUT)/cpp_types.exe: cpp_exceptions/cpp_types/main.cpp | $(OUT)
+	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+	@echo "built $@"
+
+$(OUT)/cpp_threads.exe: cpp_exceptions/cpp_threads/main.cpp | $(OUT)
+	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+	@echo "built $@"
+
+# ── DLL loader tests ────────────────────────────────────────────
+# Flags for shared library (DLL) builds.
+DLL_CFLAGS   := -O2 -shared
+# Flags for freestanding EXEs that test DLL loading.
+DLL_EXE_CFLAGS := -O2 -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables
+DLL_EXE_LDFLAGS := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
+
+# DLLs
+DLL_BASIC_OBJS    := $(OUT)/dll_basic_funcs.dll
+DLL_ORDINAL_OBJS  := $(OUT)/dll_ordinal_funcs.dll
+DLL_MATH_OBJS     := $(OUT)/dll_math_funcs.dll
+
+# EXEs
+DLL_TEST_EXES := \
+  $(OUT)/dll_basic.exe \
+  $(OUT)/dll_not_found.exe \
+  $(OUT)/dll_ordinal.exe \
+  $(OUT)/dll_refcount.exe \
+  $(OUT)/dll_multi_dll.exe
+
+.PHONY: dll_tests
+
+dll_tests: $(DLL_BASIC_OBJS) $(DLL_ORDINAL_OBJS) $(DLL_MATH_OBJS) $(DLL_TEST_EXES)
+
+# ── DLL build rules ────────────────────────────────────────────
+
+$(OUT)/dll_basic_funcs.dll: dll_tests/basic/dll.c | $(OUT)
+	$(MINGW_CC) $(DLL_CFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/dll_ordinal_funcs.dll: dll_tests/ordinal/dll.c | $(OUT)
+	$(MINGW_CC) $(DLL_CFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/dll_math_funcs.dll: dll_tests/refcount/dll.c | $(OUT)
+	$(MINGW_CC) $(DLL_CFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+# ── DLL test EXE build rules ───────────────────────────────────
+
+$(OUT)/dll_basic.exe: dll_tests/basic/main.c $(OUT)/dll_basic_funcs.dll | $(OUT)
+	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/dll_not_found.exe: dll_tests/not_found/main.c | $(OUT)
+	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/dll_ordinal.exe: dll_tests/ordinal/main.c $(OUT)/dll_ordinal_funcs.dll | $(OUT)
+	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/dll_refcount.exe: dll_tests/refcount/main.c $(OUT)/dll_math_funcs.dll | $(OUT)
+	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/dll_multi_dll.exe: dll_tests/multi_dll/main.c $(OUT)/dll_basic_funcs.dll $(OUT)/dll_math_funcs.dll | $(OUT)
+	$(MINGW_CC) $(DLL_EXE_CFLAGS) $(DLL_EXE_LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 
 clean:

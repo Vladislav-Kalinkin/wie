@@ -13,6 +13,8 @@ serde.workspace = true
 libc = "0.2"
 
 wie-cpu = { path = "../wie-cpu" }
+goblin.workspace = true
+wie-pe = { path = "../wie-pe" }
 
 [lints]
 workspace = true

@@ -13,15 +13,23 @@
     clippy::trivially_copy_pass_by_ref
 )]
 
-use super::exception::{RuntimeFunction, UnwindCode, UnwindInfo, UnwindContext, uwop};
+use super::exception::{RuntimeFunction, UnwindCode, UnwindContext, UnwindInfo, uwop};
 
 /// Builder for a single `RUNTIME_FUNCTION`.
 pub fn runtime_function(begin: u32, end: u32, unwind: u32) -> RuntimeFunction {
-    RuntimeFunction { begin_address: begin, end_address: end, unwind_data: unwind }
+    RuntimeFunction {
+        begin_address: begin,
+        end_address: end,
+        unwind_data: unwind,
+    }
 }
 
 /// Register a function table in `SyncState` and return the image base.
-pub fn register_table(state: &mut crate::sync_obj::SyncState, image_base: u64, entries: Vec<RuntimeFunction>) -> u64 {
+pub fn register_table(
+    state: &mut crate::sync_obj::SyncState,
+    image_base: u64,
+    entries: Vec<RuntimeFunction>,
+) -> u64 {
     state.function_tables.insert(image_base, entries);
     image_base
 }
@@ -30,33 +38,57 @@ pub fn register_table(state: &mut crate::sync_obj::SyncState, image_base: u64, e
 
 /// `UWOP_PUSH_NONVOL(register)` — push a nonvolatile register.
 pub fn push_nonvol(reg: u8) -> UnwindCode {
-    UnwindCode { code_offset: 0, unwind_op: uwop::PUSH_NONVOL, op_info: reg }
+    UnwindCode {
+        code_offset: 0,
+        unwind_op: uwop::PUSH_NONVOL,
+        op_info: reg,
+    }
 }
 
 /// `UWOP_ALLOC_SMALL(size_bytes)` — allocate `n` bytes on the stack (8-128, multiple of 8).
 pub fn alloc_small(n_bytes: u8) -> UnwindCode {
     let info = (n_bytes.saturating_sub(8)) / 8;
-    UnwindCode { code_offset: 0, unwind_op: uwop::ALLOC_SMALL, op_info: info }
+    UnwindCode {
+        code_offset: 0,
+        unwind_op: uwop::ALLOC_SMALL,
+        op_info: info,
+    }
 }
 
 /// `UWOP_SET_FPREG(register)` — set frame pointer.
 /// The offset is stored in `UNWIND_INFO.frame_offset`, not here.
 pub fn set_fpreg(reg: u8) -> UnwindCode {
-    UnwindCode { code_offset: 0, unwind_op: uwop::SET_FPREG, op_info: reg }
+    UnwindCode {
+        code_offset: 0,
+        unwind_op: uwop::SET_FPREG,
+        op_info: reg,
+    }
 }
 
 /// `UWOP_SAVE_NONVOL(register)` — save register to stack slot.
 pub fn save_nonvol(reg: u8) -> UnwindCode {
-    UnwindCode { code_offset: 0, unwind_op: uwop::SAVE_NONVOL, op_info: reg }
+    UnwindCode {
+        code_offset: 0,
+        unwind_op: uwop::SAVE_NONVOL,
+        op_info: reg,
+    }
 }
 
 /// Set the prologue offset on a code entry. Returns `(offset, code)` for use with `unwind_info`.
-pub fn at(code: UnwindCode, off: u8) -> (u8, UnwindCode) { (off, code) }
+pub fn at(code: UnwindCode, off: u8) -> (u8, UnwindCode) {
+    (off, code)
+}
 
 // ── Unwind info builder ────────────────────────────────────────────────
 
 /// Build `UNWIND_INFO` with a list of unwind codes (in STORED order = reverse prologue).
-pub fn unwind_info(codes: &[(u8, UnwindCode)], flags: u8, prolog_size: u8, frame_reg: u8, frame_off: u8) -> UnwindInfo {
+pub fn unwind_info(
+    codes: &[(u8, UnwindCode)],
+    flags: u8,
+    prolog_size: u8,
+    frame_reg: u8,
+    frame_off: u8,
+) -> UnwindInfo {
     UnwindInfo {
         version: 1,
         flags,
@@ -95,7 +127,9 @@ pub struct MemSim {
 
 impl MemSim {
     pub fn new() -> Self {
-        Self { regions: Vec::new() }
+        Self {
+            regions: Vec::new(),
+        }
     }
 
     /// Map `va..va+len` with zeroed bytes.
@@ -147,7 +181,12 @@ impl MemSim {
 
 /// Build an `UnwindContext` with the given RIP, RSP, and optionally set GPRs.
 pub fn unwind_ctx(rip: u64, rsp: u64) -> UnwindContext {
-    UnwindContext { rip, rsp, gpr: [0; 16], xmm: [0; 16] }
+    UnwindContext {
+        rip,
+        rsp,
+        gpr: [0; 16],
+        xmm: [0; 16],
+    }
 }
 
 impl UnwindContext {
@@ -155,6 +194,10 @@ impl UnwindContext {
         self.gpr[idx] = val;
         self
     }
-    pub fn with_rbp(self, val: u64) -> Self { self.with_gpr(Self::RBP, val) }
-    pub fn with_rbx(self, val: u64) -> Self { self.with_gpr(3, val) }
+    pub fn with_rbp(self, val: u64) -> Self {
+        self.with_gpr(Self::RBP, val)
+    }
+    pub fn with_rbx(self, val: u64) -> Self {
+        self.with_gpr(3, val)
+    }
 }

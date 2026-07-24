@@ -220,7 +220,12 @@ pub fn throw_catchable_type_rvas(
     }
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let ct_rva = read_u32(read_mem, cta_va.saturating_add(4).saturating_add(u64::from(i as u32) * 4))?;
+        let ct_rva = read_u32(
+            read_mem,
+            cta_va
+                .saturating_add(4)
+                .saturating_add(u64::from(i as u32) * 4),
+        )?;
         if ct_rva == 0 {
             continue;
         }
@@ -231,11 +236,7 @@ pub fn throw_catchable_type_rvas(
             out.push(type_rva);
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// Optional size of the primary catchable type (for by-value copy).
@@ -627,18 +628,38 @@ mod tests {
         let map = image + 0x1000;
         mem.map(map, 64);
         // Real 7za-like map pattern
-        let entries = [(0x14d08u32, -1i32), (0x14d21, 0), (0x14e2f, -1), (0x14e34, 0)];
+        let entries = [
+            (0x14d08u32, -1i32),
+            (0x14d21, 0),
+            (0x14e2f, -1),
+            (0x14e34, 0),
+        ];
         for (i, (ip, st)) in entries.iter().enumerate() {
             let e = map + (i as u64) * 8;
             mem.write_bytes(e, &ip.to_le_bytes());
             mem.write_bytes(e + 4, &st.to_le_bytes());
         }
         let mut r = mem.reader();
-        assert_eq!(state_for_ip(&mut r, image, &fi_hdr, image + 0x14d08), Some(-1));
-        assert_eq!(state_for_ip(&mut r, image, &fi_hdr, image + 0x14d21), Some(0));
-        assert_eq!(state_for_ip(&mut r, image, &fi_hdr, image + 0x14d30), Some(0));
-        assert_eq!(state_for_ip(&mut r, image, &fi_hdr, image + 0x14e2f), Some(-1));
-        assert_eq!(state_for_ip(&mut r, image, &fi_hdr, image + 0x14e40), Some(0));
+        assert_eq!(
+            state_for_ip(&mut r, image, &fi_hdr, image + 0x14d08),
+            Some(-1)
+        );
+        assert_eq!(
+            state_for_ip(&mut r, image, &fi_hdr, image + 0x14d21),
+            Some(0)
+        );
+        assert_eq!(
+            state_for_ip(&mut r, image, &fi_hdr, image + 0x14d30),
+            Some(0)
+        );
+        assert_eq!(
+            state_for_ip(&mut r, image, &fi_hdr, image + 0x14e2f),
+            Some(-1)
+        );
+        assert_eq!(
+            state_for_ip(&mut r, image, &fi_hdr, image + 0x14e40),
+            Some(0)
+        );
     }
 
     #[test]
@@ -682,7 +703,10 @@ mod tests {
                 ip_to_state_map_rva: 0,
             },
         };
-        assert_eq!(catch_object_address(0x207f_e000, &c), Some(0x207f_e000 + 48));
+        assert_eq!(
+            catch_object_address(0x207f_e000, &c),
+            Some(0x207f_e000 + 48)
+        );
         assert!(catch_is_reference(HT_IS_CONST | HT_IS_REFERENCE));
     }
 }

@@ -91,9 +91,7 @@ pub(crate) fn run_micro(
             );
         }
         let omitted = events.len().saturating_sub(HEAD + TAIL);
-        println!(
-            "  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …"
-        );
+        println!("  … {omitted} events omitted (set WIE_API_TRACE=1 for full dump) …");
         for event in events.iter().skip(events.len().saturating_sub(TAIL)) {
             println!(
                 "  [{:>4}] {}!{} handled={} ret={:?}",

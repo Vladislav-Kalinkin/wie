@@ -107,7 +107,10 @@ impl ProcessResources {
             eprintln!(
                 "[mt] drain_spawns count={} tids={:?}",
                 spawns.len(),
-                spawns.iter().map(|s| format!("{:#x}", s.tid)).collect::<Vec<_>>()
+                spawns
+                    .iter()
+                    .map(|s| format!("{:#x}", s.tid))
+                    .collect::<Vec<_>>()
             );
         }
         let shared_winapi = Arc::clone(&self.shared_winapi);
@@ -228,31 +231,23 @@ fn worker_main(
         }
 
         // Guest compute / iced / JIT: no shared WinAPI mutex.
-        let run = match engine.run_until_stop(
-            begin,
-            0,
-            0,
-            budget,
-            layout.fake_api_base,
-            fake_api_end,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                if std::env::var_os("WIE_MT_DEBUG").is_some() {
-                    eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
+        let run =
+            match engine.run_until_stop(begin, 0, 0, budget, layout.fake_api_base, fake_api_end) {
+                Ok(r) => r,
+                Err(e) => {
+                    if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                        eprintln!("[mt] worker_main run error tid={tid:#x}: {e}");
+                    }
+                    let st = lock(&shared_winapi);
+                    finish_tid(&st, tid, 1);
+                    return;
                 }
-                let st = lock(&shared_winapi);
-                finish_tid(&st, tid, 1);
-                return;
-            }
-        };
+            };
 
         // ThreadProc that `ret`s to the planted 0 return address: RIP becomes 0,
         // or the next fetch faults at VA 0. Both mean normal exit (code in RAX).
         let rip_now = engine.read_rip().unwrap_or(0);
-        if rip_now == 0
-            || (run.invalid_memory.hit && run.invalid_memory.address == 0)
-        {
+        if rip_now == 0 || (run.invalid_memory.hit && run.invalid_memory.address == 0) {
             let code = u32::try_from(engine.read_rax().unwrap_or(0) & 0xffff_ffff).unwrap_or(0);
             if std::env::var_os("WIE_MT_DEBUG").is_some() {
                 eprintln!("[mt] worker_main exit tid={tid:#x} code={code} (ret-to-0)");
