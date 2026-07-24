@@ -334,6 +334,7 @@ pub struct WinApiState {
     /// Set once at session init by the runtime (`wie-runtime::session`).
     /// Resolves `(library, name, iat_slot_va)` → fake API VA for import patching.
     /// `None` means dynamic loading is unavailable (falls back to fake handles).
+    #[allow(clippy::type_complexity)]
     pub import_resolver: Option<Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>>,
 
     /// Dynamically loaded DLL modules (real, not fake stubs).
@@ -351,7 +352,6 @@ pub struct WinApiState {
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
 impl std::fmt::Debug for WinApiState {
-    #[expect(clippy::todo, reason = "exhaustive field listing")]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WinApiState")
             .field("heap", &self.heap)

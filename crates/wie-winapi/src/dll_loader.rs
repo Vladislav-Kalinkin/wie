@@ -84,12 +84,50 @@ impl LoadedModule {
     }
 }
 
+/// Read a u32 from a slice at a given offset (little-endian).
+/// Caller MUST verify `off + 4 <= buf.len()`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+/// Read a u16 from a slice at a given offset (little-endian).
+/// Caller MUST verify `off + 2 <= buf.len()`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+/// Read an i32 from a slice at a given offset (little-endian).
+/// Caller MUST verify `off + 4 <= buf.len()`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+fn read_i32_le(buf: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+/// Read an i64 from a slice at a given offset (little-endian).
+/// Caller MUST verify `off + 8 <= buf.len()`.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+fn read_i64_le(buf: &[u8], off: usize) -> i64 {
+    i64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
+
 /// Parse the export directory of a parsed PE image.
 ///
 /// Returns `DllExports::default()` when the image has no export directory.
 /// Export names are lowercased for case-insensitive lookup.
 ///
 /// `pe_bytes` must be the raw file bytes (not the mapped image).
+#[allow(clippy::arithmetic_side_effects)]
 pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<DllExports> {
     let header = pe
         .header
@@ -111,7 +149,7 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
         .with_context(|| format!("export dir RVA {export_rva:#x} outside file"))?;
 
     // Parse the IMAGE_EXPORT_DIRECTORY (40 bytes total).
-    let export_slice = &pe_bytes[export_offset..];
+    let export_slice = pe_bytes.get(export_offset..).unwrap_or(&[]);
 
     // Read fields manually from the IMAGE_EXPORT_DIRECTORY structure (Win64).
     // Layout (all little-endian, from ntimage.h / MSDN):
@@ -130,20 +168,16 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
         bail!("export directory too short: {} bytes", export_slice.len());
     }
 
-    let read_u32_at = |off: usize| -> u32 {
-        u32::from_le_bytes(export_slice[off..off + 4].try_into().unwrap_or([0; 4]))
-    };
+    let _name_rva = read_u32_le(export_slice, 0x0c);
+    let ordinal_base = read_u32_le(export_slice, 0x10);
+    let number_of_functions = read_u32_le(export_slice, 0x14);
+    let number_of_names = read_u32_le(export_slice, 0x18);
+    let address_table_rva = read_u32_le(export_slice, 0x1c);
+    let name_pointer_rva = read_u32_le(export_slice, 0x20);
+    let ordinal_table_rva = read_u32_le(export_slice, 0x24);
 
-    let _name_rva = read_u32_at(0x0c);
-    let ordinal_base = read_u32_at(0x10);
-    let number_of_functions = read_u32_at(0x14);
-    let number_of_names = read_u32_at(0x18);
-    let address_table_rva = read_u32_at(0x1c);
-    let name_pointer_rva = read_u32_at(0x20);
-    let ordinal_table_rva = read_u32_at(0x24);
-
-    let num_functions = number_of_functions as usize;
-    let num_names = number_of_names as usize;
+    let num_functions = usize::try_from(number_of_functions).unwrap_or(0);
+    let num_names = usize::try_from(number_of_names).unwrap_or(0);
 
     let mut by_name = HashMap::with_capacity(num_names);
     let mut by_ordinal = HashMap::with_capacity(num_functions);
@@ -158,11 +192,12 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
     // from the file (each entry is an RVA or 0 for unused/forwarder).
     let mut address_table: Vec<u64> = Vec::with_capacity(num_functions);
     for i in 0..num_functions {
+        let i_u32 = u32::try_from(i).unwrap_or(0);
         let entry_file_off =
-            rva_to_file_offset(pe, address_table_rva.wrapping_add((i as u32) * 4)).ok();
+            rva_to_file_offset(pe, address_table_rva.wrapping_add(i_u32.wrapping_mul(4))).ok();
         let rva = match entry_file_off {
-            Some(off) if off + 4 <= pe_bytes.len() => {
-                u32::from_le_bytes(pe_bytes[off..off + 4].try_into().unwrap()) as u64
+            Some(off) if off.saturating_add(4) <= pe_bytes.len() => {
+                u64::from(read_u32_le(pe_bytes, off))
             }
             _ => 0,
         };
@@ -178,42 +213,42 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
 
     // Read name-pointer table entries.
     for i in 0..num_names {
+        let i_u32 = u32::try_from(i).unwrap_or(0);
         // Read ordinal entry: AddressOfNameOrdinals is an array of u16.
         let ordinal_file_off =
-            rva_to_file_offset(pe, ordinal_table_rva.wrapping_add((i as u32) * 2)).ok();
+            rva_to_file_offset(pe, ordinal_table_rva.wrapping_add(i_u32.wrapping_mul(2))).ok();
         let name_ptr_file_off =
-            rva_to_file_offset(pe, name_pointer_rva.wrapping_add((i as u32) * 4)).ok();
+            rva_to_file_offset(pe, name_pointer_rva.wrapping_add(i_u32.wrapping_mul(4))).ok();
 
         if let (Some(ord_off), Some(np_off)) = (ordinal_file_off, name_ptr_file_off) {
-            if ord_off + 2 > pe_bytes.len() || np_off + 4 > pe_bytes.len() {
+            if ord_off.saturating_add(2) > pe_bytes.len()
+                || np_off.saturating_add(4) > pe_bytes.len()
+            {
                 continue;
             }
-            let name_rva =
-                u32::from_le_bytes(pe_bytes[np_off..np_off + 4].try_into().unwrap_or([0; 4]))
-                    as u64;
-            let ordinal_idx =
-                u16::from_le_bytes(pe_bytes[ord_off..ord_off + 2].try_into().unwrap_or([0; 2]));
+            let name_rva = u64::from(read_u32_le(pe_bytes, np_off));
+            let ordinal_idx = read_u16_le(pe_bytes, ord_off);
 
-            let ordinal = (ordinal_base as u16).wrapping_add(ordinal_idx);
+            let ordinal = u16::try_from(ordinal_base)
+                .unwrap_or(0)
+                .wrapping_add(ordinal_idx);
             let function_rva = address_table
-                .get(ordinal_idx as usize)
+                .get(usize::from(ordinal_idx))
                 .copied()
                 .unwrap_or(0);
 
             // Read the export name (C string at name_rva in file).
-            if let Ok(name_off) = rva_to_file_offset(pe, name_rva as u32) {
-                let name_bytes = pe_bytes[name_off..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map(|end| &pe_bytes[name_off..name_off + end])
-                    .unwrap_or(&[]);
-                if !name_bytes.is_empty() {
-                    if let Ok(name) = std::str::from_utf8(name_bytes) {
-                        // Only store non-zero RVAs (forwarders and unused
-                        // slots are stored as 0 and excluded here).
-                        if function_rva != 0 {
-                            by_name.insert(name.to_ascii_lowercase(), function_rva);
-                        }
+            if let Ok(name_off) = rva_to_file_offset(pe, u32::try_from(name_rva).unwrap_or(0)) {
+                let name_slice = pe_bytes.get(name_off..).unwrap_or(&[]);
+                let end = name_slice.iter().position(|&b| b == 0).unwrap_or(0);
+                let name_bytes = name_slice.get(..end).unwrap_or(&[]);
+                if !name_bytes.is_empty()
+                    && let Ok(name) = std::str::from_utf8(name_bytes)
+                {
+                    // Only store non-zero RVAs (forwarders and unused
+                    // slots are stored as 0 and excluded here).
+                    if function_rva != 0 {
+                        by_name.insert(name.to_ascii_lowercase(), function_rva);
                     }
                 }
             }
@@ -229,8 +264,8 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
     Ok(DllExports {
         by_name,
         by_ordinal,
-        ordinal_base: ordinal_base as u16,
-        export_count: num_functions as u16,
+        ordinal_base: u16::try_from(ordinal_base).unwrap_or(0),
+        export_count: u16::try_from(num_functions).unwrap_or(0),
     })
 }
 
@@ -238,11 +273,17 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
 fn normalize_dll_name(name: &str) -> String {
     let clean = name.trim().trim_matches('"');
     let basename = clean
-        .rsplit(|c: char| c == '/' || c == '\\')
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(clean)
         .to_ascii_lowercase();
-    if !basename.ends_with(".dll") && !basename.ends_with(".ocx") {
+    let is_dll = std::path::Path::new(&basename)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"));
+    let is_ocx = std::path::Path::new(&basename)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ocx"));
+    if !is_dll && !is_ocx {
         format!("{basename}.dll")
     } else {
         basename
@@ -273,10 +314,10 @@ fn search_directories(
     };
 
     // 1. Application directory.
-    if let Some(parent) = std::path::Path::new(main_module_path).parent() {
-        if let Some(map) = guest_path_to_host(volumes, &parent.to_string_lossy()) {
-            push_if_new(map.host);
-        }
+    if let Some(parent) = std::path::Path::new(main_module_path).parent()
+        && let Some(map) = guest_path_to_host(volumes, &parent.to_string_lossy())
+    {
+        push_if_new(map.host);
     }
 
     // 2. System directory (C:\Windows\System32).
@@ -290,10 +331,10 @@ fn search_directories(
     }
 
     // 4. Current directory (same as app dir, may already be added).
-    if let Some(parent) = std::path::Path::new(main_module_path).parent() {
-        if let Some(map) = guest_path_to_host(volumes, &parent.to_string_lossy()) {
-            push_if_new(map.host);
-        }
+    if let Some(parent) = std::path::Path::new(main_module_path).parent()
+        && let Some(map) = guest_path_to_host(volumes, &parent.to_string_lossy())
+    {
+        push_if_new(map.host);
     }
 
     dirs
@@ -321,10 +362,10 @@ pub fn resolve_dll_path(
     // If the name contains a path separator or drive letter, resolve it directly.
     if clean.contains('\\') || clean.contains('/') || clean.contains(':') {
         // Try direct guest-path resolution.
-        if let Some(map) = crate::vfs::guest_path_to_host(volumes, clean) {
-            if map.host.is_file() {
-                return Some(map.host);
-            }
+        if let Some(map) = crate::vfs::guest_path_to_host(volumes, clean)
+            && map.host.is_file()
+        {
+            return Some(map.host);
         }
         // Check if the clean path already ends with the target name
         // (case-insensitive to handle e.g. "LIB.DLL" → "lib.dll").
@@ -333,10 +374,10 @@ pub fn resolve_dll_path(
         }
         // Try appending .dll to the original path.
         let with_ext = format!("{clean}.dll");
-        if let Some(map) = crate::vfs::guest_path_to_host(volumes, &with_ext) {
-            if map.host.is_file() {
-                return Some(map.host);
-            }
+        if let Some(map) = crate::vfs::guest_path_to_host(volumes, &with_ext)
+            && map.host.is_file()
+        {
+            return Some(map.host);
         }
         return None;
     }
@@ -378,6 +419,7 @@ pub fn resolve_dll_path(
 /// - `IMAGE_REL_BASED_DIR64` (10): 8-byte delta (x64 native)
 ///
 /// All other types return an error (unsupported).
+#[allow(clippy::arithmetic_side_effects)]
 pub fn apply_relocations(
     pe: &goblin::pe::PE<'_>,
     pe_bytes: &[u8],
@@ -404,89 +446,89 @@ pub fn apply_relocations(
     // Map the relocation data from file offsets.
     let reloc_offset = rva_to_file_offset(pe, reloc_dir.virtual_address)
         .context("relocation table RVA outside file")?;
-    let reloc_size = reloc_dir.size as usize;
+    let reloc_size =
+        usize::try_from(reloc_dir.size).context("relocation size does not fit usize")?;
     let reloc_data = pe_bytes
-        .get(reloc_offset..reloc_offset + reloc_size)
+        .get(reloc_offset..)
+        .and_then(|data| data.get(..reloc_size))
         .context("relocation data extends beyond file")?;
 
     let mut offset = 0_usize;
 
     loop {
-        if offset + 8 > reloc_data.len() {
+        if offset.saturating_add(8) > reloc_data.len() {
             break;
         }
 
-        let page_rva = u32::from_le_bytes(reloc_data[offset..offset + 4].try_into().unwrap());
-        let block_size =
-            u32::from_le_bytes(reloc_data[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        #[allow(clippy::integer_division)]
+        let page_rva = read_u32_le(reloc_data, offset);
+        let block_size = read_u32_le(reloc_data, offset.wrapping_add(4));
+        let block_size_usize = usize::try_from(block_size).unwrap_or(0);
 
-        if block_size == 0 {
+        if block_size_usize == 0 {
             break;
         }
-        if block_size < 8 {
-            bail!("invalid relocation block size: {block_size}");
+        if block_size_usize < 8 {
+            bail!("invalid relocation block size: {block_size_usize}");
         }
 
-        let entry_count = (block_size - 8) / 2;
-        let entries_base = offset + 8;
+        #[allow(clippy::integer_division)]
+        let entry_count = (block_size_usize - 8) / 2;
+        let entries_base = offset.wrapping_add(8);
 
         for i in 0..entry_count {
-            let entry_off = entries_base + i * 2;
-            if entry_off + 2 > reloc_data.len() {
+            let entry_off = entries_base.wrapping_add(i.wrapping_mul(2));
+            if entry_off.saturating_add(2) > reloc_data.len() {
                 bail!("relocation entry at offset {entry_off} exceeds block data");
             }
 
-            let entry =
-                u16::from_le_bytes(reloc_data[entry_off..entry_off + 2].try_into().unwrap());
+            let entry = read_u16_le(reloc_data, entry_off);
             let type_ = entry >> 12;
             let rva_offset = u32::from(entry & 0x0fff);
             let target_rva = page_rva.wrapping_add(rva_offset);
 
+            #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
             match type_ {
                 0 => {
                     // IMAGE_REL_BASED_ABSOLUTE — no-op alignment padding.
                 }
                 3 => {
                     // IMAGE_REL_BASED_HIGHLOW — 32-bit delta (4-byte field).
-                    let target_file_off = match rva_to_file_offset(pe, target_rva) {
-                        Ok(off) => off,
-                        Err(_) => continue,
+                    let Ok(target_file_off) = rva_to_file_offset(pe, target_rva) else {
+                        continue;
                     };
-                    if target_file_off + 4 > pe_bytes.len() {
+                    if target_file_off.saturating_add(4) > pe_bytes.len() {
                         continue;
                     }
-                    let original = i32::from_le_bytes(
-                        pe_bytes[target_file_off..target_file_off + 4]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    let adjusted = original.wrapping_add(delta as i32);
-                    let image_off = target_rva as usize;
-                    if image_off + 4 > image_bytes.len() {
+                    let original = read_i32_le(pe_bytes, target_file_off);
+                    let adjusted = original.wrapping_add(i32::try_from(delta).unwrap_or(0));
+                    let image_off = usize::try_from(target_rva).unwrap_or(0);
+                    if image_off.saturating_add(4) > image_bytes.len() {
                         continue;
                     }
-                    image_bytes[image_off..image_off + 4].copy_from_slice(&adjusted.to_le_bytes());
+                    image_bytes
+                        .get_mut(image_off..image_off.wrapping_add(4))
+                        .unwrap_or(&mut [])
+                        .copy_from_slice(&adjusted.to_le_bytes());
                 }
                 10 => {
                     // IMAGE_REL_BASED_DIR64 — 64-bit delta (8-byte field).
-                    let target_file_off = match rva_to_file_offset(pe, target_rva) {
-                        Ok(off) => off,
-                        Err(_) => continue,
+                    let Ok(target_file_off) = rva_to_file_offset(pe, target_rva) else {
+                        continue;
                     };
-                    if target_file_off + 8 > pe_bytes.len() {
+                    if target_file_off.saturating_add(8) > pe_bytes.len() {
                         continue;
                     }
-                    let original = i64::from_le_bytes(
-                        pe_bytes[target_file_off..target_file_off + 8]
-                            .try_into()
-                            .unwrap(),
-                    );
+                    let original = read_i64_le(pe_bytes, target_file_off);
                     let adjusted = original.wrapping_add(delta);
-                    let image_off = target_rva as usize;
-                    if image_off + 8 > image_bytes.len() {
+                    let image_off = usize::try_from(target_rva).unwrap_or(0);
+                    if image_off.saturating_add(8) > image_bytes.len() {
                         continue;
                     }
-                    image_bytes[image_off..image_off + 8].copy_from_slice(&adjusted.to_le_bytes());
+                    image_bytes
+                        .get_mut(image_off..image_off.wrapping_add(8))
+                        .unwrap_or(&mut [])
+                        .copy_from_slice(&adjusted.to_le_bytes());
                 }
                 _ => {
                     bail!("unsupported relocation type {type_} at RVA {target_rva:#x}");
@@ -494,7 +536,7 @@ pub fn apply_relocations(
             }
         }
 
-        offset += block_size;
+        offset = offset.wrapping_add(block_size_usize);
         if offset >= reloc_data.len() {
             break;
         }
@@ -618,19 +660,28 @@ pub fn load_dll(
 
     // Step 3: Map guest memory. Try preferred base first.
     let load_base = preferred_base;
-    let image_base = match engine.mem_map(load_base, size_of_image, wie_cpu::perm::ALL) {
-        Ok(()) => load_base,
-        Err(_) => {
-            // Preferred base unavailable — allocate from an alternative region.
-            // Use a VA derived from the handle (above fake module range).
-            let alt_base = handle & !0xfff;
-            engine
-                .mem_map(alt_base, size_of_image, wie_cpu::perm::ALL)
-                .context("failed to map DLL image memory at alternative base")?;
-            alt_base
-        }
+    let image_base = if engine
+        .mem_map(load_base, size_of_image, wie_cpu::perm::ALL)
+        .is_ok()
+    {
+        load_base
+    } else {
+        // Preferred base unavailable — allocate from an alternative region.
+        // Use a VA derived from the handle (above fake module range).
+        let alt_base = handle & !0xfff;
+        engine
+            .mem_map(alt_base, size_of_image, wie_cpu::perm::ALL)
+            .context("failed to map DLL image memory at alternative base")?;
+        alt_base
     };
 
+    // Delta is intentionally wrapping: image_base and preferred_base are
+    // close in address space; the signed difference fits in i64 for real PEs.
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::as_conversions,
+        clippy::arithmetic_side_effects
+    )]
     let delta = image_base as i64 - preferred_base as i64;
 
     // Step 4: Build the map plan for section protections.
@@ -643,7 +694,7 @@ pub fn load_dll(
         .min(pe_bytes.len());
     if header_size > 0 {
         engine
-            .mem_write(image_base, &pe_bytes[..header_size])
+            .mem_write(image_base, pe_bytes.get(..header_size).unwrap_or(&[]))
             .context("failed to write DLL headers")?;
     }
 
@@ -659,17 +710,16 @@ pub fn load_dll(
 
         if raw_size > 0 {
             let end = raw_offset.saturating_add(raw_size).min(pe_bytes.len());
-            engine
-                .mem_write(va, &pe_bytes[raw_offset..end])
-                .with_context(|| {
-                    format!("failed to write section {}", section.name().unwrap_or("?"))
-                })?;
+            let section_data = pe_bytes.get(raw_offset..end).unwrap_or(&[]);
+            engine.mem_write(va, section_data).with_context(|| {
+                format!("failed to write section {}", section.name().unwrap_or("?"))
+            })?;
         }
 
         // Zero-fill the BSS tail (virtual_size > raw_size).
         let raw_size_rounded = raw_size.max(1);
         if virtual_size > raw_size_rounded {
-            let fill_va = va.wrapping_add(raw_size_rounded as u64);
+            let fill_va = va.wrapping_add(u64::try_from(raw_size_rounded).unwrap_or(0));
             let fill_len = virtual_size.saturating_sub(raw_size_rounded);
             let zeros = vec![0_u8; fill_len];
             engine.mem_write(fill_va, &zeros).with_context(|| {

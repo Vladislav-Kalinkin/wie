@@ -973,7 +973,7 @@ fn resolve_windows_dll_path(name: &str, main_module_path: &str) -> String {
     }
     if let Some(parent) = std::path::Path::new(main_module_path).parent() {
         let dir = parent.to_string_lossy().replace('/', "\\");
-        format!("{}\\{name}", dir)
+        format!("{dir}\\{name}")
     } else {
         format!("C:\\App\\{name}")
     }
@@ -2600,26 +2600,23 @@ pub fn handle_free_library(
         0
     } else if module_handle >= dll_loader::REAL_MODULE_HANDLE_BASE {
         // Real loaded module — decrement refcount.
-        let name = match state
+        let Some(name) = state
             .loaded_modules
             .iter()
             .find(|(_, m)| m.handle == module_handle)
             .map(|(n, _)| n.clone())
-        {
-            Some(n) => n,
-            None => {
-                state.last_error = ERROR_INVALID_HANDLE;
-                let return_address = engine.return_from_win64_api(0)?;
-                return Ok(WinApiHandlerResult {
-                    return_address,
-                    return_value: 0,
-                });
-            }
+        else {
+            state.last_error = ERROR_INVALID_HANDLE;
+            let return_address = engine.return_from_win64_api(0)?;
+            return Ok(WinApiHandlerResult {
+                return_address,
+                return_value: 0,
+            });
         };
 
         if let Some(module) = state.loaded_modules.get_mut(&name) {
             if module.ref_count > 0 {
-                module.ref_count -= 1;
+                module.ref_count = module.ref_count.saturating_sub(1);
             }
             if module.ref_count == 0 {
                 // Unmap from guest memory via virtual_protect (PAGE_NOACCESS).
@@ -2702,7 +2699,7 @@ pub fn handle_get_proc_address(
             .find(|m| m.handle == module_handle)
         {
             let va = if is_ordinal {
-                let ordinal = proc_name_ptr as u16;
+                let ordinal = u16::try_from(proc_name_ptr).unwrap_or(0);
                 module.get_export_va_by_ordinal(ordinal)
             } else {
                 module.get_export_va(&proc_name)
