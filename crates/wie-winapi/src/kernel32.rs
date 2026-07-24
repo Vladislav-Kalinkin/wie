@@ -5404,10 +5404,10 @@ pub fn handle_resume_thread(
     // Previous suspend count: 1 if we had it suspended, 0 if already running, -1 on error.
     if let Some(spawn) = state.sync.suspended_spawns.remove(&handle) {
         if std::env::var_os("WIE_MT_DEBUG").is_some() {
+            let pending_after = state.sync.pending_spawns.len().saturating_add(1);
             eprintln!(
-                "[mt] ResumeThread handle={handle:#x} tid={:#x} pending→{}",
+                "[mt] ResumeThread handle={handle:#x} tid={:#x} pending→{pending_after}",
                 spawn.tid,
-                state.sync.pending_spawns.len() + 1,
             );
         }
         state.sync.pending_spawns.push(spawn);
@@ -6491,7 +6491,10 @@ fn handle_duplicate_handle(
     // Read dwOptions from the guest stack to honour DUPLICATE_CLOSE_SOURCE.
     let rsp = engine.read_rsp()?;
     let mut opt_bytes = [0_u8; 4];
-    let close_source = if engine.mem_read(rsp.wrapping_add(0x38), &mut opt_bytes).is_ok() {
+    let close_source = if engine
+        .mem_read(rsp.wrapping_add(0x38), &mut opt_bytes)
+        .is_ok()
+    {
         let opts = u32::from_le_bytes(opt_bytes);
         (opts & 0x1) != 0 // DUPLICATE_CLOSE_SOURCE = 0x1
     } else {
@@ -6632,7 +6635,8 @@ fn handle_rtl_capture_context(
     // GPRs at +0x78..+0xF8 (Rax..R15), Rip at +0xF8
     for reg in 0_usize..16 {
         let off = 0x78_usize.saturating_add(reg.saturating_mul(8));
-        if let (Some(slot), Some(val)) = (cbuf.get_mut(off..off.saturating_add(8)), tctx.gpr.get(reg))
+        if let (Some(slot), Some(val)) =
+            (cbuf.get_mut(off..off.saturating_add(8)), tctx.gpr.get(reg))
         {
             slot.copy_from_slice(&val.to_le_bytes());
         }
@@ -6647,10 +6651,9 @@ fn handle_rtl_capture_context(
     // XMM0..XMM15 at +0x100
     for i in 0_usize..16 {
         let off = 0x100_usize.saturating_add(i.saturating_mul(16));
-        if let (Some(slot), Some(val)) = (
-            cbuf.get_mut(off..off.saturating_add(16)),
-            tctx.xmm.get(i),
-        ) {
+        if let (Some(slot), Some(val)) =
+            (cbuf.get_mut(off..off.saturating_add(16)), tctx.xmm.get(i))
+        {
             slot.copy_from_slice(&val.to_le_bytes());
         }
     }
