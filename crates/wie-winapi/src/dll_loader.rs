@@ -90,17 +90,16 @@ impl LoadedModule {
 /// Export names are lowercased for case-insensitive lookup.
 ///
 /// `pe_bytes` must be the raw file bytes (not the mapped image).
-pub fn parse_dll_exports(
-    pe: &goblin::pe::PE<'_>,
-    pe_bytes: &[u8],
-) -> Result<DllExports> {
+pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<DllExports> {
     let header = pe
         .header
         .optional_header
         .as_ref()
         .context("no optional header")?;
     let data_dirs = &header.data_directories;
-    let export_dir = data_dirs.get_export_table().context("no export directory")?;
+    let export_dir = data_dirs
+        .get_export_table()
+        .context("no export directory")?;
 
     if export_dir.virtual_address == 0 {
         return Ok(DllExports::default());
@@ -115,16 +114,16 @@ pub fn parse_dll_exports(
     let export_slice = &pe_bytes[export_offset..];
 
     // Read fields manually from the IMAGE_EXPORT_DIRECTORY structure (Win64).
-    // Layout (all little-endian):
+    // Layout (all little-endian, from ntimage.h / MSDN):
     //   +0x00: u32 Characteristics (reserved)
     //   +0x04: u32 TimeDateStamp
     //   +0x08: u16 MajorVersion
     //   +0x0a: u16 MinorVersion
     //   +0x0c: u32 Name (RVA of DLL name)
-    //   +0x10: u32 OrdinalBase
-    //   +0x14: u32 AddressOfFunctions (RVA of export address table)
-    //   +0x18: u32 NumberOfFunctions
-    //   +0x1c: u32 NumberOfNames
+    //   +0x10: u32 Base (ordinal base)
+    //   +0x14: u32 NumberOfFunctions
+    //   +0x18: u32 NumberOfNames
+    //   +0x1c: u32 AddressOfFunctions (RVA of export address table)
     //   +0x20: u32 AddressOfNames (RVA of name pointer table)
     //   +0x24: u32 AddressOfNameOrdinals (RVA of ordinal table)
     if export_slice.len() < 40 {
@@ -137,9 +136,9 @@ pub fn parse_dll_exports(
 
     let _name_rva = read_u32_at(0x0c);
     let ordinal_base = read_u32_at(0x10);
-    let address_table_rva = read_u32_at(0x14);
-    let number_of_functions = read_u32_at(0x18);
-    let number_of_names = read_u32_at(0x1c);
+    let number_of_functions = read_u32_at(0x14);
+    let number_of_names = read_u32_at(0x18);
+    let address_table_rva = read_u32_at(0x1c);
     let name_pointer_rva = read_u32_at(0x20);
     let ordinal_table_rva = read_u32_at(0x24);
 
@@ -159,11 +158,8 @@ pub fn parse_dll_exports(
     // from the file (each entry is an RVA or 0 for unused/forwarder).
     let mut address_table: Vec<u64> = Vec::with_capacity(num_functions);
     for i in 0..num_functions {
-        let entry_file_off = rva_to_file_offset(
-            pe,
-            address_table_rva.wrapping_add((i as u32) * 4),
-        )
-        .ok();
+        let entry_file_off =
+            rva_to_file_offset(pe, address_table_rva.wrapping_add((i as u32) * 4)).ok();
         let rva = match entry_file_off {
             Some(off) if off + 4 <= pe_bytes.len() => {
                 u32::from_le_bytes(pe_bytes[off..off + 4].try_into().unwrap()) as u64
@@ -183,27 +179,20 @@ pub fn parse_dll_exports(
     // Read name-pointer table entries.
     for i in 0..num_names {
         // Read ordinal entry: AddressOfNameOrdinals is an array of u16.
-        let ordinal_file_off = rva_to_file_offset(
-            pe,
-            ordinal_table_rva.wrapping_add((i as u32) * 2),
-        )
-        .ok();
-        let name_ptr_file_off = rva_to_file_offset(
-            pe,
-            name_pointer_rva.wrapping_add((i as u32) * 4),
-        )
-        .ok();
+        let ordinal_file_off =
+            rva_to_file_offset(pe, ordinal_table_rva.wrapping_add((i as u32) * 2)).ok();
+        let name_ptr_file_off =
+            rva_to_file_offset(pe, name_pointer_rva.wrapping_add((i as u32) * 4)).ok();
 
         if let (Some(ord_off), Some(np_off)) = (ordinal_file_off, name_ptr_file_off) {
             if ord_off + 2 > pe_bytes.len() || np_off + 4 > pe_bytes.len() {
                 continue;
             }
-            let name_rva = u32::from_le_bytes(
-                pe_bytes[np_off..np_off + 4].try_into().unwrap_or([0; 4]),
-            ) as u64;
-            let ordinal_idx = u16::from_le_bytes(
-                pe_bytes[ord_off..ord_off + 2].try_into().unwrap_or([0; 2]),
-            );
+            let name_rva =
+                u32::from_le_bytes(pe_bytes[np_off..np_off + 4].try_into().unwrap_or([0; 4]))
+                    as u64;
+            let ordinal_idx =
+                u16::from_le_bytes(pe_bytes[ord_off..ord_off + 2].try_into().unwrap_or([0; 2]));
 
             let ordinal = (ordinal_base as u16).wrapping_add(ordinal_idx);
             let function_rva = address_table
@@ -320,6 +309,7 @@ pub fn resolve_dll_path(
     dll_name: &str,
     main_module_path: &str,
     volumes: &crate::vfs::VolumeConfig,
+    main_module_host_dir: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     let clean = dll_name.trim().trim_matches('"');
     if clean.is_empty() {
@@ -360,6 +350,15 @@ pub fn resolve_dll_path(
         }
     }
 
+    // Fallback: search the host directory of the main executable directly.
+    // This handles micro-exes and other scenarios without a bottle root.
+    if let Some(host_dir) = main_module_host_dir {
+        let candidate = host_dir.join(&search_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
     None
 }
 
@@ -393,7 +392,9 @@ pub fn apply_relocations(
     let Some(header) = pe.header.optional_header.as_ref() else {
         bail!("no optional header for relocation processing");
     };
-    let reloc_dir = header.data_directories.get_base_relocation_table()
+    let reloc_dir = header
+        .data_directories
+        .get_base_relocation_table()
         .context("no base relocation directory")?;
 
     if reloc_dir.virtual_address == 0 || reloc_dir.size == 0 {
@@ -404,7 +405,8 @@ pub fn apply_relocations(
     let reloc_offset = rva_to_file_offset(pe, reloc_dir.virtual_address)
         .context("relocation table RVA outside file")?;
     let reloc_size = reloc_dir.size as usize;
-    let reloc_data = pe_bytes.get(reloc_offset..reloc_offset + reloc_size)
+    let reloc_data = pe_bytes
+        .get(reloc_offset..reloc_offset + reloc_size)
         .context("relocation data extends beyond file")?;
 
     let mut offset = 0_usize;
@@ -414,12 +416,9 @@ pub fn apply_relocations(
             break;
         }
 
-        let page_rva = u32::from_le_bytes(
-            reloc_data[offset..offset + 4].try_into().unwrap(),
-        );
-        let block_size = u32::from_le_bytes(
-            reloc_data[offset + 4..offset + 8].try_into().unwrap(),
-        ) as usize;
+        let page_rva = u32::from_le_bytes(reloc_data[offset..offset + 4].try_into().unwrap());
+        let block_size =
+            u32::from_le_bytes(reloc_data[offset + 4..offset + 8].try_into().unwrap()) as usize;
 
         if block_size == 0 {
             break;
@@ -437,9 +436,8 @@ pub fn apply_relocations(
                 bail!("relocation entry at offset {entry_off} exceeds block data");
             }
 
-            let entry = u16::from_le_bytes(
-                reloc_data[entry_off..entry_off + 2].try_into().unwrap(),
-            );
+            let entry =
+                u16::from_le_bytes(reloc_data[entry_off..entry_off + 2].try_into().unwrap());
             let type_ = entry >> 12;
             let rva_offset = u32::from(entry & 0x0fff);
             let target_rva = page_rva.wrapping_add(rva_offset);
@@ -458,15 +456,16 @@ pub fn apply_relocations(
                         continue;
                     }
                     let original = i32::from_le_bytes(
-                        pe_bytes[target_file_off..target_file_off + 4].try_into().unwrap(),
+                        pe_bytes[target_file_off..target_file_off + 4]
+                            .try_into()
+                            .unwrap(),
                     );
                     let adjusted = original.wrapping_add(delta as i32);
                     let image_off = target_rva as usize;
                     if image_off + 4 > image_bytes.len() {
                         continue;
                     }
-                    image_bytes[image_off..image_off + 4]
-                        .copy_from_slice(&adjusted.to_le_bytes());
+                    image_bytes[image_off..image_off + 4].copy_from_slice(&adjusted.to_le_bytes());
                 }
                 10 => {
                     // IMAGE_REL_BASED_DIR64 — 64-bit delta (8-byte field).
@@ -478,15 +477,16 @@ pub fn apply_relocations(
                         continue;
                     }
                     let original = i64::from_le_bytes(
-                        pe_bytes[target_file_off..target_file_off + 8].try_into().unwrap(),
+                        pe_bytes[target_file_off..target_file_off + 8]
+                            .try_into()
+                            .unwrap(),
                     );
                     let adjusted = original.wrapping_add(delta);
                     let image_off = target_rva as usize;
                     if image_off + 8 > image_bytes.len() {
                         continue;
                     }
-                    image_bytes[image_off..image_off + 8]
-                        .copy_from_slice(&adjusted.to_le_bytes());
+                    image_bytes[image_off..image_off + 8].copy_from_slice(&adjusted.to_le_bytes());
                 }
                 _ => {
                     bail!("unsupported relocation type {type_} at RVA {target_rva:#x}");
@@ -602,10 +602,11 @@ pub fn load_dll(
         bail!("expected PE64 DLL, got PE32");
     }
 
-    let identity =
-        wie_pe::pe_identity_from_bytes(host_path, &pe_bytes).context("failed to parse PE identity")?;
+    let identity = wie_pe::pe_identity_from_bytes(host_path, &pe_bytes)
+        .context("failed to parse PE identity")?;
     let preferred_base = identity.image_base;
-    let size_of_image = usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
+    let size_of_image =
+        usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
     let entry_rva = identity.entry_rva;
 
     // Step 2: Allocate a module handle.
@@ -633,7 +634,8 @@ pub fn load_dll(
     let delta = image_base as i64 - preferred_base as i64;
 
     // Step 4: Build the map plan for section protections.
-    let map_plan = wie_pe::pe_map_plan_from_bytes(&pe_bytes).context("failed to build DLL map plan")?;
+    let map_plan =
+        wie_pe::pe_map_plan_from_bytes(&pe_bytes).context("failed to build DLL map plan")?;
 
     // Write headers to guest memory.
     let header_size = usize::try_from(identity.size_of_headers)
@@ -648,7 +650,8 @@ pub fn load_dll(
     // Write sections directly into guest memory.
     for section in &pe.sections {
         let virtual_address = u64::from(section.virtual_address);
-        let raw_offset = usize::try_from(section.pointer_to_raw_data).context("section raw offset")?;
+        let raw_offset =
+            usize::try_from(section.pointer_to_raw_data).context("section raw offset")?;
         let raw_size = usize::try_from(section.size_of_raw_data).context("section raw size")?;
         let virtual_size = usize::try_from(section.virtual_size).unwrap_or(0);
 
@@ -658,7 +661,9 @@ pub fn load_dll(
             let end = raw_offset.saturating_add(raw_size).min(pe_bytes.len());
             engine
                 .mem_write(va, &pe_bytes[raw_offset..end])
-                .with_context(|| format!("failed to write section {}", section.name().unwrap_or("?")))?;
+                .with_context(|| {
+                    format!("failed to write section {}", section.name().unwrap_or("?"))
+                })?;
         }
 
         // Zero-fill the BSS tail (virtual_size > raw_size).
@@ -667,9 +672,12 @@ pub fn load_dll(
             let fill_va = va.wrapping_add(raw_size_rounded as u64);
             let fill_len = virtual_size.saturating_sub(raw_size_rounded);
             let zeros = vec![0_u8; fill_len];
-            engine
-                .mem_write(fill_va, &zeros)
-                .with_context(|| format!("failed to zero-fill section {}", section.name().unwrap_or("?")))?;
+            engine.mem_write(fill_va, &zeros).with_context(|| {
+                format!(
+                    "failed to zero-fill section {}",
+                    section.name().unwrap_or("?")
+                )
+            })?;
         }
     }
 
@@ -686,14 +694,21 @@ pub fn load_dll(
     }
 
     // Step 6: Resolve imports.
-    let imports = wie_pe::inspect_pe_imports_bytes(&pe_bytes).context("failed to parse DLL imports")?;
+    let imports =
+        wie_pe::inspect_pe_imports_bytes(&pe_bytes).context("failed to parse DLL imports")?;
     let mut dependencies: Vec<String> = Vec::new();
     let mut seen_libs: HashSet<String> = HashSet::new();
 
     for import in &imports {
         let lib_lower = import.library.to_ascii_lowercase();
         if seen_libs.insert(lib_lower) {
-            dependencies.push(import.library.clone());
+            // Skip API-set / UCRT DLLs from recursive dependency loading.
+            // These virtual DLLs (api-ms-win-crt-*, ucrtbase.dll, msvcrt.dll)
+            // don't exist on disk — their functions are resolved individually
+            // by the import resolver above and don't need module loading.
+            if !crate::ucrt::is_ucrt_library(&import.library) {
+                dependencies.push(import.library.clone());
+            }
         }
 
         let name = if import.name.is_empty() {
@@ -794,7 +809,9 @@ pub fn prepare_dll_main_call(
     let entry_va = module.image_base.wrapping_add(module.entry_rva);
 
     // Push the fake return address onto the guest stack.
-    let rsp = engine.read_rsp().context("failed to read RSP for DllMain")?;
+    let rsp = engine
+        .read_rsp()
+        .context("failed to read RSP for DllMain")?;
     let new_rsp = rsp.wrapping_sub(8);
     engine
         .mem_write(new_rsp, &fake_return_va.to_le_bytes())

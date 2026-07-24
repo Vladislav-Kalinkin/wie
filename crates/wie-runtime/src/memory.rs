@@ -327,6 +327,7 @@ pub(crate) fn default_winapi_state(
         import_resolver: None,
         loaded_modules: std::collections::HashMap::new(),
         next_module_handle: wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
+        main_module_host_dir: None,
     })
 }
 

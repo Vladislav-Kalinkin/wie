@@ -1272,9 +1272,9 @@ fn exec_sse_movhps(
 ) -> Result<(), StepExecError> {
     if instr.op0_register().is_xmm() {
         // xmm_dst, m64_src  → load into upper 64 bits
-        let src = read_sse_op(mem, regs, instr, 1, 8)?;        // 8 bytes from memory
-        let old = regs.read_xmm(instr.op_register(0))?;        // current XMM value
-        let new = (old & u128::from(u64::MAX)) | (src << 64);  // merge into upper half
+        let src = read_sse_op(mem, regs, instr, 1, 8)?; // 8 bytes from memory
+        let old = regs.read_xmm(instr.op_register(0))?; // current XMM value
+        let new = (old & u128::from(u64::MAX)) | (src << 64); // merge into upper half
         regs.write_xmm(instr.op_register(0), new)?;
     } else {
         // m64_dst, xmm_src  → store upper 64 bits to memory
@@ -1290,10 +1290,7 @@ fn exec_sse_movhps(
 ///
 /// - `MOVHLPS xmm1, xmm2`: xmm1[63:0] = xmm2[127:64], xmm1[127:64] unchanged
 /// - `MOVLHPS xmm1, xmm2`: xmm1[127:64] = xmm2[63:0], xmm1[63:0] unchanged
-fn exec_sse_movhlps(
-    regs: &mut RegFile,
-    instr: &Instruction,
-) -> Result<(), StepExecError> {
+fn exec_sse_movhlps(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
     let src = instr.op_register(1);
     let dst_val = regs.read_xmm(dst)?;
@@ -1317,10 +1314,7 @@ fn exec_sse_movhlps(
 ///
 /// - `PUNPCKLQDQ xmm1, xmm2`: keep low half of dst, place low half of src in high half.
 /// - `PUNPCKHQDQ xmm1, xmm2`: place high half of dst in low half, high half of src in high half.
-fn exec_sse_punpck(
-    regs: &mut RegFile,
-    instr: &Instruction,
-) -> Result<(), StepExecError> {
+fn exec_sse_punpck(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
     let src = instr.op_register(1);
     let a = regs.read_xmm(dst)?;
@@ -1339,10 +1333,7 @@ fn exec_sse_punpck(
 ///
 /// Copies four 32-bit lanes from `src` to `dst` according to an imm8
 /// control byte at the end of the instruction encoding.
-fn exec_sse_pshufd(
-    regs: &mut RegFile,
-    instr: &Instruction,
-) -> Result<(), StepExecError> {
+fn exec_sse_pshufd(regs: &mut RegFile, instr: &Instruction) -> Result<(), StepExecError> {
     let dst = instr.op_register(0);
     // Source: register or memory (read full 16 bytes).
     let src_val = if instr.op1_kind() == OpKind::Memory {
@@ -1355,13 +1346,16 @@ fn exec_sse_pshufd(
         regs.read_xmm(instr.op_register(1))?
     };
     let imm8 = instr.memory_displacement64() as u8;
-    let lanes: Vec<u32> = (0..4).map(|i| {
-        let src_lane = ((imm8 >> (i * 2)) & 3) as usize;
-        ((src_val >> (src_lane * 32)) & 0xffff_ffff) as u32
-    }).collect();
-    let result: u128 = lanes.into_iter().enumerate().fold(0u128, |acc, (i, lane)| {
-        acc | (u128::from(lane) << (i * 32))
-    });
+    let lanes: Vec<u32> = (0..4)
+        .map(|i| {
+            let src_lane = ((imm8 >> (i * 2)) & 3) as usize;
+            ((src_val >> (src_lane * 32)) & 0xffff_ffff) as u32
+        })
+        .collect();
+    let result: u128 = lanes
+        .into_iter()
+        .enumerate()
+        .fold(0u128, |acc, (i, lane)| acc | (u128::from(lane) << (i * 32)));
     regs.write_xmm(dst, result)?;
     Ok(())
 }

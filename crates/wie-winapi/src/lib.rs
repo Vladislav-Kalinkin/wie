@@ -3,14 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub mod dll_loader;
 pub mod advapi32;
 pub mod bottle;
 pub mod comctl32;
 pub mod comdlg32;
 pub mod d3d9;
+pub mod dll_loader;
 pub mod dynamic_apis;
 pub use dynamic_apis::{DYNAMIC_FAKE_APIS, PREPLANTED_SOFT_APIS, resolve_get_proc_address};
+pub mod exception;
 pub mod fake_va;
 pub mod gdi32;
 pub mod guest_heap;
@@ -20,9 +21,10 @@ mod guest_string;
 pub mod idle;
 pub mod kernel32;
 pub mod mingw_dispatch;
-pub mod seh;
+pub mod msvc_eh;
 pub mod ole32;
 pub mod oleaut32;
+pub mod seh;
 pub mod shell32;
 pub mod sync_obj;
 pub mod thread;
@@ -31,20 +33,18 @@ pub mod user32;
 pub mod uxtheme;
 pub mod vfs;
 pub mod winmm;
-pub mod exception;
-pub mod msvc_eh;
 pub use bottle::{bottle_root_from_env, drive_d_from_env, guest_path_to_host};
+pub use exception::{RuntimeFunction, lookup_function_entry};
 pub use sync_obj::{
     CsWaitQueue, INFINITE, KernelObject, MAXIMUM_WAIT_OBJECTS, MultiWaitRequest, PendingSpawn,
     STILL_ACTIVE, SemaphoreObject, SyncState, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget,
     wait_multiple,
 };
 pub use vfs::{VolumeConfig, ensure_bottle_skeleton};
-pub use exception::{RuntimeFunction, lookup_function_entry};
-#[cfg(test)]
-mod exception_tests;
 #[cfg(test)]
 mod exception_helpers;
+#[cfg(test)]
+mod exception_tests;
 // HostParkReason is defined with WinApiControlSignal below.
 pub use fake_va::{
     COM_IFACE_IDIRECT3D9, COM_IFACE_IDIRECT3DDEVICE9, FAKE_API_BASE, FAKE_API_SIZE, FakeVa,
@@ -342,6 +342,11 @@ pub struct WinApiState {
 
     /// Next real loaded module handle (monotonically increasing, each step by 0x1000).
     pub next_module_handle: u64,
+
+    /// Host filesystem directory of the main executable.
+    /// Used as a fallback search directory for DLL loading when VFS/bottle
+    /// path resolution fails (e.g. micro-exes without a bottle root).
+    pub main_module_host_dir: Option<std::path::PathBuf>,
 }
 
 // Manual Debug impl: Box<dyn FnMut + Send> does not implement Debug.
@@ -375,7 +380,10 @@ impl std::fmt::Debug for WinApiState {
             .field("current_directory_wide", &self.current_directory_wide)
             .field("window_long_ptr_values", &self.window_long_ptr_values)
             .field("image_list_counts", &self.image_list_counts)
-            .field("image_list_background_colors", &self.image_list_background_colors)
+            .field(
+                "image_list_background_colors",
+                &self.image_list_background_colors,
+            )
             .field("window_visible", &self.window_visible)
             .field("window_enabled", &self.window_enabled)
             .field("active_window_handle", &self.active_window_handle)
@@ -397,7 +405,10 @@ impl std::fmt::Debug for WinApiState {
             .field("global_atoms", &self.global_atoms)
             .field("next_windows_hook_handle", &self.next_windows_hook_handle)
             .field("windows_hooks", &self.windows_hooks)
-            .field("d3d9_current_vertex_shader", &self.d3d9_current_vertex_shader)
+            .field(
+                "d3d9_current_vertex_shader",
+                &self.d3d9_current_vertex_shader,
+            )
             .field("d3d9_current_fvf", &self.d3d9_current_fvf)
             .field("d3d9_render_states", &self.d3d9_render_states)
             .field("d3d9_texture_stage_states", &self.d3d9_texture_stage_states)
@@ -406,7 +417,10 @@ impl std::fmt::Debug for WinApiState {
             .field("menu_item_check_states", &self.menu_item_check_states)
             .field("message_queue", &self.message_queue)
             .field("next_message_time", &self.next_message_time)
-            .field("d3d9_device_object_address", &self.d3d9_device_object_address)
+            .field(
+                "d3d9_device_object_address",
+                &self.d3d9_device_object_address,
+            )
             .field("d3d9_device_ref_count", &self.d3d9_device_ref_count)
             .field("d3d9_object_address", &self.d3d9_object_address)
             .field("d3d9_ref_count", &self.d3d9_ref_count)
@@ -430,6 +444,7 @@ impl std::fmt::Debug for WinApiState {
             .field("import_resolver", &"<closure>")
             .field("loaded_modules", &self.loaded_modules)
             .field("next_module_handle", &self.next_module_handle)
+            .field("main_module_host_dir", &self.main_module_host_dir)
             .finish()
     }
 }
@@ -519,6 +534,7 @@ impl Clone for WinApiState {
             import_resolver: None, // Box<dyn FnMut + Send> is not Clone
             loaded_modules: self.loaded_modules.clone(),
             next_module_handle: self.next_module_handle,
+            main_module_host_dir: self.main_module_host_dir.clone(),
         }
     }
 }
@@ -1098,6 +1114,7 @@ mod tests {
             import_resolver: None,
             loaded_modules: HashMap::new(),
             next_module_handle: dll_loader::REAL_MODULE_HANDLE_BASE,
+            main_module_host_dir: None,
         }
     }
 

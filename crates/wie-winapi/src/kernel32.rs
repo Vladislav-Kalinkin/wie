@@ -1,3 +1,4 @@
+use crate::dll_loader;
 use crate::guest_memory::{
     checked_address, checked_field_address, read_u16 as read_guest_u16, read_u64 as read_guest_u64,
     write_u16 as write_guest_u16, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
@@ -6,7 +7,6 @@ use crate::guest_string::{
     read_ansi_lossy as read_guest_ansi_lossy, read_utf16_lossy as read_guest_utf16_lossy,
     write_utf16_units as write_guest_utf16_units,
 };
-use crate::dll_loader;
 use crate::{FindHandle, FlsSlot, GlobalAtomRecord, OpenGuestFile, ResourceRecord, WinApiState};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -929,7 +929,12 @@ fn resolve_or_load_dll(
     };
 
     // Resolve DLL path via search order.
-    let host_path = crate::dll_loader::resolve_dll_path(name, &state.main_module_path, &state.volumes);
+    let host_path = crate::dll_loader::resolve_dll_path(
+        name,
+        &state.main_module_path,
+        &state.volumes,
+        state.main_module_host_dir.as_deref(),
+    );
     let Some(ref host) = host_path else {
         state.import_resolver = resolver_opt;
         state.last_error = ERROR_MOD_NOT_FOUND;
@@ -2624,7 +2629,9 @@ pub fn handle_free_library(
                     wie_cpu::protect::PAGE_NOACCESS,
                 );
                 // Evict GetProcAddress cache entries for this module.
-                state.get_proc_address_cache.retain(|_, entry| entry.module_handle != module_handle);
+                state
+                    .get_proc_address_cache
+                    .retain(|_, entry| entry.module_handle != module_handle);
                 state.loaded_modules.remove(&name);
             }
         }
@@ -6402,7 +6409,8 @@ pub fn create_guest_thread(
     // Retaddr 0 → worker loop treats RIP=0 as natural exit (exit code from RAX).
     // Without the home space, prologues that spill into it fault just past stack_top
     // (seen as worker invalid_memory at stack_top+0x10 on 7za LZMA2 thread procs).
-    let entry_rsp = aligned_top.saturating_sub(u64::try_from(THREAD_ENTRY_HOME_AND_RET).unwrap_or(0x28));
+    let entry_rsp =
+        aligned_top.saturating_sub(u64::try_from(THREAD_ENTRY_HOME_AND_RET).unwrap_or(0x28));
     // Zero home space + retaddr slot so stale data cannot look like live pointers.
     let entry_frame = [0_u8; THREAD_ENTRY_HOME_AND_RET];
     drop(engine.mem_write(entry_rsp, &entry_frame));
