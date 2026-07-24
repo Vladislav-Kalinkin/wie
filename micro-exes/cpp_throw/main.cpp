@@ -12,7 +12,7 @@ int main() {
         throw 42;
         g_state = 99; // unreachable
     } catch (int val) {
-        g_state = val;
+        g_state -= val - 40;
     }
     ExitProcess(g_state);
     return 0;

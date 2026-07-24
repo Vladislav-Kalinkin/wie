@@ -134,7 +134,7 @@ $(OUT)/vfs_roundtrip.exe: vfs_roundtrip/main.c | $(OUT)
 MINGW_CXX ?= x86_64-w64-mingw32-g++
 CPPFLAGS   := -static -O2
 
-cpp_exes: $(OUT)/cpp_throw.exe $(OUT)/cpp_dtor.exe $(OUT)/cpp_multi_catch.exe
+cpp_exes: $(OUT)/cpp_throw.exe $(OUT)/cpp_dtor.exe $(OUT)/cpp_multi_catch.exe $(OUT)/cpp_types.exe $(OUT)/cpp_threads.exe
 
 $(OUT)/cpp_throw.exe: cpp_throw/main.cpp | $(OUT)
 	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
@@ -145,6 +145,14 @@ $(OUT)/cpp_dtor.exe: cpp_dtor/main.cpp | $(OUT)
 	@echo "built $@"
 
 $(OUT)/cpp_multi_catch.exe: cpp_multi_catch/main.cpp | $(OUT)
+	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+	@echo "built $@"
+
+$(OUT)/cpp_types.exe: cpp_types/main.cpp | $(OUT)
+	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
+	@echo "built $@"
+
+$(OUT)/cpp_threads.exe: cpp_threads/main.cpp | $(OUT)
 	$(MINGW_CXX) $(CPPFLAGS) -o $@ $<
 	@echo "built $@"
 
